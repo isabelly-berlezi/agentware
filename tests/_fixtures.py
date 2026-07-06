@@ -42,11 +42,27 @@ def load_cli():
 def run_cli(argv, kdir, stdin_text=None):
     """Run the CLI with AGENTWARE_KNOWLEDGE_DIR=kdir; capture (code, out, err).
 
-    Restores any pre-existing env var afterward so test ordering is irrelevant.
+    Restores any pre-existing env vars afterward so test ordering is irrelevant.
+
+    Hermeticity: this fixture isolates the KB dir, but the CLI also reads
+    MACHINE-level operator settings from ~/.agentware/config.env (HOME_CONFIG),
+    which is bound at module-import time and so CANNOT be redirected in-process.
+    The `audit` command's dream_health check keys on `resolve_dream()`, whose
+    precedence is env -> config.env -> default-OFF; on an operator whose real
+    config has AGENTWARE_DREAM=1 that value leaks in and makes a synthetic-KB
+    audit FAIL for reasons unrelated to the KB under test. Since the env var wins
+    over config.env, we default AGENTWARE_DREAM=OFF for the run so machine-level
+    dream state never leaks and synthetic-KB audits depend ONLY on KB state. A
+    caller that sets AGENTWARE_DREAM explicitly (e.g. the dream tests) is
+    respected and its value restored afterward.
     """
     mod = load_cli()
     prev = os.environ.get("AGENTWARE_KNOWLEDGE_DIR")
     os.environ["AGENTWARE_KNOWLEDGE_DIR"] = kdir
+    prev_dream = os.environ.get("AGENTWARE_DREAM")
+    force_dream_off = prev_dream is None
+    if force_dream_off:
+        os.environ["AGENTWARE_DREAM"] = "0"
     out, err = io.StringIO(), io.StringIO()
     prev_stdin = sys_stdin = None
     try:
@@ -64,6 +80,8 @@ def run_cli(argv, kdir, stdin_text=None):
             os.environ.pop("AGENTWARE_KNOWLEDGE_DIR", None)
         else:
             os.environ["AGENTWARE_KNOWLEDGE_DIR"] = prev
+        if force_dream_off:
+            os.environ.pop("AGENTWARE_DREAM", None)
     return code, out.getvalue(), err.getvalue()
 
 
