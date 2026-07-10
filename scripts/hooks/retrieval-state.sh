@@ -26,24 +26,37 @@ if [[ ! -x scripts/agentware ]]; then
   exit 0
 fi
 
-# State file (per-session, under logs/ if available)
+# Parse the tool event from the hook payload on STDIN (Claude Code passes JSON
+# with session_id/tool_name/tool_input). The CLAUDE_TOOL_* env vars this hook
+# used to read are NEVER set by Claude Code — the bug that left this enforcement
+# dead (0 state files against 14k+ logged tool events), 260710-learning-repair-p1
+# task 9. Mirrors scripts/hooks/log-tool.sh's stdin parse.
+INPUT_JSON="$(cat 2>/dev/null || true)"
+SID="unknown"; TOOL_NAME=""; TOOL_INPUT="{}"
+if command -v jq >/dev/null 2>&1 && [[ -n "$INPUT_JSON" ]]; then
+  SID="$(printf '%s' "$INPUT_JSON" | jq -r '.session_id // "unknown"' 2>/dev/null || echo unknown)"
+  TOOL_NAME="$(printf '%s' "$INPUT_JSON" | jq -r '.tool_name // empty' 2>/dev/null || true)"
+  TOOL_INPUT="$(printf '%s' "$INPUT_JSON" | jq -c '.tool_input // {}' 2>/dev/null || echo '{}')"
+fi
+[[ -z "$SID" ]] && SID="unknown"
+
+# State file (PER-SESSION — the old single global current.state raced across
+# concurrent sessions/subagents). Under logs/ if a knowledge dir is configured.
 KDIR="$(scripts/agentware config --knowledge-dir-only 2>/dev/null || true)"
 if [[ -z "$KDIR" ]]; then
   exit 0
 fi
 STATE_DIR="$KDIR/logs/.retrieval-state"
 mkdir -p "$STATE_DIR" 2>/dev/null || true
-STATE_FILE="$STATE_DIR/current.state"
+# Sanitize the session id for use as a filename (defensive; ids are uuid-like).
+SID_SAFE="$(printf '%s' "$SID" | tr -c 'A-Za-z0-9._-' '_')"
+STATE_FILE="$STATE_DIR/$SID_SAFE.state"
 
 # Read current state
 CURRENT_STATE="UNSTARTED"
 if [[ -f "$STATE_FILE" ]]; then
   CURRENT_STATE=$(cat "$STATE_FILE" 2>/dev/null || echo "UNSTARTED")
 fi
-
-# Parse tool event from hook input (stdin is JSON with tool_name, tool_input)
-TOOL_NAME="${CLAUDE_TOOL_NAME:-}"
-TOOL_INPUT="${CLAUDE_TOOL_INPUT:-}"
 
 # Classify the tool event into a retrieval stage
 classify_event() {
@@ -77,11 +90,13 @@ classify_event() {
     echo "GREP_WS"
     return
   fi
-  if [[ "$name" == "Bash" ]] && echo "$input" | grep -qE "grep|rg |ripgrep"; then
-    if echo "$input" | grep -qE "workspace|src/|/repos?/"; then
-      echo "GREP_WS"
-      return
-    fi
+  # Any Bash grep/rg/ripgrep is a workspace grep (STAGE 3). recall/query/scope-work
+  # are matched ABOVE and returned first, so reaching here means a genuine grep.
+  # (The old inner workspace/src restriction made most greps invisible to the
+  # ladder — the R-RET-06 targeted grep is still a grep regardless of path.)
+  if [[ "$name" == "Bash" ]] && echo "$input" | grep -qE "grep|ripgrep|(^| )rg "; then
+    echo "GREP_WS"
+    return
   fi
 
   # Read tool -> CODE

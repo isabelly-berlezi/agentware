@@ -249,8 +249,13 @@ KB_GITIGNORE_CONTENT = (
 )
 
 # Indexed knowledge categories scaffolded by `init` inside the knowledge dir.
-KNOWLEDGE_SUBDIRS = ("learnings", "projects", "configurations", "prompts",
-                     "references", "skills")
+# `decisions` MUST be here: it is a first-class CATEGORIES entry that `decide`/
+# `index add` write, so it must also be WALKED by scan_entry_files/rebuild_kb —
+# otherwise every decision is silently evicted on the next `index rebuild`
+# (regression locked by tests/test_rebuild.py; see the KB learning
+# `learn-index-rebuild-drops-decision-entries`, feature 260710-learning-repair-p1).
+KNOWLEDGE_SUBDIRS = ("learnings", "decisions", "projects", "configurations",
+                     "prompts", "references", "skills")
 
 # Non-indexed dirs `init` also scaffolds in the knowledge dir: per-feature work
 # artifacts (plans/worklogs/state) and append-only session logs. These hold the
@@ -1299,10 +1304,43 @@ def load_index(kdir):
 
 
 def save_index(kdir, data):
-    """Write <kdir>/index.json canonically (2-space indent, trailing newline)."""
-    with open(index_path(kdir), "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    """Write <kdir>/index.json canonically (2-space indent, trailing newline).
+
+    ATOMIC: serialize to a temp file in the SAME directory, flush + fsync, then
+    os.replace() onto index.json. os.replace is atomic on POSIX/Windows when
+    source and destination share a filesystem, so a crash or a concurrent reader
+    (recall, the nightly dream, autocommit) can NEVER observe a half-written or
+    truncated index — the very file autocommit would otherwise commit and push to
+    every clone. save_index is the SOLE index writer; all mutations sequence
+    through it (no concurrent writers), so the temp-then-rename needs no lock.
+    Byte output is identical to the previous direct write."""
+    import stat as _stat
+    import tempfile
+    path = index_path(kdir)
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".index.", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        # Preserve the destination's permission bits across the replace (mkstemp
+        # creates 0600); match a normal umask-respecting create for a fresh index.
+        try:
+            mode = _stat.S_IMODE(os.stat(path).st_mode)
+        except OSError:
+            cur = os.umask(0)
+            os.umask(cur)
+            mode = 0o666 & ~cur
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _today():
@@ -1419,6 +1457,32 @@ def date_age_days(date_str, as_of):
     age = (datetime.date.fromisoformat(as_of)
            - datetime.date.fromisoformat(date_str)).days
     return max(0, age)
+
+
+def _freshness_fields(entry, kdir, as_of):
+    """The 4 self-defending point-in-time fields (R-FAIL-08) for a recall/query
+    result: abs_path (the entry's relative path anchored to the LIVE knowledge
+    dir), created, last_verified (back-compat: == created when absent, via
+    entry_last_verified), and age_days (whole days from last_verified to as_of;
+    None when the date is unknown/invalid). Pure + read-only — computes, never
+    mutates."""
+    rel = entry.get("path") or ""
+    lv = entry_last_verified(entry)
+    return {
+        "abs_path": os.path.join(kdir, rel) if rel else None,
+        "created": entry.get("created"),
+        "last_verified": lv,
+        "age_days": date_age_days(lv, as_of),
+    }
+
+
+def _entry_with_freshness(entry, kdir, as_of):
+    """A COPY of an index entry with the freshness fields appended. Never mutates
+    the input dict — the MCP server reuses the loaded index across calls and
+    recall/query are read-only (INV-2)."""
+    out = dict(entry)
+    out.update(_freshness_fields(entry, kdir, as_of))
+    return out
 
 
 def answer_age_days(entries_by_id, expected_ids, as_of):
@@ -3108,6 +3172,7 @@ def cmd_query(args):
         ids = graph_traverse(combined, args.relates, getattr(args, "depth", 1))
         results = [by_id[i] for i in ids if i in by_id]
 
+    results = [_entry_with_freshness(e, kdir, _today()) for e in results]
     json.dump(results, sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
     return 0
@@ -3582,10 +3647,23 @@ def cmd_learn(args):
         sys.stderr.write("agentware: %s\n" % err)
         return 1
 
-    topic = (args.topic or "").strip()
-    if not topic:
+    raw_topic = (args.topic or "").strip()
+    if not raw_topic:
         sys.stderr.write("agentware: --topic must not be empty\n")
         return 1
+    # Normalize --topic to a slug-safe stem (^[a-z0-9][a-z0-9-]*$). A non-slug
+    # topic (spaces, punctuation, uppercase) silently produced broken ids AND
+    # filenames, and breaks worklog-scan promotion (which slugifies markers
+    # before matching learning stems). Auto-slugify + notice instead of writing a
+    # malformed entry (the exact bug that left 4 unpromotable legacy entries).
+    topic = raw_topic if SLUG_RE.match(raw_topic) else _slugify(raw_topic)
+    if not topic:
+        sys.stderr.write(
+            "agentware: --topic %r has no slug-safe characters\n" % raw_topic)
+        return 1
+    if topic != raw_topic:
+        sys.stderr.write(
+            "agentware: normalized --topic %r -> %r\n" % (raw_topic, topic))
 
     body = sys.stdin.read() if args.content == "-" else args.content
     if not (body or "").strip():
@@ -3623,7 +3701,11 @@ def cmd_learn(args):
     rel_path = "%s/%s.md" % (LEARNINGS_REL, topic)
     abs_path = os.path.join(kdir, rel_path)
     tag_list = parse_tags(args.tags)
-    title = _topic_to_title(topic)
+    # --title overrides the derived display title; the default derives from the
+    # ORIGINAL (pre-slug) topic so readability survives auto-slugify. When topic
+    # is already a slug and --title is omitted this is byte-identical to the prior
+    # `_topic_to_title(topic)` (raw_topic == topic).
+    title = (getattr(args, "title", None) or "").strip() or _topic_to_title(raw_topic)
     created = _today()
 
     entries = data.get("entries") or []
@@ -3638,6 +3720,23 @@ def cmd_learn(args):
             "agentware: learning file already exists (refusing to overwrite): %s\n"
             % abs_path)
         return 1
+
+    # BM25 near-duplicate probe: self-query the new content against EXISTING
+    # learnings via the SAME lexical retrieval recall uses. A high self-normalized
+    # overlap means this likely restates an entry that already exists — point at
+    # the match and refuse unless --force.
+    if not getattr(args, "force", False):
+        probe_text = "\n".join(
+            [title, args.summary or "", " ".join(tag_list), body])
+        dup_entry, ratio = _near_duplicate_learning(kdir, data, probe_text)
+        if dup_entry is not None and ratio >= LEARN_NEAR_DUP_THRESHOLD:
+            sys.stderr.write(
+                "agentware: near-duplicate of existing learning '%s' "
+                "(%.0f%% overlap): %s\n"
+                "  amend that entry, pick a more specific --topic, or pass "
+                "--force to record anyway.\n"
+                % (dup_entry.get("id"), ratio * 100.0, dup_entry.get("path")))
+            return 1
 
     fm = build_entry_frontmatter(
         {"id": eid, "title": title, "category": "learnings", "tags": tag_list,
@@ -4238,16 +4337,36 @@ def cmd_features(args):
     return 0
 
 
-LEARNED_RE = re.compile(r"^\s*>?\s*LEARNED:\s*(.*?)\s*$")
-DECISION_RE = re.compile(r"^\s*>?\s*DECISION:\s*(.*?)\s*$")
+# Marker matchers accept the bare, blockquote (`> LEARNED:`), AND bullet-prefixed
+# (`- > LEARNED:` / `* > LEARNED:`) forms — worklogs in the wild use all three,
+# and the bullet form was silently invisible before 260710-learning-repair-p1
+# (32 real markers in one worklog scanned as 0 because the leading `- ` blocked
+# the match).
+LEARNED_RE = re.compile(r"^\s*(?:[-*+]\s+)?>?\s*LEARNED:\s*(.*?)\s*$")
+DECISION_RE = re.compile(r"^\s*(?:[-*+]\s+)?>?\s*DECISION:\s*(.*?)\s*$")
+# A `> WAIVED: <reason>` line legitimately CLOSES the most recently-scanned
+# still-open marker — an explicit "not worth promoting" decision (R-SI-03), so a
+# waived marker is not counted unpromoted.
+WAIVED_RE = re.compile(r"^\s*(?:[-*+]\s+)?>?\s*WAIVED:\s*(.*?)\s*$")
 
-# Explicit, deterministic promotion reference on a marker line. The canonical
-# form is `(Promoted: <id>)`; the bracketed `[promoted -> <id>]` form is the
-# decisions convention and is accepted too so both marker families share one
-# matcher. The captured `<id>` is resolved EXACTLY against the live index/files
-# (no substring fuzz) — this is the primary signal that a marker was promoted.
+# Explicit, deterministic promotion reference on a marker line. Accepted forms:
+#   (Promoted: <id>)     canonical — any category, including skill-<id>
+#   [promoted -> <id>]   decisions convention (ASCII arrow)
+#   [promoted -> <id>]   same with the unicode arrow U+2192 some tools emit
+#   [kb: <id>]           legacy annotation
+# The captured `<id>` is resolved EXACTLY against the live index/files (no
+# substring fuzz) — the primary signal that a marker was promoted. (The unicode
+# arrow is spliced in as "→" rather than embedded so the regex source stays
+# ASCII and unambiguous.)
 PROMOTED_RE = re.compile(
-    r"(?:\(\s*Promoted:\s*|\[\s*promoted\s*->\s*)([a-z0-9][a-z0-9-]*)", re.I)
+    r"(?:\(\s*Promoted:\s*"
+    r"|\[\s*promoted\s*(?:->|" "→" r")\s*"
+    r"|\[\s*kb:\s*)"
+    r"([a-z0-9][a-z0-9-]*)", re.I)
+
+
+# A slug-safe learning topic stem: starts alnum, then alnum-or-hyphen.
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def _slugify(text):
@@ -4301,12 +4420,42 @@ def decision_stems(kdir, data):
     return _category_stems(kdir, data, "decisions", "decide-", DECISIONS_REL)
 
 
-def _is_promoted(marker_text, stems, real_ids):
+def all_entry_ids(kdir, data):
+    """Every id a promotion reference may resolve to, lowercased: all indexed
+    entry ids + their filename stems, plus skill stems on disk. This is the
+    exact-match universe so a CROSS-category ref on a marker — e.g.
+    `(Promoted: skill-x)` or `[kb: decide-y]` on a `> LEARNED:` line — resolves
+    regardless of the marker's own kind. Read-only (INV-2), deterministic."""
+    ids = set()
+    for e in (data.get("entries") or []):
+        if not isinstance(e, dict):
+            continue
+        eid = e.get("id")
+        if eid:
+            ids.add(eid.lower())
+        base = os.path.basename(e.get("path") or "")
+        if base.endswith(".md"):
+            ids.add(base[:-3].lower())
+    # Skills can live on disk without appearing in the user index; include their
+    # stems (bare and `skill-`-prefixed) so skill-promotion refs resolve.
+    sdir = os.path.join(kdir, "skills")
+    if os.path.isdir(sdir):
+        for fn in os.listdir(sdir):
+            if fn.endswith(".md") and fn != "index.md":
+                stem = fn[:-3].lower()
+                ids.add(stem)
+                ids.add("skill-" + stem)
+    return ids
+
+
+def _is_promoted(marker_text, stems, real_ids, all_ids=None):
     """A marker is promoted iff:
 
-    * primary — it carries an explicit `(Promoted: <id>)` / `[promoted -> <id>]`
-      reference whose id resolves EXACTLY to a real entry (`real_ids`); or
-    * fallback (no reference) — its slug EQUALS a learning stem exactly.
+    * primary — it carries an explicit `(Promoted: <id>)` / `[promoted -> <id>]` /
+      `[kb: <id>]` reference whose id resolves EXACTLY to a real entry. Resolution
+      is against `real_ids` (same category) unioned with `all_ids` when supplied
+      (any category, so skill/decision refs on a `> LEARNED:` line resolve); or
+    * fallback (no reference) — its slug EQUALS a same-category stem exactly.
 
     The legacy substring branches (`stem in slug` / `slug in stem`) are gone:
     they produced false positives (short slug inside an unrelated stem) and could
@@ -4315,29 +4464,55 @@ def _is_promoted(marker_text, stems, real_ids):
     """
     refs = promoted_ids(marker_text)
     if refs:
-        return any(r in real_ids for r in refs)
+        universe = real_ids if all_ids is None else (real_ids | all_ids)
+        return any(r in universe for r in refs)
     slug = _slugify(marker_text)
     if not slug:
         return False
     return any(slug == stem for stem in stems)
 
 
-def scan_worklog(path, kdir, data):
-    """Scan a worklog for unpromoted `> LEARNED:` and `> DECISION:` markers.
+def scan_worklog_markers(path, kdir, data):
+    """Single source of truth for worklog marker scanning (INV-2 read-only).
 
-    Both families gate completion (R-SI-03 / R-AUTO-05). The combined top-level
-    `unpromoted` list keeps the original exit semantics (non-empty -> fail);
-    each item carries a `kind` ("learned"|"decision") so callers can label it.
+    Recognizes `> LEARNED:` / `> DECISION:` markers in bare, blockquote, and
+    bullet-prefixed (`- > LEARNED:`) forms; a marker is CLOSED when it carries an
+    explicit promotion reference (`(Promoted: <id>)`, `[promoted -> <id>]`,
+    unicode `[promoted -> <id>]`, or legacy `[kb: <id>]`) resolving EXACTLY to a
+    real entry in ANY category (skills included), or when its slug equals a
+    same-category entry stem. A `> WAIVED: <reason>` line closes the most
+    recently-scanned still-open marker.
+
+    Returns a dict:
+      {"unpromoted": [{line,text,kind}], "total": int, "waived": int,
+       "per_kind": {"learned": {"total","unpromoted"}, "decision": {...}}}
+    Deterministic; opens the file leniently (never mutates the KB).
     """
     l_stems = learning_stems(kdir, data)
     d_stems = decision_stems(kdir, data)
+    all_ids = all_entry_ids(kdir, data)
     kinds = (
         ("learned", LEARNED_RE, l_stems, _real_ids(l_stems, "learn-")),
         ("decision", DECISION_RE, d_stems, _real_ids(d_stems, "decide-")),
     )
-    unpromoted, total = [], 0
-    with open(path, "r", encoding="utf-8") as f:
+    per_kind = {"learned": {"total": 0, "unpromoted": 0},
+                "decision": {"total": 0, "unpromoted": 0}}
+    empty = {"unpromoted": [], "total": 0, "waived": 0, "per_kind": per_kind}
+    try:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return empty
+    unpromoted, total, waived = [], 0, 0
+    with f:
         for lineno, line in enumerate(f, start=1):
+            # A `> WAIVED:` line closes the most recently-scanned still-open
+            # marker (an explicit "not worth promoting" decision).
+            if WAIVED_RE.match(line):
+                if unpromoted:
+                    closed = unpromoted.pop()
+                    per_kind[closed["kind"]]["unpromoted"] -= 1
+                    waived += 1
+                continue
             for kind, rx, stems, real_ids in kinds:
                 m = rx.match(line)
                 if not m:
@@ -4346,11 +4521,55 @@ def scan_worklog(path, kdir, data):
                 if not text:
                     continue
                 total += 1
-                if not _is_promoted(text, stems, real_ids):
+                per_kind[kind]["total"] += 1
+                if not _is_promoted(text, stems, real_ids, all_ids):
                     unpromoted.append({"line": lineno, "text": text,
                                        "kind": kind})
+                    per_kind[kind]["unpromoted"] += 1
                 break
-    return unpromoted, total
+    return {"unpromoted": unpromoted, "total": total, "waived": waived,
+            "per_kind": per_kind}
+
+
+def scan_worklog(path, kdir, data):
+    """Scan a worklog for unpromoted `> LEARNED:` and `> DECISION:` markers.
+
+    Both families gate completion (R-SI-03 / R-AUTO-05). Back-compat wrapper over
+    `scan_worklog_markers`: returns `(unpromoted, total)`; the combined
+    `unpromoted` list keeps the original exit semantics (non-empty -> fail) and
+    each item carries a `kind` ("learned"|"decision") so callers can label it.
+    """
+    r = scan_worklog_markers(path, kdir, data)
+    return r["unpromoted"], r["total"]
+
+
+# Extracted-Knowledge 'Suggested ID' line in an assessment.md. Tolerates both
+# markdown emphasis styles the POST prompt produces:
+#   - **Suggested ID:** `learn-foo`
+#   - **Suggested ID**: `learn-foo` *(already promoted)*
+SUGGESTED_ID_RE = re.compile(r"Suggested\s+ID[*:\s]*`([a-z0-9][a-z0-9-]*)`", re.I)
+
+
+def scan_assessment_ids(path, data):
+    """Extracted-Knowledge 'Suggested ID' ids in `path` that do NOT resolve to a
+    live index entry (same id semantics as `query --id`: exact match against the
+    index `entries` ids — intentionally NOT the looser stem resolution used by
+    _is_promoted). Read-only; each item is {"line", "id"}. A missing or
+    unreadable assessment.md yields []."""
+    if not path or not os.path.isfile(path):
+        return []
+    live_ids = {e.get("id") for e in (data.get("entries") or [])
+                if isinstance(e, dict) and e.get("id")}
+    unresolved = []
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            m = SUGGESTED_ID_RE.search(line)
+            if not m:
+                continue
+            sid = m.group(1).lower()
+            if sid not in live_ids:
+                unresolved.append({"line": lineno, "id": sid})
+    return unresolved
 
 
 def cmd_worklog_scan(args):
@@ -4367,9 +4586,23 @@ def cmd_worklog_scan(args):
 
     unpromoted, total = scan_worklog(args.path, kdir, data)
     ok = len(unpromoted) == 0
+
+    # Advisory sidecar (opt-in --also-assessment): flag Extracted-Knowledge
+    # 'Suggested ID' entries in the sibling assessment.md that never made it into
+    # the live index (the POST-phase knowledge leak). Report-only — it NEVER
+    # changes the exit code, so the run_post_hooks / kb-sync / pre-hook gates that
+    # call `worklog scan` WITHOUT the flag stay byte-for-byte unaffected.
+    assessment_unpromoted = None
+    if getattr(args, "also_assessment", False):
+        assessment_path = os.path.join(
+            os.path.dirname(os.path.abspath(args.path)), "assessment.md")
+        assessment_unpromoted = scan_assessment_ids(assessment_path, data)
+
     if getattr(args, "format", "text") == "json":
-        json.dump({"unpromoted": unpromoted, "total": total},
-                  sys.stdout, ensure_ascii=False, indent=2)
+        payload = {"unpromoted": unpromoted, "total": total}
+        if assessment_unpromoted is not None:
+            payload["assessment_unpromoted"] = assessment_unpromoted
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
     else:
         if ok:
@@ -4380,6 +4613,11 @@ def cmd_worklog_scan(args):
             for item in unpromoted:
                 print("  line %d [%s]: %s"
                       % (item["line"], item.get("kind", "learned"), item["text"]))
+        if assessment_unpromoted:
+            print("ASSESSMENT SIDECAR: %d Extracted-Knowledge 'Suggested ID'(s) "
+                  "not in the live index (advisory):" % len(assessment_unpromoted))
+            for item in assessment_unpromoted:
+                print("  line %d: %s" % (item["line"], item["id"]))
     return 0 if ok else 1
 
 
@@ -4889,6 +5127,51 @@ def bm25_positive_scores(kdir, data, query, category=None):
     if category:
         corpus = [(e, t) for (e, t) in corpus if e.get("category") == category]
     return [(e, s) for (e, s) in bm25_scores(corpus, q_tokens) if s > 0.0]
+
+
+# Self-normalized BM25 overlap at/above which `learn` treats new content as a
+# near-duplicate of an existing learning and refuses without --force. Tuned so a
+# near-verbatim restatement (~1.0) blocks while distinct entries sharing only
+# boilerplate stay well under (empirically <= ~0.5 on the synthetic KB).
+LEARN_NEAR_DUP_THRESHOLD = 0.75
+
+
+def _near_duplicate_learning(kdir, data, query_text):
+    """Closest existing-learning near-duplicate of `query_text`: (entry, ratio).
+
+    Retrieval reuses the SAME lexical machinery recall uses (`build_corpus` +
+    `bm25_scores`) scoped to the `learnings` sub-corpus. The new content is
+    appended as an ephemeral pseudo-doc so its BM25 SELF-score normalizes scale:
+    `ratio = bm25(query, best_existing) / bm25(query, new_content)`, a corpus-
+    independent [0,1] self-similarity (~1.0 == near-verbatim; distinct entries
+    sharing only boilerplate score low because BM25 discounts common terms via
+    IDF). On ties the reported entry follows recall's canonical order (score desc
+    -> created desc -> id asc). Read-only; no network/LLM/index write."""
+    q_tokens = tokenize(query_text)
+    if not q_tokens:
+        return None, 0.0
+    corpus = [(e, t) for (e, t) in build_corpus(kdir, data)
+              if e.get("category") == "learnings"]
+    if not corpus:
+        return None, 0.0
+    pseudo_id = "\x00new-learning"  # sentinel absent from any real corpus id
+    corpus.append(({"id": pseudo_id, "category": "learnings", "created": ""},
+                   query_text))
+    scored = bm25_scores(corpus, q_tokens)
+    self_score = 0.0
+    others = []
+    for entry, score in scored:
+        if entry.get("id") == pseudo_id:
+            self_score = score
+        elif score > 0.0:
+            others.append((entry, score))
+    if self_score <= 0.0 or not others:
+        return None, 0.0
+    others.sort(key=lambda es: es[0].get("id") or "")
+    others.sort(key=lambda es: es[0].get("created") or "", reverse=True)
+    others.sort(key=lambda es: es[1], reverse=True)
+    best_entry, best_score = others[0]
+    return best_entry, best_score / self_score
 
 
 def retrieve_bm25(kdir, data, query, top_k=None):
@@ -7723,14 +8006,16 @@ def build_recall_payload(kdir, data, query, top_k=5, token_budget=1500,
             })
             continue
         used += cost
-        results.append({
+        rec = {
             "id": entry.get("id"),
             "path": entry.get("path"),
             "category": entry.get("category"),
             "score": round(score, 6),
             "summary": entry.get("summary") or "",
             "estimated_tokens": cost,
-        })
+        }
+        rec.update(_freshness_fields(entry, kdir, as_of))
+        results.append(rec)
     payload = {
         "query": query,
         "strategy": resolved,
@@ -7861,9 +8146,12 @@ def cmd_recall(args):
         print("  category: %s" % args.category)
     for r in results:
         print("  [%.4f] %s" % (r["score"], r["id"]))
-        print("    %s" % r["path"])
+        print("    %s" % r["abs_path"])
         if r["summary"]:
             print("    %s" % r["summary"])
+        print("    age: %s days (created %s, last_verified %s)"
+              % ("?" if r.get("age_days") is None else r["age_days"],
+                 r.get("created") or "?", r.get("last_verified") or "?"))
     if overflow:
         print("  note: %d ranked entr%s exceeded the token budget and %s skipped "
               "(pointers only) — inspect with `agentware query --id <id>`:"
@@ -7872,6 +8160,7 @@ def cmd_recall(args):
         for o in overflow:
             print("    [%.4f] %s (~%d tokens) %s"
                   % (o["score"], o["id"], o["estimated_tokens"], o["path"]))
+    print("  point-in-time values may be stale — verify against live state (R-FAIL-08)")
     return 0
 
 
@@ -10621,38 +10910,16 @@ def _classify_recovery(err_step, next_step):
 
 def _failure_marker_tally(kdir, feature):
     """Per-kind LEARNED/DECISION tallies (total + unpromoted) from the feature's
-    worklog (read-only). Reuses the completion-gate regexes + promotion stems so
-    the tally agrees with the worklog-scan gate."""
+    worklog (read-only). Delegates to `scan_worklog_markers` so the tally uses
+    the exact same regexes, cross-category resolution, and WAIVED handling as the
+    completion gate — the two can never drift."""
     out = {"learned": {"total": 0, "unpromoted": 0},
            "decision": {"total": 0, "unpromoted": 0}}
     wl = os.path.join(kdir, "work", feature, "worklog.md")
     if not os.path.isfile(wl):
         return out
     data, _err = load_index(kdir)
-    l_stems = learning_stems(kdir, data)
-    d_stems = decision_stems(kdir, data)
-    kinds = (
-        ("learned", LEARNED_RE, l_stems, _real_ids(l_stems, "learn-")),
-        ("decision", DECISION_RE, d_stems, _real_ids(d_stems, "decide-")),
-    )
-    try:
-        f = open(wl, "r", encoding="utf-8", errors="replace")
-    except OSError:
-        return out
-    with f:
-        for line in f:
-            for kind, rx, stems, real_ids in kinds:
-                m = rx.match(line)
-                if not m:
-                    continue
-                text = m.group(1).strip()
-                if not text:
-                    continue
-                out[kind]["total"] += 1
-                if not _is_promoted(text, stems, real_ids):
-                    out[kind]["unpromoted"] += 1
-                break
-    return out
+    return scan_worklog_markers(wl, kdir, data)["per_kind"]
 
 
 def derive_failures(kdir, feature):
@@ -10823,6 +11090,110 @@ def cmd_dashboard(args):
         return 0
 
 
+# Retrieval-utilization derivation (260710-learning-repair-p1 task 9). Read-only
+# (INV-2): parses the per-tool-call log (logs/sessions/*/live.jsonl written by
+# scripts/hooks/log-tool.sh) to measure whether recall is actually USED — the
+# missing utilization signal (<10% of returned paths were ever read).
+_RET_ID_RE = re.compile(
+    r"\b((?:learn|decide|config|project|ref|skill)-[a-z0-9][a-z0-9-]*)")
+_RET_PATH_RE = re.compile(
+    r"\b((?:learnings|decisions|projects|configurations|references|skills|"
+    r"prompts)/[A-Za-z0-9._/-]+\.md)")
+
+
+def _iter_live_records(path):
+    """Yield parsed JSON objects from a live.jsonl (best-effort; skip bad lines)."""
+    try:
+        f = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                yield rec
+
+
+def derive_retrieval(kdir, session=None):
+    """Per-session retrieval utilization over logs/sessions/*/live.jsonl.
+
+    For each session: was `recall` invoked by the MAIN agent (EXCLUDING calls
+    inside a plan/task `--verify` string and subagent-attributed calls), which
+    entry ids it returned, and how many of the returned paths were later Read
+    (read-through). Plus overall corpus coverage (distinct learning ids ever
+    surfaced / learnings corpus size). Deterministic; ids/paths are regex-
+    extracted from the (possibly truncated) recorded response, so counts are a
+    faithful lower bound. Read-only (INV-2)."""
+    data, _err = load_index(kdir)
+    corpus_learnings = {
+        e["id"] for e in (data.get("entries") or [])
+        if isinstance(e, dict) and e.get("category") == "learnings" and e.get("id")}
+    surfaced = set()
+    out_sessions = []
+    root = os.path.join(kdir, "logs", "sessions")
+    for sdir in sorted(glob.glob(os.path.join(root, "*"))):
+        sid = os.path.basename(sdir)
+        if session and sid != session:
+            continue
+        live = os.path.join(sdir, "live.jsonl")
+        if not os.path.isfile(live):
+            continue
+        recall_calls = 0
+        returned_ids, returned_paths, read_paths = set(), set(), set()
+        for rec in _iter_live_records(live):
+            tool = rec.get("tool") or ""
+            agent = rec.get("agent") or "main"
+            inp = rec.get("input") or ""
+            resp = rec.get("response") or ""
+            if not isinstance(inp, str):
+                inp = json.dumps(inp)
+            if not isinstance(resp, str):
+                resp = json.dumps(resp)
+            is_recall = (
+                tool == "Bash" and "agentware recall" in inp
+                and agent == "main"
+                # exclude recall calls that are only part of a --verify assertion
+                and "--verify" not in inp and "verify:" not in inp.lower())
+            if is_recall:
+                recall_calls += 1
+                for m in _RET_ID_RE.findall(resp):
+                    returned_ids.add(m)
+                    surfaced.add(m)
+                for m in _RET_PATH_RE.findall(resp):
+                    returned_paths.add(m)
+            elif tool in ("Read", "Bash"):
+                for m in _RET_PATH_RE.findall(inp):
+                    read_paths.add(m)
+        read_hit = len(returned_paths & read_paths)
+        out_sessions.append({
+            "session": sid,
+            "recall_invoked": recall_calls > 0,
+            "recall_calls": recall_calls,
+            "returned_ids": sorted(returned_ids),
+            "read_through": {
+                "returned_paths": len(returned_paths),
+                "read": read_hit,
+                "ratio": (round(read_hit / len(returned_paths), 4)
+                          if returned_paths else None)},
+        })
+    corpus_size = len(corpus_learnings)
+    covered = len(surfaced & corpus_learnings)
+    return {
+        "sessions_sampled": len(out_sessions),
+        "corpus_coverage": {
+            "learning_ids_surfaced": covered,
+            "corpus_size": corpus_size,
+            "ratio": round(covered / corpus_size, 4) if corpus_size else None},
+        "sessions": out_sessions,
+    }
+
+
 def cmd_metrics(args):
     """Execution observability over session transcripts (READ-ONLY, INV-2).
 
@@ -10832,6 +11203,29 @@ def cmd_metrics(args):
     kdir = require_knowledge_dir()
     if not kdir:
         return 1
+
+    # Retrieval-utilization mode (Task 9): a distinct, self-contained derivation
+    # over live.jsonl — short-circuits the execution-cost path above.
+    if getattr(args, "retrieval", False):
+        report = derive_retrieval(kdir, session=getattr(args, "session", None))
+        if getattr(args, "format", "text") == "json":
+            json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("retrieval utilization: %d session(s) sampled"
+                  % report["sessions_sampled"])
+            cc = report["corpus_coverage"]
+            print("  corpus coverage: %s/%s learning ids surfaced (ratio %s)"
+                  % (cc["learning_ids_surfaced"], cc["corpus_size"], cc["ratio"]))
+            for s in report["sessions"]:
+                rt = s["read_through"]
+                print("  %s: recall=%s calls=%d returned_ids=%d "
+                      "read-through=%s/%s"
+                      % (s["session"], s["recall_invoked"], s["recall_calls"],
+                         len(s["returned_ids"]), rt["read"],
+                         rt["returned_paths"]))
+        return 0
+
     since = getattr(args, "since", None)
     if since is not None and not _is_valid_date(since):
         sys.stderr.write("agentware: --since must be YYYY-MM-DD\n")
@@ -14336,6 +14730,7 @@ def _mcp_tool_query(kdir, data, arguments):
     if not isinstance(value, str):
         raise _McpInvalidParams("%r must be a string" % selector)
     results = _mcp_query_lookup(data, selector, value)
+    results = [_entry_with_freshness(e, kdir, _today()) for e in results]
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 
@@ -14461,6 +14856,7 @@ DREAM_SESSION_TTL_SEC = 1800     # a .loop whose liveness file is fresher = acti
 DREAM_LOAD_RATIO = 4.0           # skip when 1-min loadavg > ratio * cpu_count
 DREAM_NICE = 10                  # run the cycle at low priority (never compete)
 DREAM_STALE_HOURS = 48           # dream_health warns when last dream older than this
+DREAM_PLAN_ONLY_MIN_AGE_HOURS = 48  # step e flags plan.md w/ no worklog.md older than this
 
 # Ordered, fixed cycle (each step idempotent + individually skippable via --steps).
 DREAM_STEP_FUNCS = ()  # populated below once the step fns are defined
@@ -15191,11 +15587,13 @@ def _dream_step_eval_record(kdir, dry_run):
             "post_redact_scrubbed": redact.get("scrubbed", 0)}
 
 
-def _dream_render_detect_report(report, markers):
+def _dream_render_detect_report(report, markers, plan_only=None):
     """Render step e's findings into a deterministic, diff-friendly markdown
     report body. REPORT-ONLY (INV-2) — pure formatting, no mutation. Inputs are
     sorted here so the output is byte-stable for unchanged inputs (INV-1): no
-    clocks, no run-id, no host-specific values in the body."""
+    clocks, no run-id, no host-specific values in the body. `plan_only` (optional,
+    default None) lists plan.md-only work dirs; ages are passed IN as data (the
+    live clock is read only by the caller) so this stays pure."""
     lines = [
         "# Dream Detect Report (latest)",
         "",
@@ -15252,6 +15650,20 @@ def _dream_render_detect_report(report, markers):
     else:
         lines.append("_none_")
         lines.append("")
+    plan_only = sorted(plan_only or [], key=lambda p: (p.get("rel") or ""))
+    lines.append("## Plan-only work dirs (%d)" % len(plan_only))
+    lines.append("")
+    lines.append("> plan.md present but NO worklog.md, plan older than %dh "
+                 "(a planned feature that produced no worklog — the learning "
+                 "pipeline never ran for it)."
+                 % DREAM_PLAN_ONLY_MIN_AGE_HOURS)
+    lines.append("")
+    if plan_only:
+        for p in plan_only:
+            lines.append("- %s age=%sh" % (p.get("rel"), p.get("age_hours")))
+    else:
+        lines.append("_none_")
+    lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
@@ -15285,10 +15697,13 @@ def _dream_step_detect_report(kdir, dry_run):
         return {"status": "error", "errors": [err]}
     report = build_stale_report(kdir, data, 120)
     markers, scanned = [], 0
+    plan_only = []
+    now = time.time()
     work = os.path.join(kdir, "work")
     if os.path.isdir(work):
         for feat in sorted(os.listdir(work)):
-            wl = os.path.join(work, feat, "worklog.md")
+            fdir = os.path.join(work, feat)
+            wl = os.path.join(fdir, "worklog.md")
             if os.path.isfile(wl):
                 scanned += 1
                 up, _tot = scan_worklog(wl, kdir, data)
@@ -15297,11 +15712,27 @@ def _dream_step_detect_report(kdir, dry_run):
                     markers.append({"feature": feat, "rel": rel,
                                     "line": m["line"], "kind": m["kind"],
                                     "text": m["text"]})
-    body = _dream_render_detect_report(report, markers)
+            else:
+                # Plan-only work dir: plan.md present, NO worklog.md. Flag once its
+                # plan is older than the min-age budget — a planned feature that
+                # left no worklog (the learning pipeline never ran). READ-ONLY.
+                plan = os.path.join(fdir, "plan.md")
+                if os.path.isfile(plan):
+                    try:
+                        age_h = (now - os.path.getmtime(plan)) / 3600.0
+                    except OSError:
+                        age_h = 0.0
+                    if age_h >= DREAM_PLAN_ONLY_MIN_AGE_HOURS:
+                        plan_only.append(
+                            {"feature": feat,
+                             "rel": os.path.join("work", feat, "plan.md"),
+                             "age_hours": round(age_h, 1)})
+    body = _dream_render_detect_report(report, markers, plan_only)
     report_rel = _dream_write_detect_report(kdir, body)
     result = {"status": "ok", "stale": len(report["stale"]),
               "duplicates": len(report["conflicts"]),
-              "worklogs_scanned": scanned, "unpromoted_markers": len(markers)}
+              "worklogs_scanned": scanned, "unpromoted_markers": len(markers),
+              "plan_only_dirs": len(plan_only)}
     if report_rel:
         result["report"] = report_rel
     return result
@@ -16927,6 +17358,12 @@ def build_parser():
     p_learn.add_argument("--source", default=None,
                          help="optional provenance source: user|agent|imported "
                               "(default: agent). Feeds the ACR source_weight prior.")
+    p_learn.add_argument("--title", default=None,
+                         help="optional display title (default: derived from "
+                              "--topic via title-casing)")
+    p_learn.add_argument("--force", action="store_true",
+                         help="record even if a near-duplicate existing learning "
+                              "is detected")
     p_learn.set_defaults(func=cmd_learn)
 
     # decide -----------------------------------------------------------------
@@ -16986,6 +17423,12 @@ def build_parser():
         "scan", parents=[fmt_parent],
         help="find unpromoted '> LEARNED:' markers in a worklog")
     p_scan.add_argument("--path", required=True, help="path to a worklog.md")
+    p_scan.add_argument(
+        "--also-assessment", action="store_true",
+        help="also flag Extracted-Knowledge 'Suggested ID' entries in the sibling "
+             "assessment.md whose ids do not resolve in the live index; reported "
+             "as an 'assessment_unpromoted' field (advisory — does not change the "
+             "exit code)")
     p_scan.set_defaults(func=cmd_worklog_scan)
 
     # audit ------------------------------------------------------------------
@@ -17005,13 +17448,16 @@ def build_parser():
     # recall -----------------------------------------------------------------
     p_recall = sub.add_parser(
         "recall", parents=[fmt_parent],
-        help="deterministic BM25 ranked retrieval, token-budgeted")
+        help="deterministic BM25 ranked retrieval, token-budgeted "
+             "(budget-bounded output — never pipe through head)")
     p_recall.add_argument("query", help="free-text query to rank KB entries against")
     p_recall.add_argument("--top-k", type=int, default=5, dest="top_k",
                           help="max entries to return before budgeting (default: 5)")
     p_recall.add_argument("--token-budget", type=int, default=1500,
                           dest="token_budget",
-                          help="trim so cumulative est. tokens <= budget (default: 1500)")
+                          help="trim so cumulative est. tokens <= budget (default: 1500); "
+                               "output is already budget-bounded — never pipe recall "
+                               "through `head`")
     p_recall.add_argument("--category", default=None,
                           help="restrict ranking to a single category")
     p_recall.add_argument("--strategy", choices=("bm25", "bm25+acr"),
@@ -17187,6 +17633,11 @@ def build_parser():
                            help="model context-window size (tokens) the "
                                 "context-tax truncation-risk is measured "
                                 "against (default 200000)")
+    p_metrics.add_argument("--retrieval", action="store_true",
+                           help="report per-session RETRIEVAL utilization over "
+                                "live.jsonl (recall invoked, returned ids, "
+                                "read-through, corpus coverage) instead of "
+                                "execution-cost metrics")
     p_metrics.set_defaults(func=cmd_metrics)
 
     # dashboard --------------------------------------------------------------

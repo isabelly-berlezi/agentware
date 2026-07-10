@@ -50,13 +50,18 @@ render "$SESS/main.jsonl" "$SESS/main.md"
 SUB_SRC="${tpath%.jsonl}/subagents"
 sub_count=0
 if [[ -d "$SUB_SRC" ]]; then
-  for sj in "$SUB_SRC"/*.jsonl; do
+  # Recurse so NESTED workflow subagents are captured, not only direct children
+  # (Task 7c, 260710-learning-repair-p1). Preserve the nested path so distinct
+  # agents never collide on basename.
+  while IFS= read -r sj; do
     [[ -e "$sj" ]] || continue
-    base="$(basename "$sj" .jsonl)"
-    cp -f "$sj" "$SESS/subagents/$base.jsonl" 2>/dev/null || true
-    render "$SESS/subagents/$base.jsonl" "$SESS/subagents/$base.md"
+    rel="${sj#"$SUB_SRC"/}"; rel="${rel%.jsonl}"
+    dst="$SESS/subagents/$rel"
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+    cp -f "$sj" "$dst.jsonl" 2>/dev/null || true
+    render "$dst.jsonl" "$dst.md"
     sub_count=$((sub_count + 1))
-  done
+  done < <(find "$SUB_SRC" -type f -name '*.jsonl' 2>/dev/null)
 fi
 
 # Assemble full.md: the main transcript with every subagent appended at the end.
@@ -64,11 +69,12 @@ fi
   cat "$SESS/main.md" 2>/dev/null
   if [[ "$sub_count" -gt 0 ]]; then
     printf '\n\n---\n\n# Spawned subagents (%d)\n' "$sub_count"
-    for m in "$SESS"/subagents/*.md; do
+    while IFS= read -r m; do
       [[ -e "$m" ]] || continue
-      printf '\n---\n\n## ⤷ Subagent: %s\n\n' "$(basename "$m" .md)"
+      rel="${m#"$SESS"/subagents/}"; rel="${rel%.md}"
+      printf '\n---\n\n## ⤷ Subagent: %s\n\n' "$rel"
       cat "$m" 2>/dev/null
-    done
+    done < <(find "$SESS/subagents" -type f -name '*.md' 2>/dev/null | sort)
   fi
 } > "$SESS/full.md" 2>/dev/null || true
 

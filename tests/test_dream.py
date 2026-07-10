@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 from tests._fixtures import load_cli, build_synthetic_kb, run_cli
@@ -747,6 +748,35 @@ class DreamDetectReportRenderTests(unittest.TestCase):
              "line": 3, "kind": "DECISION", "text": "a choice"},
         ]
 
+    def test_plan_only_section_renders_sorted_when_present(self):
+        plan_only = [
+            {"feature": "260101-b", "rel": "work/260101-b/plan.md",
+             "age_hours": 72.0},
+            {"feature": "260101-a", "rel": "work/260101-a/plan.md",
+             "age_hours": 96.5},
+        ]
+        body = self.mod._dream_render_detect_report(
+            self.report, self.markers, plan_only)
+        self.assertIn("## Plan-only work dirs (2)", body)
+        self.assertLess(body.index("work/260101-a/plan.md"),
+                        body.index("work/260101-b/plan.md"),
+                        "plan-only rows sort by rel")
+        self.assertIn("work/260101-a/plan.md age=96.5h", body)
+
+    def test_plan_only_section_zero_by_default_two_arg(self):
+        # Back-compatible 2-arg call renders the section with count 0 + _none_.
+        body = self.mod._dream_render_detect_report(self.report, self.markers)
+        self.assertIn("## Plan-only work dirs (0)", body)
+
+    def test_plan_only_render_is_byte_stable(self):
+        plan_only = [{"feature": "260101-a", "rel": "work/260101-a/plan.md",
+                      "age_hours": 50.0}]
+        a = self.mod._dream_render_detect_report(
+            self.report, self.markers, plan_only)
+        b = self.mod._dream_render_detect_report(
+            self.report, self.markers, plan_only)
+        self.assertEqual(a, b)
+
     def test_report_enumerates_each_finding(self):
         body = self.mod._dream_render_detect_report(self.report, self.markers)
         # stale: sorted by id (learn-a before learn-z)
@@ -1241,6 +1271,68 @@ class DreamObservabilityE2ETests(unittest.TestCase, _GuardedEnv):
         self.assertLess(hc["age_hours"], 1.0)
         self.assertEqual(hc["outcome"], "partial")
         self.assertFalse(hc["ok"])  # warns: last cycle did not finish clean
+
+
+class DreamPlanOnlyDetectTests(unittest.TestCase, _GuardedEnv):
+    """260710-learning-repair-p1 task 4: step e counts plan-only work dirs
+    (plan.md, no worklog.md, plan older than DREAM_PLAN_ONLY_MIN_AGE_HOURS=48h).
+    READ-ONLY; the report enumerates each. Abandoned plans can no longer vanish
+    silently."""
+
+    def setUp(self):
+        self._save_env()
+        self.addCleanup(self._restore_env)
+        self.kdir = tempfile.mkdtemp(prefix="agentware-dream-planonly-")
+        self.addCleanup(shutil.rmtree, self.kdir, True)
+        build_synthetic_kb(self.kdir)
+        run_cli(["index", "migrate-frontmatter"], self.kdir)
+        _seed_gold(self.kdir)
+        _migrate_kb(self.kdir)
+        self._satisfy_health_gate(self.kdir)
+
+    def _mk(self, feat, plan_age_h=None, worklog=False):
+        d = os.path.join(self.kdir, "work", feat)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "plan.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("# Plan - %s\n" % feat)
+        if plan_age_h is not None:
+            t = time.time() - plan_age_h * 3600
+            os.utime(p, (t, t))
+        if worklog:
+            with open(os.path.join(d, "worklog.md"), "w", encoding="utf-8") as f:
+                f.write("# wl\n\n- did a thing\n")
+
+    def _run_e(self):
+        return run_cli(
+            ["dream", "--steps", "e", "--force", "--format", "json"], self.kdir)
+
+    def test_counts_only_stale_plan_only_dirs(self):
+        self._mk("260101-old-planonly", plan_age_h=72)               # counted
+        self._mk("260101-fresh-planonly", plan_age_h=1)              # too new
+        self._mk("260101-has-worklog", plan_age_h=72, worklog=True)  # has worklog
+        code, out, err = self._run_e()
+        self.assertEqual(code, 0, err)
+        e = json.loads(out)["steps"][0]
+        self.assertEqual(e["plan_only_dirs"], 1, out)
+        body = open(os.path.join(self.kdir, self._mod.DREAM_REPORT_REL),
+                    encoding="utf-8").read()
+        self.assertIn("## Plan-only work dirs (1)", body)
+        self.assertIn("work/260101-old-planonly/plan.md", body)
+        self.assertNotIn("260101-fresh-planonly", body)
+        self.assertNotIn("260101-has-worklog/plan.md", body)
+
+    def test_step_e_stays_read_only_for_plan_only(self):
+        self._mk("260101-old-planonly", plan_age_h=72)
+        plan = os.path.join(self.kdir, "work", "260101-old-planonly", "plan.md")
+        before = open(plan, encoding="utf-8").read()
+        code, _out, err = self._run_e()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(open(plan, encoding="utf-8").read(), before,
+                         "step e must not touch the plan.md it flags")
+        self.assertFalse(os.path.isfile(os.path.join(
+            self.kdir, "work", "260101-old-planonly", "worklog.md")),
+            "step e must not create a worklog for a plan-only dir")
 
 
 if __name__ == "__main__":

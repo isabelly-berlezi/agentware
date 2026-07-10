@@ -10,6 +10,7 @@ in a session. The raw JSONL is copied alongside this file as the lossless record
 this renderer is the human-readable view.
 """
 
+import hashlib
 import json
 import sys
 
@@ -53,6 +54,36 @@ def _render_content(content, out):
             out.append("> 📤 _tool result_: " + _short(c or "", 1500))
 
 
+def _genuine_user_text(content):
+    """Concatenated genuine text of a user message (str or block list); empty
+    when it carries only tool_result / non-text blocks."""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "text":
+            t = b.get("text", "")
+            if isinstance(t, str) and t.strip():
+                parts.append(t)
+    return "\n".join(parts).strip()
+
+
+def _turn_id(entry, role, content):
+    """Stable per-turn id: for a genuine user prompt, the content hash that JOINS
+    to prompts.log (log-prompt.sh writes the same sha1(text.strip())[:12]); else
+    the transcript entry uuid."""
+    if role == "user":
+        txt = _genuine_user_text(content)
+        if txt:
+            return "turn-" + hashlib.sha1(txt.encode("utf-8")).hexdigest()[:12]
+    u = entry.get("uuid")
+    if isinstance(u, str) and u:
+        return "turn-" + u.replace("-", "")[:12]
+    return ""
+
+
 def main(argv):
     if len(argv) < 2:
         sys.stderr.write("usage: render-transcript.py <transcript.jsonl>\n")
@@ -74,13 +105,24 @@ def main(argv):
                     continue
                 msg = entry.get("message") or {}
                 role = msg.get("role") or etype
+                content = msg.get("content")
                 body = []
-                _render_content(msg.get("content"), body)
+                _render_content(content, body)
                 body = [b for b in body if b and b.strip()]
                 if not body:
                     continue
-                label = "🧑 USER" if role == "user" else "🤖 ASSISTANT"
-                lines.append("## [%s] %s" % (_ts(entry), label))
+                # Label by CONTENT, not carrier role (Task 7b): a user-role
+                # message carrying only tool_result blocks is a tool RESULT, not a
+                # genuine prompt. Reserve USER for real operator/loop text.
+                if role == "user":
+                    label = "🧑 USER" if _genuine_user_text(content) else "🛠 TOOL RESULT"
+                else:
+                    label = "🤖 ASSISTANT"
+                tid = _turn_id(entry, role, content)
+                header = "## [%s] %s" % (_ts(entry), label)
+                if tid:
+                    header += "  {#%s}" % tid
+                lines.append(header)
                 lines.append("")
                 lines.extend(body)
                 lines.append("")

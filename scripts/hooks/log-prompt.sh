@@ -20,8 +20,28 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Provenance origin (Task 7a, 260710-learning-repair-p1): loop (agentware.sh
+# exported AGENTWARE_ORIGIN) / system (machine-injection heuristic) / human
+# (default operator prompt). Additive: appended to the header, existing parsers
+# that read the first three bracket groups are unaffected.
+origin="human"
+if [[ -n "${AGENTWARE_ORIGIN:-}" ]]; then
+  origin="loop"
+elif printf '%s' "$prompt" | grep -qiE '<task-notification>|<system-reminder>|<persona-preamble>|^You are (a subagent|Claude Code|the agentware)'; then
+  origin="system"
+fi
+
+# Turn id (Task 7b): content hash joining this record to its rendered turn in
+# sessions/<sid>/main.md (render-transcript.py computes the SAME
+# sha1(text.strip())[:12]). Best-effort (needs python3).
+turn=""
+if command -v python3 >/dev/null 2>&1; then
+  turn="$(printf '%s' "$prompt" | python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.stdin.read().strip().encode("utf-8")).hexdigest()[:12])' 2>/dev/null)"
+fi
+
 {
-  printf '[%s] [session %s] [cwd %s]\n' "$ts" "$sid" "$cwd"
+  printf '[%s] [session %s] [cwd %s] [origin=%s] [turn=%s]\n' "$ts" "$sid" "$cwd" "$origin" "$turn"
   printf '%s\n\n' "$prompt"
 } >> "$LOG_DIR/prompts.log"
 exit 0

@@ -215,5 +215,133 @@ class ScanShapeTestCase(_PromotionKB):
         self.assertEqual(code, 1)
 
 
+class AlsoAssessmentTestCase(_PromotionKB):
+    """260710-learning-repair-p1 task 6: --also-assessment flags Extracted-
+    Knowledge 'Suggested ID' lines in the sibling assessment.md whose ids do not
+    resolve in the live index. Advisory: never changes the exit code (that is
+    still governed by worklog markers)."""
+
+    def _write_assessment(self, text):
+        p = os.path.join(self.kdir, "assessment.md")
+        _write(p, text)
+        return p
+
+    def _scan_ax(self, extra_argv):
+        # Clean worklog (marker slug == a real stem => promoted) so any exit-code
+        # effect must come from the assessment sidecar, not the worklog.
+        wl = self._worklog("# wl\n\n> LEARNED: ci-cache-warming\n")
+        code, out, _ = run_cli(
+            ["worklog", "scan", "--path", wl, "--format", "json"] + extra_argv,
+            self.kdir)
+        return code, json.loads(out)
+
+    def test_flag_absent_field_omitted(self):
+        self._write_assessment(
+            "## Extracted Knowledge\n- **Suggested ID:** `learn-does-not-exist`\n")
+        code, payload = self._scan_ax([])
+        self.assertNotIn("assessment_unpromoted", payload)
+        self.assertEqual(set(payload), {"unpromoted", "total"})
+        self.assertEqual(code, 0)
+
+    def test_unresolved_ids_flagged_both_markdown_styles(self):
+        self._write_assessment(
+            "## Extracted Knowledge\n\n"
+            "### EK-1\n- **Suggested ID:** `learn-does-not-exist`\n"
+            "### EK-2\n- **Suggested ID**: `learn-geofence-reminders` "
+            "*(already promoted)*\n"
+            "### EK-3\n- **Suggested ID**: `learn-another-missing`\n")
+        code, payload = self._scan_ax(["--also-assessment"])
+        self.assertIn("assessment_unpromoted", payload)
+        ids = [i["id"] for i in payload["assessment_unpromoted"]]
+        self.assertEqual(ids, ["learn-does-not-exist", "learn-another-missing"])
+        self.assertNotIn("learn-geofence-reminders", ids)
+        self.assertEqual(code, 0)
+
+    def test_missing_assessment_yields_empty_list(self):
+        code, payload = self._scan_ax(["--also-assessment"])
+        self.assertEqual(payload.get("assessment_unpromoted"), [])
+        self.assertEqual(code, 0)
+
+    def test_line_number_reported(self):
+        self._write_assessment(
+            "intro line\n- **Suggested ID:** `learn-does-not-exist`\n")
+        _code, payload = self._scan_ax(["--also-assessment"])
+        item = payload["assessment_unpromoted"][0]
+        self.assertEqual(item["line"], 2)
+        self.assertEqual(item["id"], "learn-does-not-exist")
+
+    def test_read_only_and_deterministic(self):
+        self._write_assessment(
+            "## Extracted Knowledge\n- **Suggested ID:** `learn-does-not-exist`\n")
+        idx = os.path.join(self.kdir, "index.json")
+        with open(idx, "rb") as f:
+            before = f.read()
+        c1, p1 = self._scan_ax(["--also-assessment"])
+        c2, p2 = self._scan_ax(["--also-assessment"])
+        self.assertEqual(p1, p2)
+        self.assertEqual(c1, c2)
+        with open(idx, "rb") as f:
+            self.assertEqual(before, f.read())
+
+
+class Task2MarkerFormsTestCase(_PromotionKB):
+    """260710-learning-repair-p1 task 2: the scanner must recognize bullet-prefixed
+    markers, the unicode-arrow / `[kb:]` promotion forms, cross-category (skill)
+    references, and `> WAIVED:` closures."""
+
+    def test_bullet_prefixed_marker_is_counted(self):
+        # The exact form that scanned as 0 in the wild (`- > LEARNED:`).
+        code, payload = self._scan("# wl\n\n- > LEARNED: ci\n")
+        self.assertEqual(payload["total"], 1,
+                         "bullet-prefixed marker must be counted")
+        self.assertIn("ci", self._unpromoted_texts(payload))
+        self.assertEqual(code, 1)
+
+    def test_bullet_prefixed_marker_promoted_by_slug(self):
+        code, payload = self._scan("# wl\n\n- > LEARNED: ci-cache-warming\n")
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["unpromoted"], [], payload)
+        self.assertEqual(code, 0)
+
+    def test_unicode_arrow_reference_is_promoted(self):
+        code, payload = self._scan(
+            "# wl\n\n> LEARNED: [promoted → geofence-reminders] arrival fix\n")
+        self.assertEqual(payload["unpromoted"], [], payload)
+        self.assertEqual(code, 0)
+
+    def test_kb_bracket_reference_is_promoted(self):
+        code, payload = self._scan(
+            "# wl\n\n> LEARNED: arrival fix [kb: learn-geofence-reminders]\n")
+        self.assertEqual(payload["unpromoted"], [], payload)
+        self.assertEqual(code, 0)
+
+    def test_waived_line_closes_preceding_marker(self):
+        code, payload = self._scan(
+            "# wl\n\n"
+            "- > LEARNED: something trivial not worth keeping\n"
+            "> WAIVED: too trivial to promote\n")
+        self.assertEqual(payload["total"], 1, "marker still counted in total")
+        self.assertEqual(payload["unpromoted"], [],
+                         "a waived marker is not counted unpromoted")
+        self.assertEqual(code, 0)
+
+    def test_cross_category_skill_reference_is_promoted(self):
+        # A `> LEARNED:` marker promoted INTO a skill resolves against the skill
+        # id even though skills are a different category.
+        _write(os.path.join(self.kdir, "skills", "cache-warming.md"),
+               "# Cache Warming Skill\n")
+        code, payload = self._scan(
+            "# wl\n\n> LEARNED: generalized the tip (Promoted: skill-cache-warming)\n")
+        self.assertEqual(payload["unpromoted"], [], payload)
+        self.assertEqual(code, 0)
+
+    def test_unicode_arrow_regex_extracts_id(self):
+        mod = load_cli()
+        m = mod.PROMOTED_RE.search("x [promoted → learn-foo-bar]")
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1).lower(), "learn-foo-bar")
+        self.assertEqual(mod.promoted_ids("y [kb: decide-baz]"), ["decide-baz"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -192,6 +192,73 @@ class RecallCommandTest(SyntheticKBTestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("recall:", out)
 
+    # --- 260710-learning-repair-p1 task 8: self-defending, resolvable output ---
+    def test_results_carry_self_defending_freshness_fields(self):
+        import json
+        import os
+        code, out, err = self.run_cli(
+            ["recall", "geofence arrive reminders", "--as-of", "2026-06-25",
+             "--format", "json"])
+        self.assertEqual(code, 0, err)
+        payload = json.loads(out)
+        self.assertTrue(payload["results"])
+        for r in payload["results"]:
+            for key in ("abs_path", "created", "last_verified", "age_days"):
+                self.assertIn(key, r)
+            self.assertEqual(r["abs_path"], os.path.join(self.kdir, r["path"]))
+            self.assertTrue(os.path.isabs(r["abs_path"]))
+            self.assertIsInstance(r["age_days"], int)
+            self.assertGreaterEqual(r["age_days"], 0)
+            self.assertEqual(
+                r["age_days"],
+                CLI.date_age_days(r["last_verified"], "2026-06-25"))
+        top = payload["results"][0]
+        self.assertEqual(top["id"], "learn-geofence-reminders")
+        self.assertEqual(top["last_verified"], top["created"])
+        self.assertEqual(top["created"], "2026-01-02")
+
+    def test_added_fields_are_additive_not_ranking_disturbing(self):
+        import json
+        payload = json.loads(self.run_cli(
+            ["recall", "geofence arrive reminders", "--format", "json"])[1])
+        self.assertTrue(payload["results"])
+        NEW = {"abs_path", "created", "last_verified", "age_days"}
+        for r in payload["results"]:
+            self.assertEqual(
+                set(r) - NEW,
+                {"id", "path", "category", "score", "summary",
+                 "estimated_tokens"})
+        scores = [r["score"] for r in payload["results"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_text_mode_renders_abs_path_and_static_stale_footer(self):
+        import os
+        code, out, err = self.run_cli(["recall", "geofence arrive reminders"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("recall:", out)
+        self.assertIn(
+            os.path.join(self.kdir, "learnings/geofence-reminders.md"), out)
+        self.assertIn(
+            "point-in-time values may be stale — verify against live state "
+            "(R-FAIL-08)", out)
+        self.assertEqual(
+            out.count("verify against live state (R-FAIL-08)"), 1)
+
+    def test_query_results_carry_freshness_fields(self):
+        import json
+        import os
+        code, out, _ = self.run_cli(["query", "--tag", "geofence"])
+        self.assertEqual(code, 0)
+        results = json.loads(out)
+        self.assertTrue(results)
+        for r in results:
+            for key in ("abs_path", "created", "last_verified", "age_days"):
+                self.assertIn(key, r)
+            self.assertEqual(r["abs_path"], os.path.join(self.kdir, r["path"]))
+        geo = next(r for r in results if r["id"] == "learn-geofence-reminders")
+        self.assertEqual(geo["category"], "learnings")
+        self.assertEqual(geo["last_verified"], geo["created"])
+
 
 class Bm25AcrStrategyTest(SyntheticKBTestCase):
     """`bm25+acr` (Phase 2.1): ACR re-ranks WITHIN the BM25 set, never adds to it.

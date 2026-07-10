@@ -50,6 +50,16 @@ resp_c="$(printf '%s'  "$input"  | jq -c '.tool_response // {}' 2>/dev/null)"
 [[ -z "$sid" ]] && sid="unknown"
 [[ -z "$tool" ]] && tool="unknown"
 
+# Attribution (Task 7d, 260710-learning-repair-p1): which agent produced this
+# call, so a subagent's tool calls never conflate into the parent session.
+# Derived from transcript_path (subagent paths live under .../subagents/...;
+# mirrors log-subagent.sh). Additive field — the live.jsonl reader ignores it.
+tpath="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)"
+agent="main"
+case "$tpath" in
+  */subagents/*) agent="$(basename "${tpath%.jsonl}")" ;;
+esac
+
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # C-4: bound large tool I/O. Mirrors render-transcript.py's _short(..., 1500)
@@ -77,8 +87,8 @@ mkdir -p "$SESS" 2>/dev/null || exit 0
 # string fields so the line is always valid JSON regardless of tool I/O shape.
 jq -nc \
   --arg ts "$ts" --arg tool "$tool" --arg status "$status" \
-  --arg input "$input_t" --arg response "$resp_t" \
-  '{ts:$ts, tool:$tool, status:$status, input:$input, response:$response}' \
+  --arg input "$input_t" --arg response "$resp_t" --arg agent "$agent" \
+  '{ts:$ts, tool:$tool, status:$status, agent:$agent, input:$input, response:$response}' \
   >> "$SESS/live.jsonl" 2>/dev/null || true
 
 # Human one-line view.

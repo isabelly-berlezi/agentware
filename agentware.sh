@@ -432,7 +432,15 @@ POST_PROMPT="You are assessing the completed implementation of $FEATURE_NAME.
    (.claude/skills/self-improvement/SKILL.md) and note them under
    '## Extracted Knowledge' with: suggested ID, classification (learning /
    skill candidate / steering candidate), one-paragraph summary, suggested
-   wiring location, and tags.
+   wiring location, and tags. Extracted knowledge must NOT live only in
+   assessment.md (that is a silent knowledge leak the worklog-scan gate never
+   reads): for EACH extracted item not already promoted, ALSO append a
+   '> LEARNED: <one-liner>' marker to $DOCS_DIR/worklog.md and immediately
+   promote it via scripts/agentware learn (per the self-improvement skill), then
+   annotate that marker '(Promoted: <id>)' so it resolves. Before emitting
+   POST_COMPLETE, run scripts/agentware worklog scan --path $DOCS_DIR/worklog.md
+   and confirm 0 unpromoted — the kb-sync commit gate re-checks this and aborts
+   the run if any marker is left unpromoted.
 9. Output <promise>POST_COMPLETE</promise> when done"
 
 # MERGE_PROMPT — Phase 5 of the KB git sync (feature 260625-kb-git-sync). Spawned
@@ -537,7 +545,21 @@ learnings_promoted() {
   local kdir
   kdir="$(scripts/agentware config --knowledge-dir-only 2>/dev/null || true)"
   [[ -n "$kdir" && -f "$kdir/.initialized" ]] || return 0
-  [[ -f "$DOCS_DIR/worklog.md" ]] || return 0
+  # Worklog-presence gate (Task 4, 260710-learning-repair-p1). A loop that
+  # ACTUALLY RAN a task this session (LOOP_ITERATIONS_USED >= 1) MUST have left a
+  # non-empty worklog (MAIN_PROMPT step 7) — the zero-knowledge-loss scan below
+  # has nothing to gate on otherwise, and a silent no-op PASS is how capture
+  # collapsed unnoticed. `-s` is false for BOTH a missing and an empty file.
+  # Idleness stays valid: with 0 iterations (onboarding-only run) an absent
+  # worklog keeps the lenient path.
+  if [[ "${LOOP_ITERATIONS_USED:-0}" -ge 1 ]]; then
+    if [[ ! -s "$DOCS_DIR/worklog.md" ]]; then
+      echo "Error: worklog.md is missing or empty at $DOCS_DIR/worklog.md after ${LOOP_ITERATIONS_USED} main iteration(s) ran — a real run must leave a non-empty worklog (MAIN_PROMPT step 7)." >&2
+      return 1
+    fi
+  else
+    [[ -f "$DOCS_DIR/worklog.md" ]] || return 0
+  fi
   scripts/agentware worklog scan --path "$DOCS_DIR/worklog.md" >/dev/null 2>&1
 }
 
@@ -899,6 +921,18 @@ run_post_hooks() {
     fi
   fi
 
+  # Worklog-presence backstop (Task 4, 260710-learning-repair-p1). The scan below
+  # only fails on a MISSING worklog (with a misleading "unpromoted markers"
+  # message) and PASSES an empty one outright. A loop that RAN a task
+  # (LOOP_ITERATIONS_USED >= 1) must have a non-empty worklog — fail loudly and
+  # specifically here first. Placed after the not-initialized early-return so an
+  # uninitialized run never reaches it; idleness (0 iterations) is exempt.
+  if [[ "${LOOP_ITERATIONS_USED:-0}" -ge 1 ]] && [[ ! -s "$DOCS_DIR/worklog.md" ]]; then
+    echo "Error: [post-hook] worklog.md is missing or empty at $DOCS_DIR/worklog.md after ${LOOP_ITERATIONS_USED} main iteration(s) ran."
+    echo "A real run must record a worklog entry per task (MAIN_PROMPT step 7); zero knowledge loss cannot be verified without it."
+    exit 1
+  fi
+
   log "[post-hook] scripts/agentware worklog scan (zero-knowledge-loss gate)"
   if ! scripts/agentware worklog scan --path "$DOCS_DIR/worklog.md"; then
     echo "Error: [post-hook] unpromoted '> LEARNED:' / '> DECISION:' markers remain in $DOCS_DIR/worklog.md."
@@ -1228,6 +1262,10 @@ run_phase() {
   # stage so its session is attributed to loop-pre / loop-post (the main loop sets
   # loop-main). Read by the metrics stage classifier (_STAGE_TO_PHASE).
   export AGENTWARE_STAGE="loop-$phase_name"
+  # Provenance origin (Task 7a, 260710-learning-repair-p1): spawned CLIs inherit
+  # this; log-prompt.sh tags their records origin=loop. run_phase runs only for
+  # pre/post -> loop-pre / loop-post.
+  export AGENTWARE_ORIGIN="loop-$phase_name"
 
   for i in $(seq 1 "$max_iter"); do
     echo "$i" > "$STATE_DIR/.${phase_name}_iteration"
@@ -1344,6 +1382,7 @@ AW_BLOCKER_HALT="AW_BLOCKER_HALT"
 
 # Stage propagation (Task 7): main-loop spawns are attributed to loop-main.
 export AGENTWARE_STAGE="loop-main"
+export AGENTWARE_ORIGIN="loop-exec"  # Provenance origin (Task 7a): main-loop spawns tag origin=loop
 
 for i in $(seq 1 "$MAX_ITERATIONS"); do
   echo "$i" > "$STATE_DIR/.iteration"
