@@ -4782,25 +4782,52 @@ def build_work_corpus(kdir):
     work_dir = os.path.join(kdir, "work")
     if not os.path.isdir(work_dir):
         return []
-    corpus = []
-    for feature_dir in sorted(os.listdir(work_dir)):
-        fpath = os.path.join(work_dir, feature_dir)
-        if not os.path.isdir(fpath):
+    # Enumerate features ONE level deeper for the auto/ lane (feature 260710):
+    # (feature_id, feature_path). A top-level `auto` dir is a container, not a
+    # feature — descend into work/auto/<slug>/ and namespace the id as auto/<slug>.
+    feature_dirs = []
+    for name in sorted(os.listdir(work_dir)):
+        p = os.path.join(work_dir, name)
+        if not os.path.isdir(p):
             continue
-        # Extract created date from YYMMDD prefix (e.g. 260630-feature-name)
-        date_match = _re.match(r"(\d{6})", feature_dir)
+        if name == "auto":
+            try:
+                for sub in sorted(os.listdir(p)):
+                    sp = os.path.join(p, sub)
+                    if os.path.isdir(sp):
+                        feature_dirs.append(("auto/" + sub, sp))
+            except OSError:
+                pass
+        else:
+            feature_dirs.append((name, p))
+    corpus = []
+    for feature_id, fpath in feature_dirs:
+        slug = feature_id.split("/")[-1]
+        # Extract created date from the slug's YYMMDD prefix (stable, not mtime).
+        date_match = _re.match(r"(\d{6})", slug)
         created = ""
         if date_match:
             d = date_match.group(1)
             created = "20%s-%s-%s" % (d[:2], d[2:4], d[4:6])
+        # Parse the feature's plan.md `> Status:` ONCE; every sibling doc inherits
+        # the same feature-level BM25 multiplier (feature 260710).
+        feat_state = _PLAN_DEFAULT_STATE
+        plan_md = os.path.join(fpath, "plan.md")
+        if os.path.isfile(plan_md):
+            try:
+                with open(plan_md, "r", encoding="utf-8") as f:
+                    feat_state, _c = _read_plan_status(f.read())
+            except (IOError, UnicodeDecodeError):
+                pass
+        status_mult = _work_status_multiplier(feat_state)
         for fname in sorted(os.listdir(fpath)):
             if not fname.endswith(".md"):
                 continue
             md_path = os.path.join(fpath, fname)
             if not os.path.isfile(md_path):
                 continue
-            rel_path = "work/%s/%s" % (feature_dir, fname)
-            entry_id = "%s/%s" % (feature_dir, fname.replace(".md", ""))
+            rel_path = "work/%s/%s" % (feature_id, fname)
+            entry_id = "%s/%s" % (feature_id, fname.replace(".md", ""))
             # Extract title from first heading
             title = ""
             try:
@@ -4826,6 +4853,8 @@ def build_work_corpus(kdir):
                 "path": rel_path,
                 "category": "work",
                 "created": created,
+                "status": feat_state,
+                "status_mult": status_mult,
             }
             doc_text = "\n".join([title, "", body])
             corpus.append((pseudo_entry, doc_text))
@@ -8080,6 +8109,11 @@ def cmd_recall(args):
         else:
             query_tokens = tokenize(args.query)
             scored = bm25_scores(work_corpus, query_tokens)
+            # Plan-status BM25 multiplier (feature 260710): superseded/cancelled
+            # ×0.3, done ×0.7, draft/ready/running/MISSING ×1.0. Siblings inherit
+            # their feature's plan multiplier via the pseudo_entry. --scope work
+            # ONLY — the default/curated path is byte-unchanged (gold-fixture gate).
+            scored = [(e, s * e.get("status_mult", 1.0)) for (e, s) in scored]
             # Sort: score desc -> created desc -> id asc
             scored.sort(key=lambda es: es[0].get("id") or "")
             scored.sort(key=lambda es: es[0].get("created") or "", reverse=True)
@@ -9753,13 +9787,28 @@ def list_loop_features(kdir):
     unit the loop operates on (read-only directory listing; [] when absent)."""
     work = os.path.join(kdir, "work")
     out = []
+
+    def _is_feature(d):
+        return os.path.isfile(os.path.join(d, "plan.md")) or \
+            os.path.isdir(os.path.join(d, ".loop"))
+
     try:
         for name in sorted(os.listdir(work)):
             fdir = os.path.join(work, name)
             if not os.path.isdir(fdir):
                 continue
-            if os.path.isfile(os.path.join(fdir, "plan.md")) or \
-                    os.path.isdir(os.path.join(fdir, ".loop")):
+            # The auto/ container is not itself a feature — descend one level so
+            # workorders (work/auto/<slug>/) surface too (feature 260710).
+            if name == "auto":
+                try:
+                    for sub in sorted(os.listdir(fdir)):
+                        sp = os.path.join(fdir, sub)
+                        if os.path.isdir(sp) and _is_feature(sp):
+                            out.append("auto/" + sub)
+                except OSError:
+                    pass
+                continue
+            if _is_feature(fdir):
                 out.append(name)
     except OSError:
         return []
@@ -12228,6 +12277,95 @@ _PLAN_VERIFY_RE = re.compile(r"\*Verify:\*")
 _PLAN_VERIFY_NONEMPTY_RE = re.compile(r"\*Verify:\*\s*\S")
 _PLAN_PROMISE_RE = re.compile(r"<promise>[A-Z0-9_]+</promise>")
 
+# --- Plan state machine (feature 260710-plan-state-machine) -------------------
+# Toolkit-owned plan-LEVEL lifecycle, team-visible through git: a `> Status:`
+# header line in plan.md + an append-only `## Status log` section. `plan set-state`
+# is the SOLE writer. The SIX states and the FULL legal-transition matrix below
+# are the single source of truth — any (from, to) edge NOT present in
+# _PLAN_STATE_TRANSITIONS is REFUSED with a clear error. A plan with no `> Status:`
+# header reads as `draft` (legacy plans). Header parsing is FIRST-MATCH from the
+# top of the file; a later/duplicate status-like line is ignored here and flagged
+# by lint.
+_PLAN_STATES = ("draft", "ready", "running", "done", "superseded", "cancelled")
+_PLAN_TERMINAL_STATES = ("done", "superseded", "cancelled")
+_PLAN_DEFAULT_STATE = "draft"
+_PLAN_STATUS_HEADER_RE = re.compile(r"^>\s*Status:\s*([A-Za-z-]+)\s*$", re.M)
+_PLAN_CLAIMED_BY_RE = re.compile(r"^>\s*Claimed-by:\s*(.+?)\s*$", re.M)
+_PLAN_SUPERSEDED_BY_RE = re.compile(r"^>\s*Superseded-by:\s*(.+?)\s*$", re.M)
+_PLAN_STATUS_LOG_HEADING = "## Status log"
+
+# Re-claim staleness: a `running` plan whose `> Claimed-by:` timestamp is older
+# than this many hours may be re-claimed by ANY actor (crash recovery). Shared by
+# the set-state running->running edge AND dream's report-only drift detection.
+STALLED_CLAIM_HOURS = 72
+
+# `recall --scope work` BM25 multipliers by plan state (feature 260710): a
+# superseded/cancelled feature is strongly downranked, done moderately, and
+# draft/ready/running/MISSING are neutral. Confined to --scope work — the default/
+# curated ranking is byte-unchanged (gold-fixture gate).
+_WORK_STATUS_MULT = {"superseded": 0.3, "cancelled": 0.3, "done": 0.7}
+
+
+def _work_status_multiplier(state):
+    """Multiplier for a plan state; draft/ready/running/MISSING -> 1.0 (neutral)."""
+    return _WORK_STATUS_MULT.get((state or "").lower(), 1.0)
+
+# The FULL legal transition matrix. Key = (from_state, to_state); value dict:
+#   actors — allowed --actor values, or None for any actor.
+#   needs  — required argv: 'reason' and/or 'superseded_by'.
+# Non-argv gates (draft->ready readiness, running->done open-markers==0,
+# running->running re-claim) are enforced in cmd_plan_set_state, not here. Any
+# edge absent from this dict is REFUSED. `done` is terminal except done->superseded.
+_PLAN_STATE_TRANSITIONS = {
+    ("draft", "ready"): {"actors": None, "needs": ()},
+    ("ready", "draft"): {"actors": None, "needs": ("reason",)},
+    ("ready", "running"): {"actors": ("loop", "operator"), "needs": ()},
+    ("running", "running"): {"actors": ("loop", "operator"), "needs": ()},
+    ("running", "done"): {"actors": ("loop", "operator"), "needs": ()},
+    ("draft", "superseded"): {"actors": None, "needs": ("superseded_by",)},
+    ("ready", "superseded"): {"actors": None, "needs": ("superseded_by",)},
+    ("done", "superseded"): {"actors": None, "needs": ("superseded_by",)},
+    ("running", "superseded"): {"actors": ("operator",), "needs": ("superseded_by",)},
+    ("draft", "cancelled"): {"actors": None, "needs": ("reason",)},
+    ("ready", "cancelled"): {"actors": None, "needs": ("reason",)},
+    ("running", "cancelled"): {"actors": ("operator",), "needs": ("reason",)},
+    ("cancelled", "draft"): {"actors": ("operator",), "needs": ("reason",)},
+}
+
+# Merge precedence for a `> Status:` header CONFLICT (pitfall f): the
+# legally-downstream state wins, and a terminal state beats a non-terminal one.
+_PLAN_STATE_RANK = {
+    "draft": 0, "ready": 1, "running": 2,
+    "done": 3, "cancelled": 4, "superseded": 5,
+}
+
+# The EXACT emitter placeholder signatures `_plan_skeleton` writes for an unfilled
+# Context / Target / Verify / Acceptance. `plan lint --readiness` fails while ANY
+# of these SIGNATURES remain (signature match, NOT any mention of "TODO"); the
+# em-dash and punctuation are load-bearing — keep byte-identical to _plan_skeleton.
+_PLAN_READINESS_SIGNATURES = (
+    "_TODO: problem, goal, design, constraints, environment, pitfalls._",
+    "TODO: replace with the absolute or ~-rooted directory path(s) this "
+    "plan targets",
+    "*Verify:* TODO — exercise the feature end-to-end and capture the outcome.",
+    "- [ ] TODO: define the verifiable acceptance criteria.",
+)
+_PLAN_ACCEPT_PLACEHOLDER = "TODO: define the verifiable acceptance criteria"
+
+# --- Workorders + emit-time governance (feature 260710-plan-state-machine) -----
+# Background/autonomous work units are WORKORDERS under work/auto/<slug>/. Kernel
+# paths a MACHINE-generated plan (`plan new --auto`) may NEVER target: it can never
+# be born a self-extension (decide-self-correction-governance-tiers, guard g1).
+# Human self-extensions still route through R-PKG-03..06; this only fences the
+# emitter.
+_KERNEL_PATH_TOKENS = (
+    "scripts/agentware", "scripts/hooks", ".claude", "steering",
+    "AGENTS.md", "CLAUDE.md", "agentware.sh",
+)
+WORKORDER_DRAFT_CAP = 5   # g3: max concurrent draft/ready workorders under work/auto/
+SCHEMA_REL = ".schema"    # KB schema-version sidecar (full runner in the migrate cmd)
+_WORKORDER_SLUG_RE = re.compile(r"^\d{6}-")  # YYMMDD- (lint WARN otherwise)
+
 _PLAN_MARKER_HINT = ("expected a well-formed marker like `- ⬜ **N**` "
                      "(emoji ⬜/🟡/✅ + bold digit)")
 _PLAN_R7_TOKENS = ("R-KB", "index validate", "learn", "features")
@@ -12321,12 +12459,18 @@ def plan_target_dirs(text):
     return dirs
 
 
-def lint_plan(text, strict=False):
-    """Apply the structural plan-format rules R1–R11 to `text`.
+def lint_plan(text, strict=False, rel_path=None, schema_version=0):
+    """Apply the structural plan-format rules R1–R13 to `text`.
 
     Returns (errors, warnings); each is a list of {rule, line, message}. R1 (file
     existence) is handled by the caller before this runs. Read-only (INV-2): never
     mutates anything. R9 is a warning by default and an error under `strict`.
+
+    `rel_path` (the plan's KB-relative POSIX path, e.g. `work/auto/<slug>/plan.md`)
+    drives R12 (workorder provenance headers required under work/auto/), whose
+    severity flips WARN->error once `schema_version >= 1` (the deterministic,
+    versioned flip — no config flag). R13 binds the declared `> Status:` header to
+    derived task reality.
     """
     errors, warnings = [], []
 
@@ -12468,6 +12612,44 @@ def lint_plan(text, strict=False):
             "'## Target packages' section has no valid directory paths — add "
             "at least one absolute or ~-rooted path (e.g. `- ~/workspace/pkg`)")
 
+    # R12 — workorders (plans under work/auto/) MUST carry provenance headers.
+    # Severity: WARN while the KB schema < 1, ERROR once schema >= 1 (the
+    # deterministic, versioned flip — no config flag).
+    if rel_path and rel_path.startswith("work/auto/"):
+        bucket = errors if schema_version >= 1 else warnings
+        missing = [h for h in ("Origin", "Generated-by", "Trigger")
+                   if not re.search(r"(?m)^>\s*%s:\s*\S" % h, header_text)]
+        if missing:
+            add(bucket, "R12", 1,
+                "workorder under work/auto/ is missing provenance header(s): %s "
+                "(emit via `plan new --auto --generated-by … --trigger …`)"
+                % ", ".join("> %s:" % m for m in missing))
+        # Slug SHOULD be YYMMDD- (WARN only).
+        parts = rel_path.split("/")
+        slug = parts[2] if len(parts) > 2 else ""
+        if slug and not _WORKORDER_SLUG_RE.match(slug):
+            add(warnings, "R12", 1,
+                "workorder slug %r does not match the YYMMDD- convention" % slug)
+
+    # R13 — status-reality binding: the declared `> Status:` must be one of the
+    # six states, unique, and consistent with derived task reality.
+    state, status_count = _read_plan_status(text)
+    if status_count > 1:
+        add(errors, "R13", 1,
+            "plan carries %d `> Status:` header lines (duplicate/hand-edited) — "
+            "exactly one is allowed; header parsing is first-match" % status_count)
+    elif status_count == 1 and state not in _PLAN_STATES:
+        add(errors, "R13", 1,
+            "unrecognized `> Status: %s` — one of: %s"
+            % (state, ", ".join(_PLAN_STATES)))
+    if status_count >= 1 and state == "done":
+        open_n = _plan_open_marker_count(text)
+        if open_n > 0:
+            bucket = errors if strict else warnings
+            add(bucket, "R13", 1,
+                "declared `> Status: done` but %d open task marker(s) remain "
+                "(a done plan must have every task ✅)" % open_n)
+
     return errors, warnings
 
 
@@ -12484,9 +12666,27 @@ def _emit_plan_lint(result, as_json):
     return 0 if result["ok"] else 1
 
 
+def _plan_rel_path(path):
+    """The plan's knowledge-dir-relative POSIX path (e.g. work/auto/<slug>/
+    plan.md), or None when unresolved or outside the KB (so R12 degrades to a
+    no-op for an arbitrary --path)."""
+    kdir = resolve_knowledge_dir()
+    if not kdir:
+        return None
+    try:
+        rel = os.path.relpath(os.path.abspath(path), os.path.abspath(kdir))
+    except (ValueError, OSError):
+        return None
+    rel = rel.replace(os.sep, "/")
+    if rel.startswith("../") or rel == "..":
+        return None
+    return rel
+
+
 def cmd_plan_lint(args):
     path = args.path
     strict = bool(getattr(args, "strict", False))
+    readiness = bool(getattr(args, "readiness", False))
     as_json = getattr(args, "format", "text") == "json"
 
     # R1 — the file exists and is readable.
@@ -12506,7 +12706,19 @@ def cmd_plan_lint(args):
                          "message": "cannot read plan file %s: %s" % (path, exc)}]},
             as_json)
 
-    errors, warnings = lint_plan(text, strict=strict)
+    # --readiness — the mechanical draft->ready gate (placeholder SIGNATURES gone
+    # + >=1 real acceptance checkbox). Distinct from structural lint.
+    if readiness:
+        ok, reasons = _plan_readiness(text)
+        errs = [{"rule": "readiness", "line": 0, "message": r} for r in reasons]
+        return _emit_plan_lint(
+            {"ok": ok, "errors": errs, "warnings": []}, as_json)
+
+    rel_path = _plan_rel_path(path)
+    kdir = resolve_knowledge_dir()
+    schema_version = _kb_schema_read(kdir) if kdir else 0
+    errors, warnings = lint_plan(text, strict=strict, rel_path=rel_path,
+                                 schema_version=schema_version)
     result = {"ok": len(errors) == 0, "errors": errors, "warnings": warnings}
     return _emit_plan_lint(result, as_json)
 
@@ -12556,13 +12768,33 @@ def _plan_path(kdir, feature):
     return os.path.join(kdir, "work", feature, "plan.md")
 
 
-def _plan_skeleton(feature, title, max_iterations, self_extension, author=None):
+def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
+                   origin=None, generated_by=None, trigger=None, evidence=None,
+                   target_seed=None):
     """Build the canonical, lint-passing plan skeleton.
 
     ALWAYS seeds the mandatory trailing pair: a penultimate `[e2e]` task (literal
     token + non-empty Verify -> R6) and a final `[kb]` task embedding an R7 token
     (`index validate`/`learn`/`features` -> R7). There is no flag to omit them.
+
+    When `origin == 'auto'` the skeleton also carries the four workorder
+    provenance headers (`> Origin: auto`, `> Generated-by:`, `> Trigger:`,
+    optional `> Evidence:`), and `target_seed` (when given) replaces the Target
+    packages TODO stub with real path row(s).
     """
+    prov_block = ""
+    if origin == "auto":
+        prov_block = ("> Origin: auto\n"
+                      "> Generated-by: %s\n"
+                      "> Trigger: %s\n"
+                      % (generated_by or "unknown", trigger or "unspecified"))
+        if evidence:
+            prov_block += "> Evidence: %s\n" % evidence
+    if target_seed:
+        target_block = "%s\n\n" % target_seed
+    else:
+        target_block = ("- TODO: replace with the absolute or ~-rooted directory "
+                        "path(s) this plan targets\n\n")
     warning = ""
     if self_extension:
         warning = (
@@ -12584,6 +12816,8 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None):
         "# Plan — %s\n\n"
         "> Feature: `%s`\n"
         "> Created: %s\n"
+        "> Status: draft\n"
+        "%s"
         "%s"
         "> Type: %s\n\n"
         "---\n\n"
@@ -12592,8 +12826,7 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None):
         "_TODO: problem, goal, design, constraints, environment, pitfalls._\n\n"
         "---\n\n"
         "## Target packages\n\n"
-        "- TODO: replace with the absolute or ~-rooted directory path(s) this "
-        "plan targets\n\n"
+        "%s"
         "---\n\n"
         "## Tasks\n\n"
         "- ⬜ **1** [e2e] End-to-end verification of the feature.\n"
@@ -12611,10 +12844,11 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None):
         "- **Max iterations:** %d\n"
         "- **Self-extension:** %s\n\n"
         "<promise>%s</promise>\n"
-        % (title, feature, _today(), author_line,
+        % (title, feature, _today(), prov_block, author_line,
            "**self-extension (package change)**" if self_extension
            else "feature work",
-           warning, int(max_iterations), selfext_line, _plan_promise(feature))
+           warning, target_block, int(max_iterations), selfext_line,
+           _plan_promise(feature))
     )
 
 
@@ -12656,11 +12890,348 @@ def _load_plan_for_edit(kdir, feature):
     return text, None
 
 
+def _kb_schema_read(kdir):
+    """Read the KB schema version from <kdir>/.schema; missing/unreadable => 0
+    (a pre-versioning KB — the bootstrap contract). The full migrate runner
+    (writes, journaling, guards) lives in cmd_migrate."""
+    try:
+        with open(os.path.join(kdir, SCHEMA_REL), "r", encoding="utf-8") as f:
+            return int((f.read() or "0").strip() or "0")
+    except (OSError, ValueError):
+        return 0
+
+
+# --- KB schema versioning + migration runner (feature 260710-plan-state-machine)
+# The package carries KB_SCHEMA_VERSION (the max registered migration version);
+# the KB records its own version in <kdir>/.schema (missing => 0, pre-versioning).
+# An idempotent, non-destructive runner applies pending migrations: ADDITIVE ones
+# auto-apply + journal; a RESTRUCTURING one is REFUSED with a suggested-workorder
+# instruction (tier mapping per decide-self-correction-governance-tiers). An older
+# CLL (KB_SCHEMA_VERSION < .schema) fails loud read-only on any KB write.
+# Each migration: (version:int, tier:'additive'|'restructuring', name:str,
+#                  fn:callable(kdir)) — fn MUST be idempotent + non-destructive.
+def _run_state_backfill(kdir, now_iso=None):
+    """Stamp `> Status:` on every legacy work/*/plan.md AND work/auto/*/plan.md
+    that lacks one, deriving `done` (metrics terminal `completed` > `.loop/.done` >
+    all-tasks-✅, via derive_outcome) else `draft`. NEVER overwrites an existing
+    status; skips the live loop feature (is_session_active) and unparseable plans
+    (logged); appends a `backfilled by migration-001` status-log line per stamp.
+    Idempotent + non-destructive. Returns a summary dict."""
+    now_iso = now_iso or _now_iso()
+    work = os.path.join(kdir, "work")
+    live = is_session_active(kdir)
+    stamped, skipped_existing, skipped_live, skipped_unparseable = [], [], [], []
+    feats = []
+    try:
+        for name in sorted(os.listdir(work)):
+            fdir = os.path.join(work, name)
+            if not os.path.isdir(fdir):
+                continue
+            if name == "auto":
+                try:
+                    for sub in sorted(os.listdir(fdir)):
+                        if os.path.isdir(os.path.join(fdir, sub)):
+                            feats.append("auto/" + sub)
+                except OSError:
+                    pass
+            else:
+                feats.append(name)
+    except OSError:
+        return {"stamped": [], "skipped_existing": [], "skipped_live": [],
+                "skipped_unparseable": []}
+    for feat in feats:
+        path = _plan_path(kdir, feat)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            skipped_unparseable.append(feat)
+            sys.stderr.write("migration-001: skipping unreadable plan %s\n" % feat)
+            continue
+        # Plan-shaped? Needs a title or a `> Feature:`/`> Created:` header anchor,
+        # else it is one of the legacy non-plan variants -> skip (never crash).
+        if not (re.search(r"(?m)^#\s", text)
+                or re.search(r"(?m)^>\s*(Feature|Created):", text)):
+            skipped_unparseable.append(feat)
+            sys.stderr.write("migration-001: skipping unparseable plan %s\n" % feat)
+            continue
+        _state, cnt = _read_plan_status(text)
+        if cnt >= 1:
+            skipped_existing.append(feat)   # NEVER overwrite an existing status
+            continue
+        if feat == live:
+            skipped_live.append(feat)       # the loop stamps it done at run end
+            continue
+        outcome = derive_outcome(kdir, feat)
+        state = "done" if (outcome and outcome.get("outcome") == "completed") \
+            else "draft"
+        lines = text.splitlines()
+        lines = _set_header_line(lines, "Status", state)
+        lines = _append_status_log(
+            lines, "- %s (none) -> %s by migration-001 reason: backfilled by "
+                   "migration-001" % (now_iso, state))
+        out = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+        _atomic_write(path, out)
+        stamped.append({"feature": feat, "state": state})
+    return {"stamped": stamped, "skipped_existing": skipped_existing,
+            "skipped_live": skipped_live,
+            "skipped_unparseable": skipped_unparseable}
+
+
+def _migration_001_state_backfill(kdir):
+    """Migration 001 (additive tier): dogfood the state machine by stamping a
+    derived `> Status:` on every pre-existing plan. Idempotent + non-destructive."""
+    return _run_state_backfill(kdir)
+
+
+# Registered migrations, ascending version. 001 = plan state-backfill (additive).
+_KB_MIGRATIONS = ((1, "additive", "plan-state-backfill",
+                   _migration_001_state_backfill),)
+KB_SCHEMA_VERSION = max((m[0] for m in _KB_MIGRATIONS), default=0)
+_KB_MIGRATION_JOURNAL_REL = os.path.join("logs", "migrations.jsonl")
+
+
+def _kb_schema_write(kdir, n):
+    """Stamp <kdir>/.schema atomically."""
+    _atomic_write(os.path.join(kdir, SCHEMA_REL), "%d\n" % int(n))
+
+
+def _kb_pending_migrations(kdir):
+    """Registered migrations with version > the KB's current schema, in order."""
+    cur = _kb_schema_read(kdir)
+    return [m for m in _KB_MIGRATIONS if m[0] > cur]
+
+
+def _kb_journal_migration(kdir, record):
+    """Append one JSON line to <kdir>/logs/migrations.jsonl (best-effort audit)."""
+    try:
+        path = os.path.join(kdir, _KB_MIGRATION_JOURNAL_REL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        sys.stderr.write("agentware: migration journal write failed: %s\n" % exc)
+
+
+def _kb_migrate_apply(kdir):
+    """Apply pending ADDITIVE migrations in order (journal each), then stamp
+    .schema. A RESTRUCTURING migration STOPS the run (refusal) without applying
+    it. Returns (result, error): error is set only for the older-CLI guard.
+    result = {applied:[…], schema:int, pending:int, refused:{…}|None}."""
+    cur = _kb_schema_read(kdir)
+    if cur > KB_SCHEMA_VERSION:
+        return None, ("older CLI (schema %d) on a newer KB (schema %d) — refusing "
+                      "any write; update the agentware package first"
+                      % (KB_SCHEMA_VERSION, cur))
+    pending = _kb_pending_migrations(kdir)
+    applied, reached, refused = [], cur, None
+    for (ver, tier, name, fn) in pending:
+        if tier != "additive":
+            refused = {"version": ver, "name": name, "tier": tier}
+            break
+        fn(kdir)
+        rec = {"ts": _now_iso(), "version": ver, "name": name, "tier": tier}
+        _kb_journal_migration(kdir, rec)
+        applied.append(rec)
+        reached = ver
+    target = reached if refused else KB_SCHEMA_VERSION
+    _kb_schema_write(kdir, target)
+    return {"applied": applied, "schema": target,
+            "pending": len(pending) - len(applied), "refused": refused}, None
+
+
+def _kb_writer_funcs():
+    """The KB-INDEX-writing command funcs whose dispatch triggers the cheap
+    pending-migration auto-apply (resolved at call time to avoid def-ordering).
+    Plan writers are excluded (state-backfill IS a migration — would recurse)."""
+    return {cmd_index_add, cmd_index_remove, cmd_index_sync, cmd_index_rebuild,
+            cmd_learn, cmd_decide, cmd_ingest}
+
+
+def _kb_predispatch_gate(args):
+    """On a KB-WRITING command dispatch: (1) older-CLI guard — refuse the write
+    loudly on a newer KB; (2) cheap pending-check + auto-apply of ADDITIVE
+    migrations FIRST (the on-first-CLI-use trigger). No-op for readers and for an
+    unconfigured/uninitialized KB. Returns an exit code to short-circuit, else None."""
+    if getattr(args, "func", None) not in _kb_writer_funcs():
+        return None
+    kdir = resolve_knowledge_dir()
+    if not kdir or not os.path.isdir(kdir):
+        return None
+    if not os.path.isfile(os.path.join(kdir, SENTINEL_REL)):
+        return None   # uninitialized: init/onboarding path — never migrate
+    cur = _kb_schema_read(kdir)
+    if cur > KB_SCHEMA_VERSION:
+        sys.stderr.write(
+            "agentware: refusing to write — this CLI is schema %d but the KB is "
+            "schema %d (older CLI on a newer KB). Update the agentware package "
+            "first.\n" % (KB_SCHEMA_VERSION, cur))
+        return 1
+    if cur < KB_SCHEMA_VERSION:
+        result, err = _kb_migrate_apply(kdir)
+        if err:
+            sys.stderr.write("agentware: %s\n" % err)
+            return 1
+        if result.get("refused"):
+            r = result["refused"]
+            sys.stderr.write(
+                "agentware: a restructuring migration (%d %s) is pending — run "
+                "`scripts/agentware migrate --apply` (it will emit a migration "
+                "workorder) before writing.\n" % (r["version"], r["name"]))
+            return 1
+    return None
+
+
+def cmd_migrate(args):
+    """`migrate --list` (read-only) / `migrate --apply` (apply + stamp .schema).
+
+    Pinned output: `--list` prints `migrate: schema <cur> -> <target>, <k> pending`
+    or `migrate: up to date (schema <N>, 0 pending)`; `--apply` with nothing
+    pending prints exactly `migrate: up to date (schema <N>, 0 pending)`.
+    """
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    as_json = getattr(args, "format", "text") == "json"
+    cur = _kb_schema_read(kdir)
+    target = KB_SCHEMA_VERSION
+
+    if getattr(args, "apply", False):
+        result, err = _kb_migrate_apply(kdir)
+        if err:
+            if as_json:
+                json.dump({"ok": False, "error": err}, sys.stdout,
+                          ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                sys.stderr.write("migrate: %s\n" % err)
+            return 1
+        applied = result.get("applied", [])
+        refused = result.get("refused")
+        if as_json:
+            json.dump({"ok": not refused, "applied": applied,
+                       "schema": result["schema"], "pending": result["pending"],
+                       "refused": refused}, sys.stdout, ensure_ascii=False,
+                      indent=2)
+            sys.stdout.write("\n")
+        if refused:
+            print("migrate: refusing to auto-apply RESTRUCTURING migration %d "
+                  "(%s) — create a migration workorder: `scripts/agentware plan "
+                  "new --auto <YYMMDD>-migrate-%d --generated-by migrate --trigger "
+                  "schema-%d --title 'apply migration %d'`"
+                  % (refused["version"], refused["name"], refused["version"],
+                     refused["version"], refused["version"]))
+            return 1
+        if not applied:
+            print("migrate: up to date (schema %d, 0 pending)" % result["schema"])
+        else:
+            print("migrate: applied %d migration(s) -> schema %d"
+                  % (len(applied), result["schema"]))
+        return 0
+
+    # --list (read-only; NEVER creates .schema)
+    pending = _kb_pending_migrations(kdir)
+    if as_json:
+        json.dump({"ok": True, "schema": cur, "target": target,
+                   "pending": [{"version": m[0], "tier": m[1], "name": m[2]}
+                               for m in pending]},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    if not pending:
+        print("migrate: up to date (schema %d, 0 pending)" % cur)
+    else:
+        print("migrate: schema %d -> %d, %d pending" % (cur, target, len(pending)))
+    return 0
+
+
+def _target_hits_kernel(target):
+    """g1: does a target path resolve into the agentware package / a kernel path?
+    True for the package root itself, anything inside it, and any kernel token."""
+    if not target:
+        return False
+    raw = target.strip()
+    low = raw.lower()
+    for tok in _KERNEL_PATH_TOKENS:
+        if tok.lower() in low:
+            return True
+    ap = os.path.abspath(os.path.expanduser(raw))
+    root = os.path.abspath(REPO_ROOT)
+    return ap == root or ap.startswith(root + os.sep)
+
+
+def _count_auto_open_workorders(kdir):
+    """g3: count workorders under work/auto/ whose status is draft or ready."""
+    n = 0
+    base = os.path.join(kdir, "work", "auto")
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return 0
+    for name in names:
+        p = os.path.join(base, name, "plan.md")
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                state, _c = _read_plan_status(f.read())
+        except OSError:
+            continue
+        if state in ("draft", "ready"):
+            n += 1
+    return n
+
+
 def cmd_plan_new(args):
     kdir = require_knowledge_dir()
     if not kdir:
         return 1
-    path = _plan_path(kdir, args.feature)
+    feature = args.feature
+    auto = bool(getattr(args, "auto", False))
+    origin = generated_by = trigger = evidence = target_seed = None
+    self_extension = bool(getattr(args, "self_extension", False))
+
+    if auto:
+        # The emitter PREPENDS auto/ itself — a slug already containing '/' is an
+        # error (no double-prefix ambiguity).
+        if "/" in feature:
+            sys.stderr.write(
+                "agentware: --auto slug must NOT contain '/'; the emitter prepends "
+                "'auto/' (got %r)\n" % feature)
+            return 1
+        generated_by = _sanitize_provenance(getattr(args, "generated_by", None))
+        trigger = _sanitize_provenance(getattr(args, "trigger", None))
+        evidence = _sanitize_provenance(getattr(args, "evidence", None))
+        if not generated_by or not trigger:
+            sys.stderr.write("agentware: --auto requires --generated-by and "
+                             "--trigger (provenance headers)\n")
+            return 1
+        origin = "auto"
+        self_extension = False   # machine plans can never be self-extensions (g1)
+        feature = "auto/" + feature
+        # g1 — kernel-path refusal on every explicit --target; default = the kdir.
+        targets = getattr(args, "target", None) or []
+        for t in targets:
+            if _target_hits_kernel(t):
+                sys.stderr.write(
+                    "agentware: refusing a workorder targeting a kernel path / the "
+                    "agentware package (%s) — machine-generated plans can never be "
+                    "self-extensions (g1)\n" % t)
+                return 1
+        target_seed = ("\n".join("- %s" % t for t in targets) if targets
+                       else "- %s" % kdir)
+        # g3 — concurrent draft/ready cap under work/auto/.
+        open_wo = _count_auto_open_workorders(kdir)
+        if open_wo >= WORKORDER_DRAFT_CAP:
+            sys.stderr.write(
+                "agentware: refusing a new workorder — %d draft/ready workorders "
+                "already exist under work/auto/ (lifecycle cap %d; cancel or "
+                "complete some first)\n" % (open_wo, WORKORDER_DRAFT_CAP))
+            return 1
+
+    path = _plan_path(kdir, feature)
     if os.path.exists(path) and not getattr(args, "force", False):
         sys.stderr.write(
             "agentware: plan already exists (use --force to overwrite): %s\n"
@@ -12668,18 +13239,19 @@ def cmd_plan_new(args):
         return 1
     # Resolve the author: explicit --author override, else the per-user handle.
     author = getattr(args, "author", None) or resolve_user_handle()
-    text = _plan_skeleton(args.feature, args.title,
+    text = _plan_skeleton(feature, args.title,
                           getattr(args, "max_iterations", 30),
-                          bool(getattr(args, "self_extension", False)),
-                          author=author)
+                          self_extension, author=author, origin=origin,
+                          generated_by=generated_by, trigger=trigger,
+                          evidence=evidence, target_seed=target_seed)
     _atomic_write(path, text)
     if getattr(args, "format", "text") == "json":
-        json.dump({"ok": True, "path": path,
-                   "promise": _plan_promise(args.feature)},
+        json.dump({"ok": True, "path": path, "feature": feature,
+                   "promise": _plan_promise(feature)},
                   sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
     else:
-        print("PLAN created '%s' -> %s" % (args.feature, path))
+        print("PLAN created '%s' -> %s" % (feature, path))
     return 0
 
 
@@ -12760,6 +13332,395 @@ def cmd_plan_set_status(args):
     else:
         print("PLAN set-status '%s': task %d -> %s"
               % (args.feature, target, args.status))
+    return 0
+
+
+def _now_iso():
+    """Current UTC time as `YYYY-MM-DDTHH:MM:SSZ` (the `> Claimed-by:` / log ts)."""
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _short_host():
+    """Short (unqualified) hostname for the claim stamp; 'unknown' on failure.
+
+    Uses os.uname()/$HOSTNAME rather than the `socket` module — the toolkit is
+    forbidden from importing network-capable modules (INV-1, test_invariants)."""
+    try:
+        node = os.uname().nodename            # POSIX
+    except AttributeError:
+        node = os.environ.get("HOSTNAME") or os.environ.get("COMPUTERNAME") or ""
+    node = (node or "unknown").split(".")[0]
+    return node or "unknown"
+
+
+def _iso_to_epoch(ts):
+    """Parse an ISO `...Z` (or naive) timestamp to epoch seconds, else None."""
+    import calendar
+    import datetime
+    if not ts:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return calendar.timegm(datetime.datetime.strptime(ts, fmt).timetuple())
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _claim_age_hours(ts, now_iso):
+    """Age in hours between a claim timestamp and `now_iso`, or None if unparsable."""
+    a = _iso_to_epoch(ts)
+    b = _iso_to_epoch(now_iso)
+    if a is None or b is None:
+        return None
+    return (b - a) / 3600.0
+
+
+def _sanitize_provenance(value):
+    """g2 guard: a provenance value (reason/trigger/…) can NEVER inject a forged
+    header line. Collapse CR/LF to spaces and strip a leading `>` so a crafted
+    value cannot smuggle a `> Status:`/`> Claimed-by:` line into the header."""
+    if value is None:
+        return None
+    v = value.replace("\r", " ").replace("\n", " ").strip()
+    while v.startswith(">"):
+        v = v[1:].strip()
+    return v
+
+
+def _read_plan_status(text):
+    """FIRST-MATCH `> Status:` from the top of the file -> (state, count).
+
+    `count` is how many status-like header lines exist (>1 => duplicate/
+    hand-edited, an error for lint/set-state). Missing => (_PLAN_DEFAULT_STATE, 0)
+    so every legacy plan reads as `draft`.
+    """
+    matches = _PLAN_STATUS_HEADER_RE.findall(text or "")
+    if not matches:
+        return (_PLAN_DEFAULT_STATE, 0)
+    return (matches[0].strip().lower(), len(matches))
+
+
+def _parse_claim(text):
+    """Parse the first `> Claimed-by: <handle>@<host> <ISO>` line, or None."""
+    m = _PLAN_CLAIMED_BY_RE.search(text or "")
+    if not m:
+        return None
+    raw = m.group(1).strip()
+    parts = raw.rsplit(" ", 1)
+    who = parts[0].strip() if parts else raw
+    ts = parts[1].strip() if len(parts) > 1 else ""
+    return {"who": who, "ts": ts, "raw": raw}
+
+
+def _plan_open_marker_count(text):
+    """Count OPEN (⬜/🟡) task markers in `text` via the canonical marker regex."""
+    open_n = 0
+    for ln in (text or "").splitlines():
+        m = _PLAN_TASK_LINE_RE.match(ln)
+        if m and m.group(1) != "✅":
+            open_n += 1
+    return open_n
+
+
+def _plan_readiness(text):
+    """draft->ready gate: (ok, reasons). Fails while ANY emitter placeholder
+    SIGNATURE remains, or there is no real acceptance-criteria checkbox. Prose that
+    merely mentions a placeholder token still passes (signature match)."""
+    reasons = []
+    for sig in _PLAN_READINESS_SIGNATURES:
+        if sig in (text or ""):
+            reasons.append("unfilled skeleton placeholder still present: %r"
+                           % (sig[:60] + ("…" if len(sig) > 60 else "")))
+    real_accept = 0
+    in_accept = False
+    for ln in (text or "").splitlines():
+        hm = _PLAN_HEADING_RE.match(ln)
+        if hm:
+            in_accept = "acceptance" in hm.group(1).lower()
+            continue
+        if in_accept and _PLAN_CHECKBOX_RE.match(ln):
+            if _PLAN_ACCEPT_PLACEHOLDER in ln:
+                continue
+            real_accept += 1
+    if real_accept < 1:
+        reasons.append("no real acceptance-criteria checkbox "
+                       "(only the skeleton placeholder)")
+    return (not reasons, reasons)
+
+
+def _merge_plan_status(a, b):
+    """Resolve a `> Status:` merge conflict deterministically (pitfall f): the
+    legally-downstream state wins; a terminal state beats a non-terminal one."""
+    ra = _PLAN_STATE_RANK.get((a or "").lower(), -1)
+    rb = _PLAN_STATE_RANK.get((b or "").lower(), -1)
+    return a if ra >= rb else b
+
+
+def _load_plan_tolerant(kdir, feature):
+    """Read a plan for a STATE edit WITHOUT the lint gate (unlike
+    _load_plan_for_edit): set-state must be able to label a not-yet-ready draft.
+    Returns (text, None) or (None, error_message)."""
+    path = _plan_path(kdir, feature)
+    if not os.path.isfile(path):
+        return None, "no plan at %s (run `plan new %s` first)" % (path, feature)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read(), None
+    except OSError as exc:
+        return None, "cannot read plan %s: %s" % (path, exc)
+
+
+def _set_header_line(lines, field, value):
+    """Set/replace/remove a toolkit-owned `> Field: value` header line (first
+    match removed, new one inserted after its anchor). value=None removes it.
+    Returns the mutated list."""
+    field_rx = re.compile(r"^>\s*%s:\s" % re.escape(field))
+    out = [ln for ln in lines if not field_rx.match(ln)]
+    if value is None:
+        return out
+    new_line = "> %s: %s" % (field, value)
+    anchors = {
+        "Status": ("Created", "Feature"),
+        "Claimed-by": ("Status", "Created", "Feature"),
+        "Superseded-by": ("Status", "Created", "Feature"),
+    }.get(field, ())
+    insert_idx = None
+    for anchor in anchors:
+        arx = re.compile(r"^>\s*%s:\s" % re.escape(anchor))
+        for i, ln in enumerate(out):
+            if arx.match(ln):
+                insert_idx = i + 1
+                break
+        if insert_idx is not None:
+            break
+    if insert_idx is None:
+        insert_idx = 1 if out else 0
+    out.insert(insert_idx, new_line)
+    return out
+
+
+def _append_status_log(lines, entry):
+    """Append `entry` under the append-only `## Status log` section, creating the
+    section at end-of-file when absent. Returns the mutated list."""
+    idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == _PLAN_STATUS_LOG_HEADING:
+            idx = i
+            break
+    if idx is None:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.append(_PLAN_STATUS_LOG_HEADING)
+        lines.append("")
+        lines.append(entry)
+        return lines
+    end = len(lines)
+    for j in range(idx + 1, len(lines)):
+        if lines[j].startswith("## "):
+            end = j
+            break
+    k = end - 1
+    while k > idx and lines[k].strip() == "":
+        k -= 1
+    lines.insert(k + 1, entry)
+    return lines
+
+
+def cmd_plan_set_state(args):
+    """Transition a plan's lifecycle state through the legal-transition matrix.
+
+    The SOLE writer of the `> Status:` header + `## Status log`. Refuses every
+    edge not in _PLAN_STATE_TRANSITIONS, enforces actor restrictions, the
+    readiness / open-markers / re-claim gates, and the --reason / --superseded-by
+    requirements; header flip + log append are written together atomically.
+    """
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    feature = args.feature
+    to_state = args.state
+    actor = getattr(args, "actor", "operator") or "operator"
+    as_json = getattr(args, "format", "text") == "json"
+
+    if to_state not in _PLAN_STATES:
+        sys.stderr.write("agentware: unknown state %r (one of: %s)\n"
+                         % (to_state, ", ".join(_PLAN_STATES)))
+        return 1
+
+    text, err = _load_plan_tolerant(kdir, feature)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    from_state, status_count = _read_plan_status(text)
+    if status_count > 1:
+        sys.stderr.write(
+            "agentware: plan carries %d `> Status:` header lines — duplicate or "
+            "hand-edited status; fix it so exactly one remains\n" % status_count)
+        return 1
+
+    edge = (from_state, to_state)
+    rule = _PLAN_STATE_TRANSITIONS.get(edge)
+    if rule is None:
+        msg = "illegal transition %s -> %s (refused)" % (from_state, to_state)
+        if from_state == "done":
+            msg = ("`done` is terminal — the loop refuses to start a done plan; "
+                   "create a NEW feature plan to extend a completed feature "
+                   "(only done -> superseded is allowed)")
+        sys.stderr.write("agentware: %s\n" % msg)
+        return 1
+
+    if rule["actors"] is not None and actor not in rule["actors"]:
+        sys.stderr.write(
+            "agentware: transition %s -> %s requires actor %s (got %r) — workers "
+            "may never take this edge\n"
+            % (from_state, to_state, "/".join(rule["actors"]), actor))
+        return 1
+
+    reason = _sanitize_provenance(getattr(args, "reason", None))
+    superseded_by = _sanitize_provenance(getattr(args, "superseded_by", None))
+    if "reason" in rule["needs"] and not reason:
+        sys.stderr.write("agentware: %s -> %s requires --reason\n"
+                         % (from_state, to_state))
+        return 1
+    if "superseded_by" in rule["needs"] and not superseded_by:
+        sys.stderr.write("agentware: %s -> %s requires --superseded-by <feature>\n"
+                         % (from_state, to_state))
+        return 1
+
+    now_iso = getattr(args, "now", None) or _now_iso()
+    handle = getattr(args, "handle", None) or resolve_user_handle() or "operator"
+    host = getattr(args, "host", None) or _short_host()
+    claim_who = "%s@%s" % (handle, host)
+
+    # --- Non-argv gates ---
+    if edge == ("draft", "ready"):
+        ok, reasons = _plan_readiness(text)
+        if not ok:
+            sys.stderr.write(
+                "agentware: draft -> ready blocked — plan is not ready:\n")
+            for r in reasons:
+                sys.stderr.write("  - %s\n" % r)
+            return 1
+    if edge == ("running", "done"):
+        open_n = _plan_open_marker_count(text)
+        if open_n > 0:
+            sys.stderr.write(
+                "agentware: running -> done blocked — %d open task marker(s) "
+                "remain (every task must be ✅)\n" % open_n)
+            return 1
+    if edge == ("running", "running"):
+        claim = _parse_claim(text)
+        if claim is not None:
+            same = claim["who"] == claim_who
+            stale = False
+            age = _claim_age_hours(claim["ts"], now_iso)
+            if age is not None and age >= STALLED_CLAIM_HOURS:
+                stale = True
+            if not (same or stale):
+                sys.stderr.write(
+                    "agentware: running -> running refused — plan is claimed by "
+                    "'%s'; re-claim only by the same handle@host or after %dh of "
+                    "staleness (crash recovery)\n" % (claim["raw"],
+                                                      STALLED_CLAIM_HOURS))
+                return 1
+
+    # --- Apply (header flip + log append, atomically) ---
+    lines = text.splitlines()
+    lines = _set_header_line(lines, "Status", to_state)
+    if to_state == "running":
+        lines = _set_header_line(lines, "Claimed-by", "%s %s" % (claim_who, now_iso))
+    elif from_state == "running":
+        lines = _set_header_line(lines, "Claimed-by", None)
+    if to_state == "superseded":
+        lines = _set_header_line(lines, "Superseded-by", superseded_by)
+    log_reason = reason or (superseded_by if to_state == "superseded"
+                            else ("claim %s" % claim_who if to_state == "running"
+                                  else "-"))
+    entry = "- %s %s -> %s by %s reason: %s" % (
+        now_iso, from_state, to_state, actor, log_reason)
+    lines = _append_status_log(lines, entry)
+    out = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    _atomic_write(_plan_path(kdir, feature), out)
+
+    if as_json:
+        json.dump({"ok": True, "feature": feature, "from": from_state,
+                   "to": to_state, "actor": actor}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("PLAN set-state '%s': %s -> %s (by %s)"
+              % (feature, from_state, to_state, actor))
+    return 0
+
+
+def cmd_plan_claim(args):
+    """Loop/operator START-edge orchestrator (Context policy). Brings a plan to
+    `running`, or REFUSES: draft -> (readiness gate) ready -> running; ready ->
+    running; running -> legal re-claim (same handle@host or stalled); done/
+    superseded/cancelled -> refuse with the create-a-new-feature instruction. On
+    any refusal returns non-zero and leaves state untouched (an aborted/failed run
+    therefore honestly STAYS running)."""
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    feature = args.feature
+    actor = getattr(args, "actor", "loop") or "loop"
+    text, err = _load_plan_tolerant(kdir, feature)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+    state, cnt = _read_plan_status(text)
+    if cnt > 1:
+        sys.stderr.write("agentware: plan carries duplicate `> Status:` lines; "
+                         "fix it before starting\n")
+        return 1
+
+    def _to(target):
+        ns = argparse.Namespace(
+            feature=feature, state=target, actor=actor,
+            reason=None, superseded_by=None,
+            handle=getattr(args, "handle", None),
+            host=getattr(args, "host", None), now=getattr(args, "now", None),
+            format=getattr(args, "format", "text"))
+        return cmd_plan_set_state(ns)
+
+    if state in ("done", "superseded", "cancelled"):
+        sys.stderr.write(
+            "agentware: plan is '%s' — the loop refuses to start it. Create a NEW "
+            "feature plan to continue this work (only done->superseded is a legal "
+            "edge).\n" % state)
+        return 1
+    if state == "draft":
+        rc = _to("ready")            # prints the readiness message on failure
+        if rc != 0:
+            return rc
+        return _to("running")
+    if state in ("ready", "running"):
+        return _to("running")        # ready->running, or a legal running re-claim
+    sys.stderr.write("agentware: unrecognized plan state %r\n" % state)
+    return 1
+
+
+def cmd_plan_state_backfill(args):
+    """`plan state-backfill` — migration 001's logic, also runnable directly."""
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    summary = _run_state_backfill(kdir)
+    if getattr(args, "format", "text") == "json":
+        out = {"ok": True}
+        out.update(summary)
+        json.dump(out, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("PLAN state-backfill: stamped %d, skipped %d existing + %d live + "
+              "%d unparseable"
+              % (len(summary["stamped"]), len(summary["skipped_existing"]),
+                 len(summary["skipped_live"]), len(summary["skipped_unparseable"])))
     return 0
 
 
@@ -14857,6 +15818,13 @@ DREAM_LOAD_RATIO = 4.0           # skip when 1-min loadavg > ratio * cpu_count
 DREAM_NICE = 10                  # run the cycle at low priority (never compete)
 DREAM_STALE_HOURS = 48           # dream_health warns when last dream older than this
 DREAM_PLAN_ONLY_MIN_AGE_HOURS = 48  # step e flags plan.md w/ no worklog.md older than this
+# Plan-state DRIFT thresholds (feature 260710, report-only in dream step e):
+#   stalled    = a `running` plan whose `> Claimed-by:` is older than
+#                STALLED_CLAIM_HOURS (defined with the plan-state constants).
+#   stale-draft = a `draft` plan idle longer than its lane's TTL (auto lane is
+#                 tighter than the operator lane). `cancelled` plans are excluded.
+AUTO_DRAFT_TTL_DAYS = 7
+OPERATOR_DRAFT_TTL_DAYS = 90
 
 # Ordered, fixed cycle (each step idempotent + individually skippable via --steps).
 DREAM_STEP_FUNCS = ()  # populated below once the step fns are defined
@@ -15130,6 +16098,24 @@ def _dream_pkg_pull_revert(target, sha0, env):
     _git(target, "reset", "--hard", sha0, env=env)
 
 
+def _dream_apply_migrations_after_pull(kdir, result):
+    """After a successful+UPDATED package pull whose syntax check passed, bring the
+    KB schema current (feature 260710). Best-effort + report-only in the result
+    dict; NEVER raises (a migration failure must not break the dream cycle)."""
+    if not result.get("updated"):
+        return
+    try:
+        out, err = _kb_migrate_apply(kdir)
+        if err:
+            result["migrate"] = {"error": err}
+        elif out:
+            result["migrate"] = {"applied": len(out.get("applied", [])),
+                                 "schema": out.get("schema"),
+                                 "refused": out.get("refused")}
+    except Exception as exc:  # noqa: BLE001 — never break the cycle on migration
+        result["migrate"] = {"error": str(exc)}
+
+
 def _dream_step_pkg_pull(kdir, dry_run):
     """Step 0 — pull latest agentware package repo (REPO_ROOT).
 
@@ -15175,6 +16161,7 @@ def _dream_step_pkg_pull(kdir, dry_run):
                   "from": sha0, "to": sha1, "updated": updated}
         if warning:
             result["warning"] = warning
+        _dream_apply_migrations_after_pull(kdir, result)
         return result
     rb = _git_timed(target, "pull", "--rebase", "--autostash", env=env)
     if rb.returncode == 0:
@@ -15192,6 +16179,7 @@ def _dream_step_pkg_pull(kdir, dry_run):
                   "from": sha0, "to": sha1, "updated": True}
         if warning:
             result["warning"] = warning
+        _dream_apply_migrations_after_pull(kdir, result)
         return result
     if git_rebase_in_progress(target):
         _git(target, "rebase", "--abort", env=env)
@@ -15587,13 +16575,14 @@ def _dream_step_eval_record(kdir, dry_run):
             "post_redact_scrubbed": redact.get("scrubbed", 0)}
 
 
-def _dream_render_detect_report(report, markers, plan_only=None):
+def _dream_render_detect_report(report, markers, plan_only=None, drift=None):
     """Render step e's findings into a deterministic, diff-friendly markdown
     report body. REPORT-ONLY (INV-2) — pure formatting, no mutation. Inputs are
     sorted here so the output is byte-stable for unchanged inputs (INV-1): no
     clocks, no run-id, no host-specific values in the body. `plan_only` (optional,
-    default None) lists plan.md-only work dirs; ages are passed IN as data (the
-    live clock is read only by the caller) so this stays pure."""
+    default None) lists plan.md-only work dirs; `drift` (optional) lists stalled/
+    stale-draft plans; ages are passed IN as data (the live clock is read only by
+    the caller) so this stays pure."""
     lines = [
         "# Dream Detect Report (latest)",
         "",
@@ -15664,6 +16653,23 @@ def _dream_render_detect_report(report, markers, plan_only=None):
     else:
         lines.append("_none_")
     lines.append("")
+    # Plan-state drift (feature 260710): report-only; NO acting worker (P3).
+    drift = sorted(drift or [], key=lambda d: (d.get("rel") or ""))
+    lines.append("## Drift — stalled / stale-draft (%d)" % len(drift))
+    lines.append("")
+    lines.append("> stalled = `running` claimed >%dh ago; stale-draft = `draft` "
+                 "idle >%dd (auto) / >%dd (operator). `cancelled` excluded. "
+                 "Report-only — no worker acts on these here."
+                 % (STALLED_CLAIM_HOURS, AUTO_DRAFT_TTL_DAYS,
+                    OPERATOR_DRAFT_TTL_DAYS))
+    lines.append("")
+    if drift:
+        for d in drift:
+            lines.append("- %s [%s] %s"
+                         % (d.get("rel"), d.get("kind"), d.get("detail") or ""))
+    else:
+        lines.append("_none_")
+    lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
@@ -15698,41 +16704,94 @@ def _dream_step_detect_report(kdir, dry_run):
     report = build_stale_report(kdir, data, 120)
     markers, scanned = [], 0
     plan_only = []
+    drift = []
     now = time.time()
     work = os.path.join(kdir, "work")
+
+    def _iter_feats(work_dir):
+        # One level, PLUS the auto/ lane (feature 260710): the `auto` container is
+        # not a feature — descend into work/auto/<slug>/. Deterministic ordering.
+        for name in sorted(os.listdir(work_dir)):
+            d = os.path.join(work_dir, name)
+            if not os.path.isdir(d):
+                continue
+            if name == "auto":
+                try:
+                    for sub in sorted(os.listdir(d)):
+                        sp = os.path.join(d, sub)
+                        if os.path.isdir(sp):
+                            yield "auto/" + sub, sp
+                except OSError:
+                    pass
+            else:
+                yield name, d
+
     if os.path.isdir(work):
-        for feat in sorted(os.listdir(work)):
-            fdir = os.path.join(work, feat)
+        for feat, fdir in _iter_feats(work):
             wl = os.path.join(fdir, "worklog.md")
             if os.path.isfile(wl):
                 scanned += 1
                 up, _tot = scan_worklog(wl, kdir, data)
-                rel = os.path.join("work", feat, "worklog.md")
+                rel = "work/%s/worklog.md" % feat
                 for m in up:
                     markers.append({"feature": feat, "rel": rel,
                                     "line": m["line"], "kind": m["kind"],
                                     "text": m["text"]})
-            else:
-                # Plan-only work dir: plan.md present, NO worklog.md. Flag once its
-                # plan is older than the min-age budget — a planned feature that
-                # left no worklog (the learning pipeline never ran). READ-ONLY.
-                plan = os.path.join(fdir, "plan.md")
-                if os.path.isfile(plan):
-                    try:
-                        age_h = (now - os.path.getmtime(plan)) / 3600.0
-                    except OSError:
-                        age_h = 0.0
-                    if age_h >= DREAM_PLAN_ONLY_MIN_AGE_HOURS:
-                        plan_only.append(
-                            {"feature": feat,
-                             "rel": os.path.join("work", feat, "plan.md"),
-                             "age_hours": round(age_h, 1)})
-    body = _dream_render_detect_report(report, markers, plan_only)
+            plan = os.path.join(fdir, "plan.md")
+            if not os.path.isfile(plan):
+                continue
+            # Plan-only work dir: plan.md present, NO worklog.md. Flag once its
+            # plan is older than the min-age budget (READ-ONLY).
+            if not os.path.isfile(wl):
+                try:
+                    age_h = (now - os.path.getmtime(plan)) / 3600.0
+                except OSError:
+                    age_h = 0.0
+                if age_h >= DREAM_PLAN_ONLY_MIN_AGE_HOURS:
+                    plan_only.append(
+                        {"feature": feat, "rel": "work/%s/plan.md" % feat,
+                         "age_hours": round(age_h, 1)})
+            # Plan-state DRIFT (report-only): stalled `running`, stale `draft`.
+            # `cancelled` is excluded (legitimate cleanup). Ages computed here from
+            # the live clock and passed to the pure renderer as data (INV-1).
+            try:
+                with open(plan, "r", encoding="utf-8") as f:
+                    ptext = f.read()
+            except OSError:
+                ptext = ""
+            state, _cnt = _read_plan_status(ptext)
+            rel_plan = "work/%s/plan.md" % feat
+            is_auto = feat.startswith("auto/")
+            if state == "running":
+                claim = _parse_claim(ptext)
+                cepoch = _iso_to_epoch(claim["ts"]) if claim else None
+                if cepoch is not None:
+                    age_h = (now - cepoch) / 3600.0
+                    if age_h >= STALLED_CLAIM_HOURS:
+                        drift.append({"feature": feat, "rel": rel_plan,
+                                      "kind": "stalled",
+                                      "detail": "claimed %.1fh ago (>%dh)"
+                                                % (age_h, STALLED_CLAIM_HOURS)})
+            elif state == "draft":
+                ttl_days = AUTO_DRAFT_TTL_DAYS if is_auto else OPERATOR_DRAFT_TTL_DAYS
+                try:
+                    age_d = (now - os.path.getmtime(plan)) / 86400.0
+                except OSError:
+                    age_d = 0.0
+                if age_d > ttl_days:
+                    drift.append({"feature": feat, "rel": rel_plan,
+                                  "kind": "stale-draft",
+                                  "detail": "draft idle %.1fd (>%dd, %s lane)"
+                                            % (age_d, ttl_days,
+                                               "auto" if is_auto else "operator")})
+    body = _dream_render_detect_report(report, markers, plan_only, drift)
     report_rel = _dream_write_detect_report(kdir, body)
     result = {"status": "ok", "stale": len(report["stale"]),
               "duplicates": len(report["conflicts"]),
               "worklogs_scanned": scanned, "unpromoted_markers": len(markers),
-              "plan_only_dirs": len(plan_only)}
+              "plan_only_dirs": len(plan_only),
+              "stalled": sum(1 for d in drift if d["kind"] == "stalled"),
+              "stale_draft": sum(1 for d in drift if d["kind"] == "stale-draft")}
     if report_rel:
         result["report"] = report_rel
     return result
@@ -17415,6 +18474,18 @@ def build_parser():
         help="regenerate FEATURES.md from the knowledge index.json")
     p_feat.set_defaults(func=cmd_features)
 
+    # migrate ----------------------------------------------------------------
+    p_mig = sub.add_parser(
+        "migrate", parents=[fmt_parent],
+        help="KB schema migration runner: --list (read-only) / --apply (idempotent)")
+    mig_grp = p_mig.add_mutually_exclusive_group()
+    mig_grp.add_argument("--list", action="store_true",
+                         help="report pending migrations, read-only (the default)")
+    mig_grp.add_argument("--apply", action="store_true",
+                         help="apply pending additive migrations and stamp .schema "
+                              "(idempotent; refuses restructuring migrations)")
+    p_mig.set_defaults(func=cmd_migrate)
+
     # worklog ----------------------------------------------------------------
     p_wl = sub.add_parser("worklog", help="worklog utilities")
     wl_sub = p_wl.add_subparsers(dest="worklog_command", metavar="<subcommand>")
@@ -17783,12 +18854,17 @@ def build_parser():
     plan_sub.required = True
     p_plan_lint = plan_sub.add_parser(
         "lint", parents=[fmt_parent],
-        help="lint a feature plan against the R1–R9 structural contract")
+        help="lint a feature plan against the R1–R13 structural contract")
     p_plan_lint.add_argument("--path", required=True, help="path to a plan.md")
     p_plan_lint.add_argument(
         "--strict", action="store_true",
-        help="treat the R9 autonomy rule as a hard failure (used by the loop "
-             "pre-hook so a non-autonomous plan aborts before the run)")
+        help="treat the R9 autonomy rule (and the R13 done-reality binding) as "
+             "hard failures (used by the loop pre-hook so a non-autonomous plan "
+             "aborts before the run)")
+    p_plan_lint.add_argument(
+        "--readiness", action="store_true",
+        help="check ONLY the mechanical draft->ready gate: no emitter placeholder "
+             "signatures remain and >=1 real acceptance checkbox exists")
     p_plan_lint.set_defaults(func=cmd_plan_lint)
 
     p_plan_new = plan_sub.add_parser(
@@ -17807,6 +18883,22 @@ def build_parser():
                             help="provenance author handle (default: the per-user "
                                  "handle if set). Visible metadata only — no effect "
                                  "on execution or retrieval.")
+    p_plan_new.add_argument(
+        "--auto", action="store_true",
+        help="emit a WORKORDER under work/auto/<slug>/ (the emitter prepends "
+             "'auto/'); requires --generated-by and --trigger, seeds provenance "
+             "headers + a knowledge-dir target, and enforces the emit-time "
+             "governance guards g1/g2/g3")
+    p_plan_new.add_argument("--generated-by", dest="generated_by", default=None,
+                            help="[--auto] the tool/agent that generated this "
+                                 "workorder (provenance)")
+    p_plan_new.add_argument("--trigger", default=None,
+                            help="[--auto] the event that triggered it (provenance)")
+    p_plan_new.add_argument("--evidence", default=None,
+                            help="[--auto] optional evidence path(s) (provenance)")
+    p_plan_new.add_argument("--target", action="append", default=None,
+                            help="[--auto] target directory (repeatable; default: "
+                                 "the knowledge dir). Kernel paths are refused (g1).")
     p_plan_new.set_defaults(func=cmd_plan_new)
 
     p_plan_add = plan_sub.add_parser(
@@ -17829,6 +18921,48 @@ def build_parser():
     p_plan_status.add_argument("status", choices=("todo", "wip", "done"),
                                help="new status")
     p_plan_status.set_defaults(func=cmd_plan_set_status)
+
+    p_plan_state = plan_sub.add_parser(
+        "set-state", parents=[fmt_parent],
+        help="transition a plan's lifecycle state (draft|ready|running|done|"
+             "superseded|cancelled) via the legal-transition matrix")
+    p_plan_state.add_argument("feature", help="feature slug; dir under work/")
+    p_plan_state.add_argument("state", choices=_PLAN_STATES, help="target state")
+    p_plan_state.add_argument(
+        "--actor", choices=("operator", "loop"), default="operator",
+        help="who is requesting the transition (worker-restricted edges refuse "
+             "actor=loop)")
+    p_plan_state.add_argument(
+        "--reason", default=None,
+        help="required for demotions / cancellations / the cancelled->draft reopen")
+    p_plan_state.add_argument(
+        "--superseded-by", dest="superseded_by", default=None,
+        help="required for any X -> superseded (the replacing feature slug)")
+    p_plan_state.add_argument("--handle", default=None,
+                              help="claim handle (default: resolved user handle)")
+    p_plan_state.add_argument("--host", default=None,
+                              help="claim host (default: short hostname)")
+    p_plan_state.add_argument("--now", default=None,
+                              help="ISO timestamp override (determinism/testing)")
+    p_plan_state.set_defaults(func=cmd_plan_set_state)
+
+    p_plan_backfill = plan_sub.add_parser(
+        "state-backfill", parents=[fmt_parent],
+        help="stamp a derived `> Status:` on every legacy plan lacking one "
+             "(migration 001; never overwrites, skips the live feature)")
+    p_plan_backfill.set_defaults(func=cmd_plan_state_backfill)
+
+    p_plan_claim = plan_sub.add_parser(
+        "claim", parents=[fmt_parent],
+        help="loop START-edge: bring a plan to running (draft->ready->running / "
+             "ready->running / running re-claim), or refuse a terminal plan")
+    p_plan_claim.add_argument("feature", help="feature slug; dir under work/")
+    p_plan_claim.add_argument("--actor", choices=("operator", "loop"),
+                              default="loop", help="requesting actor")
+    p_plan_claim.add_argument("--handle", default=None, help="claim handle")
+    p_plan_claim.add_argument("--host", default=None, help="claim host")
+    p_plan_claim.add_argument("--now", default=None, help="ISO ts override (tests)")
+    p_plan_claim.set_defaults(func=cmd_plan_claim)
 
     p_plan_tdirs = plan_sub.add_parser(
         "target-dirs",
@@ -17920,6 +19054,11 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    # KB-write dispatch gate: older-CLI refusal + auto-apply pending additive
+    # migrations before any KB-writing command mutates the KB (feature 260710).
+    rc = _kb_predispatch_gate(args)
+    if rc is not None:
+        return rc
     return args.func(args)
 
 

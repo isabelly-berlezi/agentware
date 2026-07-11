@@ -70,10 +70,11 @@ fi
 FEATURE="$1"
 shift
 
-# Validate the feature name: alphanumerics, dashes, underscores only.
-if [[ ! "$FEATURE" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+# Validate the feature name: alphanumerics, dashes, underscores — with at most
+# ONE optional `auto/` prefix for workorders (work/auto/<slug>/, feature 260710).
+if [[ ! "$FEATURE" =~ ^(auto/)?[a-zA-Z0-9_-]+$ ]]; then
   echo "Error: invalid feature name '$FEATURE'"
-  echo "Feature names may contain only letters, digits, dashes, and underscores ([a-zA-Z0-9_-])."
+  echo "Feature names may contain only letters, digits, dashes, and underscores ([a-zA-Z0-9_-]), with at most one optional 'auto/' prefix for workorders."
   exit 1
 fi
 
@@ -796,6 +797,12 @@ run_pre_hooks() {
     return 0
   fi
 
+  # KB schema migration (feature 260710): bring the KB to the package's schema
+  # version before the other gates. Idempotent + best-effort; a restructuring
+  # migration surfaces its own suggested-workorder message (non-fatal here).
+  log "[pre-hook] scripts/agentware migrate --apply"
+  scripts/agentware migrate --apply || true
+
   log "[pre-hook] scripts/agentware index validate"
   if ! scripts/agentware index validate; then
     echo "Error: [pre-hook] index validation failed. Fix the knowledge index (via scripts/agentware) first."
@@ -1318,6 +1325,23 @@ run_pre_hooks
 # until an explicit set-point below asserts completed / hit_max_iterations / etc.).
 LOOP_OUTCOME="unknown"
 
+# ---- PLAN STATE: CLAIM running (feature 260710-plan-state-machine) ----
+# Bring the plan to `running` per the state-machine policy (draft->ready->running /
+# ready->running / running re-claim), or REFUSE a terminal (done/superseded/
+# cancelled) plan with the create-a-new-feature instruction. Guarded to a
+# KB-resident feature so non-KB / self-development runs are untouched. A failed or
+# aborted run leaves the state at `running` (honest; dream flags it stalled later).
+if [[ -x scripts/agentware ]] && [[ "$INITIALIZED" == true ]] && \
+   [[ -n "$KDIR" ]] && [[ "$DOCS_DIR" == "$KDIR/work/$FEATURE" ]] && \
+   [[ -f "$DOCS_DIR/plan.md" ]]; then
+  log "[state] scripts/agentware plan claim $FEATURE --actor loop"
+  if ! scripts/agentware plan claim "$FEATURE" --actor loop; then
+    echo "Error: [state] refusing to start plan '$FEATURE' (see message above)."
+    LOOP_OUTCOME="pre_hook_abort"
+    exit 1
+  fi
+fi
+
 # Pre phase (3 tasks max).
 if [[ "$SKIP_PRE" != true ]]; then
   run_phase "pre" "$PRE_PROMPT" 3 "PRE_TASK_COMPLETE"
@@ -1515,6 +1539,17 @@ LOOP_OUTCOME="completed"
 # Post phase (1 task).
 if [[ "$SKIP_POST" != true ]]; then
   run_phase "post" "$POST_PROMPT" 1 "POST_COMPLETE"
+fi
+
+# ---- PLAN STATE: DONE on success (feature 260710-plan-state-machine) ----
+# The run completed (all markers ✅, learnings promoted). Stamp running->done so
+# the terminal state is team-visible in plan.md. Best-effort: never fail an
+# otherwise-complete run on the status flip. Guarded to a KB-resident feature.
+if [[ -x scripts/agentware ]] && [[ "$INITIALIZED" == true ]] && \
+   [[ -n "$KDIR" ]] && [[ "$DOCS_DIR" == "$KDIR/work/$FEATURE" ]] && \
+   [[ -f "$DOCS_DIR/plan.md" ]]; then
+  log "[state] scripts/agentware plan set-state $FEATURE done --actor loop"
+  scripts/agentware plan set-state "$FEATURE" done --actor loop || true
 fi
 
 # ---- KB SYNC (commit + push) ----
