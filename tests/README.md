@@ -33,3 +33,16 @@ scripts/agentware audit --with-tests
 - The CLI script is imported as a module via `importlib` (it has no `.py`
   extension) and invoked through `main(argv)`, capturing stdout/stderr and exit
   code.
+
+## Test-naming convention (avoid `-k` collisions)
+
+`python3 -m unittest ... -k <token>` matches the token as a substring of the test
+**module filename** AND every **method name**, across the whole suite. So a test
+prefix must be **unique**: it must not be a substring of any test-module filename
+or of any method in another suite. Concretely, a `-k test_migrate` batch collects
+`test_migrate_runner.py` *and* any stray `test_migrate_*` method elsewhere; a
+`-k test_drift` batch collects `test_drift_dream.py` *and* any stray
+`test_drift_*`. Keep each suite's methods under its own unambiguous prefix (e.g.
+`test_g1harden_`, `test_gatebaseline_`, `test_schemaguard_`, `test_donestamp_`,
+`test_attachmigrate_`, `test_evalpin_`) — verified unique against every existing
+module filename and method before adoption.

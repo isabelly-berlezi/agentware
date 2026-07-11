@@ -101,7 +101,7 @@ class AttachConformanceTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertTrue(report["parity_errors"])
 
-    def test_migrate_makes_missing_dirs_conformant(self):
+    def test_attachmigrate_makes_missing_dirs_conformant(self):
         kdir = _make_conformant_kb(with_entries=False)
         self.addCleanup(shutil.rmtree, kdir, True)
         shutil.rmtree(os.path.join(kdir, "learnings"))

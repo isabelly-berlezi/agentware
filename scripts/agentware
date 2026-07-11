@@ -9659,9 +9659,10 @@ def derive_iteration_costs(events):
     for e in events:
         # Skip the non-iteration event types (Task 7): task_transition events also
         # carry an integer `iteration` but describe a single task's lifecycle, not
-        # the per-iteration loop structure; terminal events have no iteration. Only
-        # the Task-6 per-iteration/phase events (no `event` discriminator) fold here.
-        if e.get("event") in ("task_transition", "terminal"):
+        # the per-iteration loop structure; terminal events have no iteration; the
+        # 260711 done_stamp_failed event carries no iteration either. Only the
+        # Task-6 per-iteration/phase events (no `event` discriminator) fold here.
+        if e.get("event") in ("task_transition", "terminal", "done_stamp_failed"):
             continue
         it = e.get("iteration")
         if not isinstance(it, int) or isinstance(it, bool):
@@ -13043,19 +13044,66 @@ def _kb_migrate_apply(kdir):
 
 
 def _kb_writer_funcs():
-    """The KB-INDEX-writing command funcs whose dispatch triggers the cheap
-    pending-migration auto-apply (resolved at call time to avoid def-ordering).
-    Plan writers are excluded (state-backfill IS a migration — would recurse)."""
-    return {cmd_index_add, cmd_index_remove, cmd_index_sync, cmd_index_rebuild,
-            cmd_learn, cmd_decide, cmd_ingest}
+    """Version-refusal SUPERSET: EVERY KB-mutating command func. On a NEWER KB
+    (`.schema` > this CLI's KB_SCHEMA_VERSION) the older-CLI guard refuses ALL of
+    these loudly, so an out-of-date package can never silently corrupt a migrated
+    KB. Resolved at call time to avoid def-ordering.
+
+    Deliberately EXCLUDED (NOT registered):
+      - cmd_migrate — one func serves `--list` (read-only) AND `--apply`;
+        registering it would make read-only `--list` trip the auto-apply and
+        write `.schema` during a READ. It self-guards `cur > target` and owns its
+        own schema writes.
+      - cmd_attach — targets an ARBITRARY candidate path (not the configured KB)
+        and has its own conformance/migrate flow.
+    Read-only verbs (recall, query, config, metrics, worklog scan, plan lint,
+    features-less lookups) are exempt by OMISSION — correct by construction."""
+    return {
+        # index writers
+        cmd_index_add, cmd_index_remove, cmd_index_sync, cmd_index_rebuild,
+        cmd_index_migrate,
+        # knowledge writers
+        cmd_learn, cmd_decide, cmd_ingest,
+        # plan-state writers (previously OMITTED — the schema-guard hole)
+        cmd_plan_new, cmd_plan_add_task, cmd_plan_set_state, cmd_plan_set_status,
+        cmd_plan_claim, cmd_plan_state_backfill,
+        # derived-artifact + skill writers
+        cmd_features, cmd_skill_add, cmd_skill_remove,
+        # offline miner: cmd_dream's step-a (_dream_step_index_rebuild) calls
+        # rebuild_kb IN-PROCESS — the SAME structured-index rewrite as the guarded
+        # cmd_index_rebuild — with no self-guard, and it is cron-installable, so an
+        # older CLI would silently corrupt a newer/migrated KB. Version-refusal
+        # only (see _kb_autoapply_funcs): dream `--dry-run` is read-only.
+        cmd_dream,
+    }
+
+
+def _kb_autoapply_funcs():
+    """Auto-apply SUBSET = the writer superset MINUS the DUAL-MODE / migration-
+    RUNNER verbs whose read-only path must never trip a `.schema` write.
+
+    On a STALE KB (`.schema` < KB_SCHEMA_VERSION) the dispatch auto-applies pending
+    ADDITIVE migrations before the write. Excluded:
+      - cmd_plan_state_backfill — IS migration 001's body; if the gate auto-applied
+        migration 001 and THEN this verb ran its body, the backfill would run twice
+        (harmless-but-misleading `stamped 0`). Excluding it runs the direct verb's
+        body once without the gate racing it.
+      - cmd_dream — has a read-only `--dry-run` mode; auto-applying migrations
+        (which writes `.schema`) during a dry-run would commit a write on a read
+        (the same reason cmd_migrate is not even in the superset).
+    Both still carry version-refusal via superset membership."""
+    return _kb_writer_funcs() - {cmd_plan_state_backfill, cmd_dream}
 
 
 def _kb_predispatch_gate(args):
     """On a KB-WRITING command dispatch: (1) older-CLI guard — refuse the write
-    loudly on a newer KB; (2) cheap pending-check + auto-apply of ADDITIVE
-    migrations FIRST (the on-first-CLI-use trigger). No-op for readers and for an
-    unconfigured/uninitialized KB. Returns an exit code to short-circuit, else None."""
-    if getattr(args, "func", None) not in _kb_writer_funcs():
+    loudly on a newer KB, for EVERY writer (the superset); (2) cheap pending-check
+    + auto-apply of ADDITIVE migrations FIRST (the on-first-CLI-use trigger), for
+    every writer EXCEPT the migration-runner verbs (the auto-apply subset). No-op
+    for readers and for an unconfigured/uninitialized KB. Returns an exit code to
+    short-circuit, else None."""
+    func = getattr(args, "func", None)
+    if func not in _kb_writer_funcs():
         return None
     kdir = resolve_knowledge_dir()
     if not kdir or not os.path.isdir(kdir):
@@ -13069,7 +13117,7 @@ def _kb_predispatch_gate(args):
             "schema %d (older CLI on a newer KB). Update the agentware package "
             "first.\n" % (KB_SCHEMA_VERSION, cur))
         return 1
-    if cur < KB_SCHEMA_VERSION:
+    if cur < KB_SCHEMA_VERSION and func in _kb_autoapply_funcs():
         result, err = _kb_migrate_apply(kdir)
         if err:
             sys.stderr.write("agentware: %s\n" % err)
@@ -13140,26 +13188,121 @@ def cmd_migrate(args):
                   sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
         return 0
-    if not pending:
+    if cur > target:
+        # Older CLI on a newer KB: `_kb_pending_migrations` returns [] here, so the
+        # old code misreported this as "up to date". Report the mismatch honestly;
+        # still read-only (never stamps .schema).
+        print("migrate: OLDER CLI (schema %d) on a NEWER KB (schema %d) — update "
+              "the agentware package to migrate; writes are refused until then"
+              % (target, cur))
+    elif not pending:
         print("migrate: up to date (schema %d, 0 pending)" % cur)
     else:
         print("migrate: schema %d -> %d, %d pending" % (cur, target, len(pending)))
     return 0
 
 
+def _resolves_under_repo(candidate, allow_relative=False):
+    """True iff `candidate`, once ~-expanded and realpath-resolved, IS REPO_ROOT
+    or lives inside it — compared case-INSENSITIVELY via .casefold().
+
+    Why not os.path.normcase / os.path.abspath? On posix (os.path is posixpath,
+    incl. case-insensitive APFS) BOTH normcase and realpath PRESERVE case — so the
+    naive "normcase+realpath" fix would still let `--target ~/workspace/AGENTWARE`
+    (the real package on APFS, carrying no kernel token) bypass. realpath closes
+    the symlink + `..`-traversal class; .casefold() on BOTH sides closes the case
+    class.
+
+    A bare RELATIVE candidate is resolved against CWD ONLY when
+    `allow_relative=True`. `--target` passes True: a relative `../agentware` / `.`
+    reaches the package at loop-execution time (the loop runs from REPO_ROOT) and
+    MUST be refused. The free-text scan passes the default False so a benign
+    forward-relative token like `logs/a.log` in `--evidence` is not CWD-
+    false-matched (the caller resolves only `..`-traversal text tokens explicitly)."""
+    if not candidate:
+        return False
+    exp = os.path.expanduser(candidate.strip())
+    if not exp:
+        return False
+    if not os.path.isabs(exp) and not allow_relative:
+        return False
+    try:
+        rl = os.path.realpath(exp).casefold()
+        rt = os.path.realpath(REPO_ROOT).casefold()
+    except (OSError, ValueError):
+        return False
+    return rl == rt or rl.startswith(rt + os.sep)
+
+
+def _has_kernel_path_segment(raw):
+    """True iff `raw` carries a kernel token as a PATH-BOUNDED match — a single-
+    segment token (.claude, steering, AGENTS.md, CLAUDE.md, agentware.sh) EQUAL to
+    a '/'-delimited path segment, or a multi-segment token (scripts/agentware,
+    scripts/hooks) matched on segment boundaries.
+
+    Segment-bounded (not a bare substring) so a legit EXTERNAL path that merely
+    CONTAINS a token as a substring is NOT over-refused: `/x/product-steering/n`
+    and `/x/.claude-backup` no longer false-match (their segments are
+    'product-steering'/'.claude-backup', not 'steering'/'.claude')."""
+    if not raw:
+        return False
+    segs = [s for s in raw.casefold().replace("\\", "/").split("/") if s]
+    if not segs:
+        return False
+    for tok in _KERNEL_PATH_TOKENS:
+        parts = [p for p in tok.casefold().replace("\\", "/").split("/") if p]
+        n = len(parts)
+        for i in range(len(segs) - n + 1):
+            if segs[i:i + n] == parts:
+                return True
+    return False
+
+
+def _text_hits_kernel_path(text):
+    """g1 text scan: True iff free-form text (task/trigger/evidence) contains a
+    PATH-SHAPED token — one bearing a '/' separator — that is a kernel path:
+    it carries a kernel token as a bounded path segment (e.g. 'scripts/agentware',
+    'foo/AGENTS.md'), resolves under REPO_ROOT (absolute/~/symlink forms), or is a
+    `..`-traversal token that resolves into the package. A BARE basename with no
+    '/' (AGENTS.md, steering, CLAUDE.md) is NEVER matched, and a benign forward-
+    relative token (logs/a.log) still emits, so prose still emits (pitfall b)."""
+    if not text:
+        return False
+    for raw_tok in text.split():
+        # Trim wrapping quotes/brackets from BOTH ends and trailing sentence
+        # punctuation — but NEVER strip leading '.' (that would turn a '../'
+        # traversal token into an absolute '/…' and defeat the traversal check).
+        tok = raw_tok.strip("\"'`()[]{}<>|").rstrip(".,;:!?")
+        if "/" not in tok:
+            continue
+        if _has_kernel_path_segment(tok):
+            return True
+        if _resolves_under_repo(tok):                       # absolute / ~ into repo
+            return True
+        # A `..`-traversal token is suspicious enough to resolve vs CWD; a benign
+        # forward-relative token (logs/a.log) is NOT resolved, so it still emits.
+        if tok.startswith("..") and _resolves_under_repo(tok, allow_relative=True):
+            return True
+    return False
+
+
 def _target_hits_kernel(target):
-    """g1: does a target path resolve into the agentware package / a kernel path?
-    True for the package root itself, anything inside it, and any kernel token."""
+    """g1: does a machine-plan `--target` resolve into the agentware package / a
+    kernel path? True for the package root itself, anything inside it (symlink/
+    case/traversal/RELATIVE-proof via _resolves_under_repo(allow_relative=True)),
+    and any path carrying a kernel token as a bounded path SEGMENT. The security
+    boundary for machine-generated plans (`plan new --auto`) — the P2c miner must
+    not launch behind a leaky gate."""
     if not target:
         return False
     raw = target.strip()
-    low = raw.lower()
-    for tok in _KERNEL_PATH_TOKENS:
-        if tok.lower() in low:
-            return True
-    ap = os.path.abspath(os.path.expanduser(raw))
-    root = os.path.abspath(REPO_ROOT)
-    return ap == root or ap.startswith(root + os.sep)
+    if not raw:
+        return False
+    if _has_kernel_path_segment(raw):
+        return True
+    # Targets ARE resolved relative to CWD (allow_relative=True): a relative
+    # `../agentware` / `.` reaches the package at loop-execution time.
+    return _resolves_under_repo(raw, allow_relative=True)
 
 
 def _count_auto_open_workorders(kdir):
@@ -13219,6 +13362,17 @@ def cmd_plan_new(args):
                     "agentware: refusing a workorder targeting a kernel path / the "
                     "agentware package (%s) — machine-generated plans can never be "
                     "self-extensions (g1)\n" % t)
+                return 1
+        # g1 (text scan) — a PATH-SHAPED kernel token smuggled through provenance
+        # text (trigger/evidence) is refused too; a bare basename in prose still
+        # emits (pitfall b). generated_by is a short tool id, also scanned.
+        for _label, _txt in (("generated-by", generated_by),
+                             ("trigger", trigger), ("evidence", evidence)):
+            if _text_hits_kernel_path(_txt):
+                sys.stderr.write(
+                    "agentware: refusing a workorder whose %s text references a "
+                    "kernel path (%r) — machine-generated plans can never target "
+                    "the agentware package (g1)\n" % (_label, _txt))
                 return 1
         target_seed = ("\n".join("- %s" % t for t in targets) if targets
                        else "- %s" % kdir)
@@ -13380,11 +13534,21 @@ def _claim_age_hours(ts, now_iso):
 
 def _sanitize_provenance(value):
     """g2 guard: a provenance value (reason/trigger/…) can NEVER inject a forged
-    header line. Collapse CR/LF to spaces and strip a leading `>` so a crafted
-    value cannot smuggle a `> Status:`/`> Claimed-by:` line into the header."""
+    header line. Collapse EVERY line separator to a space and strip a leading `>`
+    so a crafted value cannot smuggle a `> Status:`/`> Claimed-by:` line into the
+    header.
+
+    CRITICAL: `str.splitlines()` (which every plan.md mutator uses via
+    `"\\n".join(text.splitlines())`) splits on MORE than `\\r`/`\\n` — also
+    `\\v \\f \\x1c \\x1d \\x1e \\x85 \\u2028 \\u2029`. Stripping only `\\r`/`\\n`
+    left a value like `x\\x85> Status: done` storing clean (dup-count 1), then a
+    LATER set-state/claim round-tripped it through splitlines()+join, materializing
+    a SECOND `> Status:` line and PERMANENTLY WEDGING the workorder. `" ".join(
+    value.splitlines())` adopts the EXACT splitlines() semantics the mutators use,
+    so no residual separator survives to be re-split downstream."""
     if value is None:
         return None
-    v = value.replace("\r", " ").replace("\n", " ").strip()
+    v = " ".join(value.splitlines()).strip()
     while v.startswith(">"):
         v = v[1:].strip()
     return v

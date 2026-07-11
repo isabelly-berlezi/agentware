@@ -420,7 +420,7 @@ class FalseFailRegressionTest(SyntheticKBTestCase):
             CLI.build_corpus(self.kdir, grown_data))
         return fp_small, fp_grown
 
-    def test_drift_old_would_false_fail_new_seeds_and_passes(self):
+    def test_evalpin_old_would_false_fail_new_seeds_and_passes(self):
         fp_small, fp_grown = self._grown_fingerprint()
         # Growing the live KB changes the corpus fingerprint by construction.
         self.assertNotEqual(fp_small, fp_grown)

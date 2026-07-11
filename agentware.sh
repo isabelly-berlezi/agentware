@@ -635,6 +635,30 @@ emit_metric() {
     >> "$METRICS_LOG" 2>/dev/null || true
 }
 
+# emit_done_stamp_failed <stderr>
+# Append ONE `done_stamp_failed` event to metrics.jsonl (best-effort, typed via
+# jq) when the terminal running->done stamp is REFUSED. Deliberately carries NO
+# integer `iteration` field — so derive_iteration_costs (which folds only events
+# bearing an int iteration, and also skips the `done_stamp_failed` discriminator)
+# never mistakes it for a phantom iteration-0 record. Same best-effort/opt-out
+# posture as emit_metric: never blocks or fails the loop.
+emit_done_stamp_failed() {
+  metrics_emit_enabled || return 0
+  local detail="$1" ts
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  mkdir -p "$(dirname "$METRICS_LOG")" 2>/dev/null || true
+  jq -cn \
+    --arg ts "$ts" \
+    --arg feature "$FEATURE_NAME" \
+    --arg stage "loop-done-stamp" \
+    --arg detail "$detail" \
+    '{event:"done_stamp_failed", ts:$ts, feature:$feature, stage:$stage,
+      detail:$detail,
+      "gen_ai.operation.name":"agentware.loop.done_stamp",
+      "gen_ai.system":"agentware"}' \
+    >> "$METRICS_LOG" 2>/dev/null || true
+}
+
 # ---- PER-TASK TRANSITION EVENTS + TERMINAL OUTCOME (Task 7) ----
 #
 # Beyond the per-iteration emission (Task 6), Task 7 makes individual TASK lifecycle
@@ -1549,7 +1573,16 @@ if [[ -x scripts/agentware ]] && [[ "$INITIALIZED" == true ]] && \
    [[ -n "$KDIR" ]] && [[ "$DOCS_DIR" == "$KDIR/work/$FEATURE" ]] && \
    [[ -f "$DOCS_DIR/plan.md" ]]; then
   log "[state] scripts/agentware plan set-state $FEATURE done --actor loop"
-  scripts/agentware plan set-state "$FEATURE" done --actor loop || true
+  # Un-swallowed (feature 260711): a refused done-stamp used to vanish behind
+  # `|| true`. Now WARN loudly (with set-state's stderr) and emit a
+  # `done_stamp_failed` metric so nothing is silently discarded. The run STAYS
+  # successful (honest-running) — the refusal is observability, not a hard fail.
+  if ss_out="$(scripts/agentware plan set-state "$FEATURE" done --actor loop 2>&1)"; then
+    [[ -n "$ss_out" ]] && log "$ss_out"
+  else
+    log "⚠ WARNING: done-stamp REFUSED — running->done not applied (run stays successful): ${ss_out:-<no message>}"
+    emit_done_stamp_failed "$ss_out"
+  fi
 fi
 
 # ---- KB SYNC (commit + push) ----
