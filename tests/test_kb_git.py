@@ -466,11 +466,16 @@ class KbGitPushTest(unittest.TestCase):
         self.assertEqual(ca, 0, ea)
 
         # Clone B adds a DIFFERENT learning; its push is rejected (A moved
-        # upstream) and must auto-resolve the derived-file conflicts via rebuild.
+        # upstream). With derived artifacts DE-COMMITTED (P1.7 fix 1), the divergent
+        # index.json/rosters are gitignored + untracked, so they no longer conflict
+        # — the two distinct entry files rebase cleanly and the push succeeds
+        # without invoking the derived-file rebuild resolver. A transitional KB that
+        # still TRACKS derived files would instead report "auto-resolved"; either
+        # way the push SUCCEEDS and NOTHING is lost (asserted below).
         self._add_learning_and_commit(clone_b, "charlie")
         cb, ob, eb = run_cli(["kb-git", "push", "--path", clone_b], clone_b)
         self.assertEqual(cb, 0, eb)
-        self.assertIn("auto-resolved", ob)
+        self.assertIn("pushed", ob)
 
         # A fresh clone of the remote has BOTH learnings; the rebuilt index is
         # valid; nothing was lost.

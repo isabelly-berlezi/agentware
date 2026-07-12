@@ -169,10 +169,17 @@ class GraphCLITests(SyntheticKBTestCase):
             ["depends-on:learn-macos-no-timeout", "relates-to:missing-entry"])
 
     def test_rebuild_is_byte_identical_no_op(self):
-        before = self._index_bytes()
+        # The monotonic `generation` token (B1) increments on every rebuild by
+        # design (so a stale cache is always detectably older), and index.json is a
+        # DERIVED + gitignored artifact — whole-file byte-identity no longer matters
+        # for git. The ranking invariant is entry ORDER + CONTENT + the tags map,
+        # which stays byte-identical (generation is the one tolerated top-level diff).
+        before = json.loads(self._index_bytes())
         code, _, err = self.run_cli(["index", "rebuild"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(self._index_bytes(), before)
+        after = json.loads(self._index_bytes())
+        self.assertEqual(after["entries"], before["entries"])
+        self.assertEqual(after["tags"], before["tags"])
 
     def test_query_depends_on_full_closure(self):
         code, out, err = self.run_cli(

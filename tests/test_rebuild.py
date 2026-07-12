@@ -36,11 +36,18 @@ class RebuildTests(SyntheticKBTestCase):
             return f.read()
 
     def test_rebuild_is_byte_identical_when_unchanged(self):
-        first = self._read(self.index_file)
+        # The `generation` token bumps on every save (B1, P1.7) and index.json is
+        # now DERIVED + gitignored, so whole-file byte-identity no longer matters
+        # for git. The RANKING invariant is entry ORDER + CONTENT, which stays
+        # byte-identical (generation is the ONE tolerated top-level diff).
+        first = json.loads(self._read(self.index_file))
         feats_first = self._read(os.path.join(self.kdir, "FEATURES.md"))
         code, _, err = self.run_cli(["index", "rebuild"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(self._read(self.index_file), first)
+        after = json.loads(self._read(self.index_file))
+        self.assertEqual(after["entries"], first["entries"])
+        self.assertEqual(after["tags"], first["tags"])
+        # FEATURES.md carries no generation, so it stays byte-identical.
         self.assertEqual(self._read(os.path.join(self.kdir, "FEATURES.md")), feats_first)
 
     def test_rebuild_reflects_frontmatter_mutation(self):

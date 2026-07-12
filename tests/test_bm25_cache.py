@@ -118,12 +118,40 @@ class LoadAndFreshnessTest(BM25CacheTestCase):
         cache = CLI.build_bm25_cache(self.kdir, self.data)
         self.assertTrue(CLI.bm25_cache_is_fresh(cache, self.data, self.kdir))
 
-    def test_mutated_body_is_not_fresh(self):
+    def test_generation_bump_is_not_fresh(self):
+        # A mutation that goes through save_index bumps the index `generation`; the
+        # cache stamped at the old generation is then detected as STALE (B1, O(1)).
+        cache = CLI.build_bm25_cache(self.kdir, self.data)
+        bumped = dict(self.data, generation=self.data.get("generation", 0) + 1)
+        self.assertFalse(CLI.bm25_cache_is_fresh(cache, bumped, self.kdir))
+
+    def test_out_of_band_body_edit_is_not_auto_detected(self):
+        # RECORDED TRADEOFF (P1.7 DECISION): the O(1) generation compare does NOT
+        # self-heal a RAW out-of-band body edit (already forbidden — save_index is
+        # the sole writer). Without a generation bump the cache still reads as fresh;
+        # recovery is an explicit `index rebuild`. This locks the intended contract.
         cache = CLI.build_bm25_cache(self.kdir, self.data)
         body = os.path.join(self.kdir, self.data["entries"][0]["path"])
         with open(body, "a", encoding="utf-8") as f:
             f.write("\nNEWWORD distinctmutationmarker\n")
-        self.assertFalse(CLI.bm25_cache_is_fresh(cache, self.data, self.kdir))
+        self.assertTrue(CLI.bm25_cache_is_fresh(cache, self.data, self.kdir))
+
+    def test_freshness_reads_zero_entry_bodies(self):
+        # The B1 headline: the freshness check must read NO entry bodies.
+        cache = CLI.build_bm25_cache(self.kdir, self.data)
+        calls = [0]
+        real = CLI._read_entry_body
+
+        def counting(kdir, entry):
+            calls[0] += 1
+            return real(kdir, entry)
+
+        CLI._read_entry_body = counting
+        try:
+            CLI.bm25_cache_is_fresh(cache, self.data, self.kdir)
+        finally:
+            CLI._read_entry_body = real
+        self.assertEqual(calls[0], 0, "freshness must read zero entry bodies (B1)")
 
 
 # --- Task 4: cached scorer == live scorer, exactly ---------------------------
@@ -227,12 +255,16 @@ class FallbackGuardTest(BM25CacheTestCase):
         self.assertEqual(out_live, out_corrupt)
 
     def test_stale_cache_falls_back_to_live(self):
-        # Fresh cache, then mutate a body so the cache is stale; recall must NOT
-        # use the stale cache — output equals a clean live scan of the new state.
+        # A cache made stale by a save_index mutation (a `learn`, which bumps the
+        # index generation but does NOT rebuild the postings cache) must be
+        # BYPASSED: recall falls back to the live scan and surfaces the new entry —
+        # output equals a clean cache-less live scan of the new state (B1).
         _materialize_cache(self.kdir, self.data)
-        body = os.path.join(self.kdir, self.data["entries"][0]["path"])
-        with open(body, "a", encoding="utf-8") as f:
-            f.write("\nfreshtoken uniquemutation\n")
+        code, _o, err = run_cli(
+            ["learn", "--topic", "freshtoken-uniquemutation", "--summary", "s",
+             "--tags", "t", "--content", "freshtoken uniquemutation body zzz",
+             "--force"], self.kdir)
+        self.assertEqual(code, 0, err)
         _, out_stale_present, _ = run_cli(
             ["recall", "freshtoken uniquemutation", "--format", "json"],
             self.kdir)
@@ -241,8 +273,9 @@ class FallbackGuardTest(BM25CacheTestCase):
             ["recall", "freshtoken uniquemutation", "--format", "json"],
             self.kdir)
         self.assertEqual(out_stale_present, out_no_cache)
-        # And the new token IS surfaced (proves the live scan saw the mutation).
-        self.assertTrue(json.loads(out_no_cache)["results"])
+        # The new entry IS surfaced (proves the stale cache was bypassed).
+        ids = [r.get("id") for r in json.loads(out_no_cache)["results"]]
+        self.assertIn("learn-freshtoken-uniquemutation", ids)
 
 
 # --- INV-2: recall/eval never write the cache --------------------------------

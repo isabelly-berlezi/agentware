@@ -486,11 +486,12 @@ class TestKbGitignoreScaffold(unittest.TestCase):
         self.assertIn("*.tmp", lines)  # original content preserved
 
     def test_recognizes_bare_rules_without_trailing_slash(self):
-        # All required rules present in bare (no trailing slash) form → recognized
+        # ALL required rules present in bare (no trailing slash) form → recognized
         # as already-ignored (normalized by stripping the trailing slash), so the
-        # helper is a no-op "kept" and does not duplicate them.
+        # helper is a no-op "kept" and does not duplicate them. Covers the derived
+        # FILE rules (index.json, <sub>/index.md) too, which have no trailing slash.
         with open(self._path(), "w", encoding="utf-8") as f:
-            f.write("logs\n.loop\n.cache\n")
+            f.write("".join(r + "\n" for r in self.cli.KB_GITIGNORE_REQUIRED))
         action = self.cli._ensure_kb_gitignore(self.kdir)
         self.assertEqual(action, "kept")
         lines = [ln.strip() for ln in self._read().splitlines()]

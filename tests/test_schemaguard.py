@@ -81,6 +81,14 @@ _EXPECTED_INDEX_WRITER_DEFS = {
     "cmd_index_remove": "cmd_index_remove",
     "cmd_index_sync": "cmd_index_sync",
     "rebuild_kb": None,                           # the primitive itself
+    # P1.7 (write-path scale foundation): two thin helpers that wrap rebuild_kb to
+    # regenerate ONLY the DERIVED index (now de-committed + gitignored) from the
+    # untouched frontmatter source — inherently schema-SAFE (like rebuild_kb, and
+    # the git-sync rebuilds), so classified as primitives (None), not version-gated
+    # mutation commands. _try_rebuild_missing_index recovers a missing/corrupt index
+    # on load; _rebuild_kb_after_pull reconciles the index after a fast-forward pull.
+    "_try_rebuild_missing_index": None,
+    "_rebuild_kb_after_pull": None,
     "cmd_index_rebuild": "cmd_index_rebuild",
     "_attach_migrate_structure": "cmd_attach",   # arbitrary candidate path
     "cmd_learn": "cmd_learn",
