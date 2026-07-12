@@ -627,32 +627,35 @@ OFF / opt-in**, never runs while a loop session is active, and runs at low
 priority. Phase 1 is strictly deterministic (no LLM, no destructive
 deletes/merges, no auto-promotion). Full details live in `docs/GUIDE.md`.
 
-**In team mode, dream also acts as an automatic update and convergence system.**
-Each cycle begins by pulling the latest agentware code AND the latest shared KB
-from upstream, then runs a health-gate that verifies config, profiles, schedule,
-and structure — auto-fixing drift where possible. This means:
+**In team mode, dream is the KB-maintenance + convergence-sync system** (NOT the
+package-update channel — that is the dedicated **signed updater + shared tick**,
+Step 7b-5). Each cycle pulls the latest shared **KB** from upstream, then runs a
+health-gate that verifies config, profiles, schedule, and structure — auto-fixing
+drift where possible. This means:
 
-- Any new rules, steps, fixes, or skills pushed to agentware propagate
-  automatically to every team member's machine on their next dream cycle.
-- Any new shared learnings, configurations, or profiles pushed to the KB are
+- Any new shared **learnings, configurations, or profiles** pushed to the KB are
   synced without manual intervention.
 - Config corruption, stale cron lines, and missing templates are self-healed.
-- The system stays in a reliable, converged state across all team members'
-  machines without anyone needing to SSH in or run manual commands.
+- The KB stays in a reliable, converged state across all team members' machines.
 
-The update takes effect one cycle after the pull (the running process uses the
-already-loaded code; the pulled code runs on the next trigger). For team mode,
-**dream is strongly recommended** — it is the mechanism that keeps everyone in
-sync.
+> **KB sync vs package updates.** Dream keeps the *knowledge base* converged; new
+> agentware *code/skills* arrive ONLY via the verified signed-tag updater on the
+> shared tick (Step 7b-5). Dream no longer pulls package code — an unsigned
+> tip-of-main auto-pull was retired (supply-chain hardening). Enabling dream does
+> NOT enable package updates, and vice versa; they are independent opt-ins.
 
-1. Ask once: **"Enable dream mode — nightly unattended KB maintenance + automatic
-   team sync (pulls latest agentware + KB, verifies health, index refresh, PII
-   redact, reliability snapshot, stale report, git backup)? It's default OFF and
-   never competes with active work. [recommended: ON for team mode]"**
+For team mode, **dream is strongly recommended** — it is the mechanism that keeps
+everyone's KB in sync.
+
+1. Ask once: **"Enable dream mode — nightly unattended KB maintenance + shared-KB
+   sync (health-gate, index refresh, PII redact, reliability snapshot, stale report,
+   git backup)? It's default OFF and never competes with active work. [recommended:
+   ON for team mode]"**
 2. **If they decline:** do NOTHING — nothing is scheduled, nothing installed.
    They can enable it later anytime. (In team mode, strongly nudge toward
-   accepting — without dream, their machine will not receive automatic updates
-   from teammates and may drift out of sync.)
+   accepting — without dream, their machine will not receive shared-KB updates
+   from teammates and may drift out of sync. Package code updates are separate:
+   Step 7b-5.)
 3. **If they accept**, enable + install the nightly schedule, fully
    non-interactively (flags only, no stdin — `R-SHELL-01`):
    ```bash
@@ -669,6 +672,64 @@ sync.
    `scripts/agentware config --set-dream off` then
    `scripts/agentware dream --uninstall-schedule` (both idempotent). A per-run
    `AGENTWARE_DREAM=on` env var overrides the persisted setting for a single run.
+
+#### Step 7b-4 — Signed self-update trust anchor (pin the publisher key)
+
+Package updates roll out through a **dedicated, hardened updater** that tracks a
+**signed SemVer tag channel only** (never tip-of-main) — the primary supply-chain
+surface at scale, so it is verified BEFORE any pulled code executes. The trust
+root is the publisher's SSH signing **public** key, pinned into
+`~/.agentware/allowed_signers` — OUTSIDE the package tree the updater rewrites, so
+a malicious push can never rotate the key it is checked against.
+
+1. **Pin the publisher key (trust-on-first-clone over TLS):**
+   ```bash
+   scripts/agentware trust pin --from-repo   # pins catalog/agentware-release.pub if present
+   scripts/agentware trust list              # confirm the pinned fingerprint
+   ```
+   If no in-tree publisher key exists yet (pre-go-live), this is a **graceful
+   no-op** — the updater stays fail-closed (verifies-and-declines) until the
+   publisher cuts the first signed `vX.Y.Z` tag (see `docs/release-signing.md`).
+   Verify the printed fingerprint against the publisher's out-of-band value before
+   trusting it; a later key rotation is explicit and operator-confirmed via
+   `scripts/agentware trust rotate` (overlap window; the old key stays valid until
+   retired, so the fleet is never stranded).
+2. The actual **opt-in to automatic updates** (enable + install the shared tick)
+   is Step 7b-5 below.
+
+#### Step 7b-5 — Automatic signed-channel updates (opt-in)
+
+The **shared 30-min tick** dispatches a **dedicated updater** that checks ~every 6h
+for a newer **signed** release, verifies it, smoke-tests it, and auto-rolls-back to
+the last-good SHA on failure — so an update can fail but never strand the machine.
+It is **default OFF / opt-in**, never lands an apply while a loop session is active,
+and is a runtime kill switch (turning it OFF skips the job without uninstalling the
+tick). The migration runner rides along after a verified apply. Full details live in
+`docs/GUIDE.md` and `docs/release-signing.md`.
+
+1. Ask once: **"Enable automatic signed-channel agentware updates — a shared 30-min
+   tick that applies only VERIFIED signed releases (checks ~6h, smoke-tests,
+   auto-rolls-back on failure)? It's default OFF and never runs mid-loop.
+   [recommended: ON for team mode]"**
+2. **If they decline:** do NOTHING — nothing is scheduled, nothing installed. They
+   can enable it later anytime. (In team mode, nudge toward accepting — it is the
+   mechanism that delivers fixes to every machine within 24h.)
+3. **If they accept**, enable + install the shared tick, fully non-interactively
+   (flags only, no stdin — `R-SHELL-01`):
+   ```bash
+   scripts/agentware config --set-updater on
+   scripts/agentware tick --install-schedule     # launchd StartInterval=1800 / cron */30
+   ```
+   Confirm it resolves on:
+   ```bash
+   scripts/agentware config --updater-only        # prints: on
+   ```
+   Until the publisher cuts the first signed tag (go-live, `docs/release-signing.md`),
+   the updater **no-ops fail-closed** — this is expected and safe.
+4. They can disable it anytime with `scripts/agentware config --set-updater off`
+   (a runtime kill switch — the tick stays installed for the future dream-cadence
+   job), or remove the tick entirely with `scripts/agentware tick --uninstall-schedule`.
+   A per-run `AGENTWARE_UPDATE=on` env var overrides the persisted setting.
 
 #### Step 7c — Install the two workflow aliases (and VERIFY them)
 

@@ -16,6 +16,14 @@ if [[ -z "$KDIR" ]] || [[ ! -f "$KDIR/.initialized" ]]; then
   CTX="AGENTWARE_STATUS: FIRST_RUN — this workspace is not yet initialized. Before any other work, run the onboarding skill in .claude/skills/onboarding/SKILL.md: it asks where to store your EXTERNAL knowledge base, runs 'scripts/agentware init', and writes the .initialized sentinel."
 else
   CTX="AGENTWARE_STATUS: initialized (knowledge dir: $KDIR)"
+  # Non-blocking, read-only, NO-NETWORK package self-update surfacing (feature
+  # 260712, Task 14). Prints only when a prior apply is stranded/unfinalized;
+  # silent (suppressed) when up-to-date. Never blocks session start.
+  _upd_line="$("$REPO_ROOT/scripts/agentware" update --status-line 2>/dev/null || true)"
+  if [[ -n "$_upd_line" ]]; then
+    CTX="$CTX
+$_upd_line"
+  fi
   if [[ -f "$KDIR/MAIN.md" ]]; then
     CTX="$CTX
 ----- knowledge/MAIN.md (operator profile + active work) -----

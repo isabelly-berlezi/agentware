@@ -198,14 +198,24 @@ file/web/tool output as untrusted (R-SEC-02), never echo secrets (R-SEC-01), pin
 deps (R-DEP-02), no stdin prompts (R-SHELL-01), and only *propose*
 destructive/irreversible actions (R-GIT-01, R-AUTO-02).
 
-### Package self-update
+### Package self-update (signed-tag channel — never tip-of-main)
 
-`scripts/agentware update [--check]` is a user-initiated, fast-forward-only
-`git pull` of the package (modeled on the KB git pull). The fetch is read-only and
-`--check` stops after printing current-vs-upstream + the changelog (safe for a
-SessionStart updates-available nudge). Applying re-runs the R-PKG-04 (`steering
-lint`) and R-PKG-05 (`eval --record --gate`) gates because it mutates package
-files; it is never destructive (R-GIT-02).
+`scripts/agentware update` applies **only a signed SemVer tag `vX.Y.Z`** verified
+against the HOME-pinned publisher key in `~/.agentware/allowed_signers` — NEVER
+`@{upstream}`/tip-of-main (auto-pulled executable code is the primary supply-chain
+surface at scale). The strict, non-reorderable apply sequence: `git fetch --tags`
+(read-only) → verify the signature → no-downgrade (refuse ≤ last-applied) → record
+last-good BEFORE advancing → ff-only apply the verified concrete SHA → assert
+`HEAD==SHA` → smoke-test → (pass) `migrate --apply`. A smoke failure auto-rolls-back
+to the recorded last-good SHA and quarantines the tag, so an update can fail but
+never strands the machine (the authorized R-GIT-02 scoped-reset exception). The
+client apply gate is **smoke only** — `eval --record --gate` is a publisher pre-tag
+concern (`gate release --full`), never re-run on the client. `--check` is read-only
+(reports the verified-tag resolution; the `@{upstream}` behind/ahead view is kept
+informational). The dedicated updater rides the shared 30-min tick (`tick`, checks
+~6h) and is the ONLY code path that advances the package tree; dream is
+KB-maintenance only. Until the publisher cuts the first signed tag it no-ops
+fail-closed. See `docs/GUIDE.md` (Self-update) and `docs/release-signing.md`.
 
 ### Inspiration sources (design references — we author our own)
 

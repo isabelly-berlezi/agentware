@@ -21,16 +21,21 @@ portable.
 
 import argparse
 import contextlib
+import base64
+import binascii
 import copy
 import datetime
 import glob
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -2390,6 +2395,29 @@ def cmd_config(args):
                      "ON" if norm == "1" else "OFF"))
         return 0
 
+    # --set-updater on|off: persist the automatic signed-channel updater opt-in
+    # (feature 260712) to ~/.agentware/config.env. Default OFF; env overrides
+    # per-run (AGENTWARE_UPDATE). A runtime kill switch — the tick job SKIPS when
+    # OFF without uninstalling the shared tick (preserves the future P2c job).
+    updater_val = getattr(args, "set_updater", None)
+    if updater_val is not None:
+        norm = _parse_updater(updater_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-updater value %r (use on|off|1|0|yes|no)\n"
+                % updater_val)
+            return 2
+        _set_config_value(UPDATER_KEY, norm)
+        if as_json:
+            json.dump({"ok": True, "updater": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (automatic updates %s)"
+                  % (UPDATER_KEY, norm, HOME_CONFIG,
+                     "ON" if norm == "1" else "OFF"))
+        return 0
+
     # --set-dream-schedule <HH:MM|cron>: persist the nightly dream schedule token
     # the installer wires into launchd/cron. Invalid tokens are rejected.
     dream_sched_val = getattr(args, "set_dream_schedule", None)
@@ -2469,6 +2497,12 @@ def cmd_config(args):
     # (the scheduler installer + the `dream` idle-gate). Default OFF.
     if getattr(args, "dream_only", False):
         print("on" if resolve_dream() == "1" else "off")
+        return 0
+
+    # --updater-only: bare resolved updater setting (on/off) for shell consumers
+    # (onboarding confirm + the tick job gate). Default OFF.
+    if getattr(args, "updater_only", False):
+        print("on" if resolve_updater() == "1" else "off")
         return 0
 
     # --dream-schedule-only: bare resolved dream schedule token (empty if unset).
@@ -12209,6 +12243,7 @@ def cmd_audit(args):
             _audit_graph_integrity_check(kdir, data),
             _audit_provenance_coverage_check(kdir, data),
             _audit_dream_health_check(kdir),
+            _audit_pkg_version_check(kdir),
         ]
         # Rule-7 observability: advisory graph-health signal (append-only,
         # gitignored, read-only w.r.t. the KB/index).
@@ -16543,8 +16578,11 @@ def is_session_active(kdir, now=None):
     return None
 
 
-def _dream_lock_path(kdir):
-    return os.path.join(kdir, DREAM_LOCK_REL)
+def _dream_lock_path(kdir, lock_rel=None):
+    """Path to a single-writer lockfile under `kdir`. `lock_rel` defaults to the
+    dream lock; the dedicated updater passes UPDATER_LOCK_REL so it serializes on a
+    DISTINCT lock (never contends with dream)."""
+    return os.path.join(kdir, lock_rel or DREAM_LOCK_REL)
 
 
 def _dream_read_lock(path):
@@ -16586,35 +16624,56 @@ def dream_lock_is_stale(rec, now=None, ttl=DREAM_LOCK_TTL_SEC):
     return False
 
 
-def dream_acquire_lock(kdir, now=None, pid=None, ttl=DREAM_LOCK_TTL_SEC):
-    """Acquire the single-writer dream lock under .cache/ (gitignored).
+def dream_acquire_lock(kdir, now=None, pid=None, ttl=DREAM_LOCK_TTL_SEC,
+                       lock_rel=None):
+    """Acquire a single-writer lock under .cache/ (gitignored). `lock_rel` selects
+    WHICH lock (default: dream.lock; the updater/tick pass UPDATER_LOCK_REL).
 
     Returns True on success, False when a FRESH lock is held by another owner.
-    Reclaims a STALE lock (dead pid / expired mtime). Reads the existing lock
-    BEFORE writing anything, so a held-lock refusal mutates NOTHING. `now`/`pid`
-    are injectable for deterministic tests (no real processes needed).
+    Reclaims a STALE lock (dead pid / expired mtime). ATOMIC: the lockfile is
+    created with O_CREAT|O_EXCL so two concurrent acquirers can never both win
+    (a read-then-write would let both observe "no lock" and both write). A
+    held-lock refusal mutates NOTHING. `now`/`pid` are injectable for tests.
     """
     now = now if now is not None else time.time()
     pid = pid if pid is not None else os.getpid()
-    path = _dream_lock_path(kdir)
-    existing = _dream_read_lock(path)
-    if existing is not None and not dream_lock_is_stale(existing, now=now, ttl=ttl):
-        return False
-    rec = {"pid": pid, "mtime": now}
+    path = _dream_lock_path(kdir, lock_rel)
+    rec = json.dumps({"pid": pid, "mtime": now}, sort_keys=True)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         _ensure_kb_gitignore(kdir)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(rec, f, sort_keys=True)
     except OSError:
         return False
-    return True
+    for _attempt in (0, 1):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            existing = _dream_read_lock(path)
+            if existing is not None and not dream_lock_is_stale(existing, now=now, ttl=ttl):
+                return False   # a FRESH lock is held by another owner
+            # Stale (dead pid / expired mtime / unparseable) -> reclaim atomically:
+            # remove it and retry the exclusive create exactly once.
+            try:
+                os.remove(path)
+            except OSError:
+                return False
+            continue
+        except OSError:
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(rec)
+            return True
+        except OSError:
+            return False
+    return False
 
 
-def dream_release_lock(kdir, pid=None):
-    """Release the dream lock IFF `pid` (default: this process) owns it."""
+def dream_release_lock(kdir, pid=None, lock_rel=None):
+    """Release the lock IFF `pid` (default: this process) owns it. `lock_rel`
+    selects which lock (default: dream.lock)."""
     pid = pid if pid is not None else os.getpid()
-    path = _dream_lock_path(kdir)
+    path = _dream_lock_path(kdir, lock_rel)
     rec = _dream_read_lock(path)
     if rec is not None and rec.get("pid") == pid:
         try:
@@ -16756,121 +16815,24 @@ def _dream_pull_post_check(target):
     return "autostash pop conflicted — kept pulled version (stash preserved)"
 
 
-def _dream_pkg_syntax_check():
-    """Verify the agentware script parses after a pull. Returns None if OK,
-    or an error string if broken. Called while old code is still in memory —
-    a failure means we can still revert before the process exits."""
-    import py_compile
-    script = os.path.join(REPO_ROOT, "scripts", "agentware")
-    try:
-        py_compile.compile(script, doraise=True)
-        return None
-    except py_compile.PyCompileError as exc:
-        return str(exc)
-
-
-def _dream_pkg_pull_revert(target, sha0, env):
-    """Revert a pull that broke the script. Best-effort — if this fails too,
-    the next cycle will at least have the scheduler log showing the issue."""
-    _git(target, "reset", "--hard", sha0, env=env)
-
-
-def _dream_apply_migrations_after_pull(kdir, result):
-    """After a successful+UPDATED package pull whose syntax check passed, bring the
-    KB schema current (feature 260710). Best-effort + report-only in the result
-    dict; NEVER raises (a migration failure must not break the dream cycle)."""
-    if not result.get("updated"):
-        return
-    try:
-        out, err = _kb_migrate_apply(kdir)
-        if err:
-            result["migrate"] = {"error": err}
-        elif out:
-            result["migrate"] = {"applied": len(out.get("applied", [])),
-                                 "schema": out.get("schema"),
-                                 "refused": out.get("refused")}
-    except Exception as exc:  # noqa: BLE001 — never break the cycle on migration
-        result["migrate"] = {"error": str(exc)}
-
-
-def _dream_step_pkg_pull(kdir, dry_run):
-    """Step 0 — pull latest agentware package repo (REPO_ROOT).
-
-    Ensures the dream cycle always runs the latest CLI code. Non-interactive:
-    --autostash protects dirty work trees; --ff-only first, rebase fallback.
-    Graceful skip if not a git repo, no upstream, offline, or pre-existing
-    rebase. On any conflict, abort cleanly and skip (never leave broken state).
-    Timeout: DREAM_PULL_TIMEOUT seconds to prevent indefinite network hangs.
-
-    After a successful pull, VALIDATES the pulled code parses (py_compile).
-    If broken, reverts to the pre-pull SHA immediately — preventing the
-    self-bricking scenario where a bad push permanently breaks dream.
-    """
-    target = REPO_ROOT
-    if dry_run:
-        return {"status": "planned",
-                "would": "git pull agentware repo (%s)" % target}
-    if not git_is_work_tree(target):
-        return {"status": "skipped", "reason": "agentware is not a git work tree"}
-    if not git_has_upstream(target):
-        return {"status": "skipped", "reason": "agentware has no upstream"}
-    if git_rebase_in_progress(target):
-        return {"status": "skipped",
-                "reason": "pre-existing rebase in progress — resolve manually"}
-    head0 = _git(target, "rev-parse", "--short", "HEAD")
-    sha0 = head0.stdout.strip() if head0.returncode == 0 else "?"
-    env = _git_noninteractive_env()
-    ff = _git_timed(target, "pull", "--ff-only", "--autostash", env=env)
-    if ff.returncode == 0:
-        warning = _dream_pull_post_check(target)
-        head1 = _git(target, "rev-parse", "--short", "HEAD")
-        sha1 = head1.stdout.strip() if head1.returncode == 0 else "?"
-        updated = sha0 != sha1
-        # Anti-brick: validate pulled code parses before accepting
-        if updated:
-            err = _dream_pkg_syntax_check()
-            if err:
-                _dream_pkg_pull_revert(target, sha0, env)
-                return {"status": "fail", "method": "ff",
-                        "reason": "pulled code has syntax error — reverted",
-                        "from": sha0, "to": sha0, "error": err[:200]}
-        result = {"status": "ok", "method": "ff",
-                  "from": sha0, "to": sha1, "updated": updated}
-        if warning:
-            result["warning"] = warning
-        _dream_apply_migrations_after_pull(kdir, result)
-        return result
-    rb = _git_timed(target, "pull", "--rebase", "--autostash", env=env)
-    if rb.returncode == 0:
-        warning = _dream_pull_post_check(target)
-        head1 = _git(target, "rev-parse", "--short", "HEAD")
-        sha1 = head1.stdout.strip() if head1.returncode == 0 else "?"
-        # Anti-brick: validate pulled code parses before accepting
-        err = _dream_pkg_syntax_check()
-        if err:
-            _dream_pkg_pull_revert(target, sha0, env)
-            return {"status": "fail", "method": "rebase",
-                    "reason": "pulled code has syntax error — reverted",
-                    "from": sha0, "to": sha0, "error": err[:200]}
-        result = {"status": "ok", "method": "rebase",
-                  "from": sha0, "to": sha1, "updated": True}
-        if warning:
-            result["warning"] = warning
-        _dream_apply_migrations_after_pull(kdir, result)
-        return result
-    if git_rebase_in_progress(target):
-        _git(target, "rebase", "--abort", env=env)
-    stderr = rb.stderr or ""
-    first_err = stderr.strip().splitlines()
-    err_line = first_err[0] if first_err else "unknown"
-    if rb.returncode == 124:
-        return {"status": "skipped", "reason": "timed out — %s" % err_line}
-    if "Could not resolve host" in stderr or "index.lock" in stderr:
-        return {"status": "skipped", "reason": "offline/locked — %s" % err_line}
-    if "fatal: unable" in stderr or "fatal: Could not read" in stderr:
-        return {"status": "skipped", "reason": "offline — %s" % err_line}
-    return {"status": "skipped",
-            "reason": "rebase conflict (aborted cleanly) — %s" % err_line}
+# RETIRED (feature 260712-scheduler-updater, Task 13): dream step-0 pkg-pull.
+# The old `_dream_step_pkg_pull` + `_dream_pkg_syntax_check` +
+# `_dream_pkg_pull_revert` + `_dream_apply_migrations_after_pull` were a RIVAL
+# UNSIGNED auto-updater — `git pull --ff-only/--rebase` to tip-of-main on
+# REPO_ROOT plus migrate-after-pull, guarded only by py_compile. That (a) defeated
+# the signed-tag thesis, (b) could stamp a higher `.schema` out-of-band so the
+# updater's brick-guard then refused rollback and stranded the machine, and (c)
+# raced the 30-min tick on REPO_ROOT with non-cross-checking locks. It is REMOVED:
+# ALL package updates are now delegated to the dedicated, VERIFIED updater
+# (`_pkg_run_update`), the ONLY code path that may advance REPO_ROOT. Dream is
+# repositioned as KB-maintenance + convergence sync ONLY — it never mutates the
+# package tree, so it can never race or brick the updater.
+#
+# ACCEPTED trade-off (documented): because the updater no-ops fail-closed until the
+# operator cuts the first signed tag (Task 12), removing step-0 means NO package
+# auto-update until go-live — the intended no-unsigned-updates posture, NOT a
+# regression. (`_dream_pull_post_check` is retained: it is shared by the KB-pull
+# step, which stays.)
 
 
 def _dream_step_kb_pull(kdir, dry_run):
@@ -17521,7 +17483,8 @@ def _dream_step_kb_git(kdir, dry_run):
 
 
 DREAM_STEP_FUNCS = (
-    ("0", "pkg-pull", _dream_step_pkg_pull),
+    # Step "0" pkg-pull RETIRED (Task 13) — package updates are delegated to the
+    # dedicated verified updater; dream never mutates REPO_ROOT.
     ("1", "kb-pull", _dream_step_kb_pull),
     ("2", "health-gate", _dream_step_health_gate),
     ("a", "index-rebuild", _dream_step_index_rebuild),
@@ -18025,8 +17988,8 @@ def _dream_install_schedule(kdir, as_json):
                                           stderr=subprocess.PIPE, check=False)
                 base = existing.stdout.decode("utf-8", "replace") \
                     if existing.returncode == 0 else ""
-                base = "".join(l for l in base.splitlines(keepends=True)
-                               if "agentware" not in l or "dream" not in l)
+                # OWN marker only — never strip the tick cron line.
+                base = _crontab_filter(base, ("agentware", "dream"))
                 subprocess.run(["crontab", "-"], input=(base + content).encode(),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                check=False)
@@ -18071,6 +18034,1741 @@ def _dream_uninstall_schedule(as_json):
         print("DREAM schedule %s (%s): %s"
               % ("removed" if removed else "not present", platform, path))
     return 0
+
+
+# --- P2b: shared 30-min tick scheduler + hardened dedicated updater ----------
+# Feature 260712-scheduler-updater. Ships (1) a shared, job-agnostic, sleep-proof
+# 30-min tick daemon and (2) a HARDENED, DEDICATED package updater that tracks a
+# SIGNED SemVer tag channel ONLY (never tip-of-main), verifies BEFORE any pulled
+# code executes, smoke-tests, and auto-rolls-back to a recorded last-good SHA
+# before triggering the migration runner.
+#
+# BOOTSTRAP-DEADLOCK RULE: every updater runtime helper is a NEUTRAL `_pkg_*`
+# function — the live update path is NEVER coupled to dream code (if an update
+# breaks dream and dream is the updater, the fix can never arrive). State + the
+# trust anchor live OUTSIDE the tree the updater rewrites, in the operator's HOME
+# (`~/.agentware/`), gitignored, NEVER in the KB and NEVER in the package tree.
+#
+# LOAD-BEARING ORDERING INVARIANT: verify BEFORE any pulled code executes and
+# smoke BEFORE `migrate --apply`. Because `_kb_predispatch_gate` makes an older
+# CLI meeting a newer `.schema` fail loud, rolling the package back to an older
+# SHA *after* migrate stamped a higher `.schema` bricks the machine. Strict,
+# non-reorderable: fetch --tags (read-only) -> verify signature vs the HOME-pinned
+# key -> no-downgrade -> record last_good BEFORE advance -> ff-only apply the
+# concrete SHA -> assert HEAD==SHA -> smoke -> (pass) migrate --apply -> record.
+
+# HOME-local, gitignored, machine-local state + trust anchor. Both DERIVE from
+# HOME_CONFIG's directory so a test that patches HOME_CONFIG isolates them
+# hermetically (R-LOC-03) and they never land in the KB or the package tree.
+UPDATE_STATE_NAME = "update-state.json"
+ALLOWED_SIGNERS_NAME = "allowed_signers"
+# Single-writer updater lock — DISTINCT from DREAM_LOCK_REL so the updater and a
+# nightly dream can never interleave git mutations on the same work tree.
+UPDATER_LOCK_REL = os.path.join(".cache", "updater.lock")
+# Signed SemVer STABLE channel: vMAJOR.MINOR.PATCH only (no pre-release/build).
+PKG_CHANNEL_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+PKG_SMOKE_TIMEOUT = 600       # generous hard cap: a growing suite never false-FAILs a good tag
+PKG_FETCH_TIMEOUT = 120       # unattended tick fetch bound; rc-124 => graceful skip (no apply)
+UPDATER_CHECK_INTERVAL_SEC = 6 * 3600   # due-gate: the tick checks ~every 6h
+MAX_QUARANTINED_TAGS = 50     # bounded quarantine ledger (anti-thrash, not per-tick spam)
+
+
+class _PkgStateError(Exception):
+    """Raised for a fail-closed security condition on the HOME state/trust files
+    (symlink, wrong-owner, group/world-writable) OR an un-surfaceable write
+    failure. Callers MUST treat this as 'do not apply' — never fall through."""
+
+
+def _pkg_home_dir():
+    """The operator's ~/.agentware directory (derived from HOME_CONFIG so tests
+    that patch HOME_CONFIG get a fully isolated state/trust root)."""
+    return os.path.dirname(HOME_CONFIG)
+
+
+def _pkg_state_path():
+    return os.path.join(_pkg_home_dir(), UPDATE_STATE_NAME)
+
+
+def _pkg_assert_secure_path(path, is_dir):
+    """Fail-closed integrity guard: lstat `path` and REFUSE (raise _PkgStateError)
+    if it is a symlink, the wrong type, not owned by this euid, or group/world-
+    writable. Used before consulting or overwriting any HOME state/trust file so a
+    malicious local actor cannot redirect or tamper with the trust root."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise _PkgStateError("%s is a symlink — refusing (fail-closed)" % path)
+    if is_dir and not stat.S_ISDIR(st.st_mode):
+        raise _PkgStateError("%s is not a directory — refusing" % path)
+    if not is_dir and not stat.S_ISREG(st.st_mode):
+        raise _PkgStateError("%s is not a regular file — refusing" % path)
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and st.st_uid != geteuid():
+        raise _PkgStateError(
+            "%s owned by uid %d, not %d — refusing (fail-closed)"
+            % (path, st.st_uid, geteuid()))
+    if st.st_mode & 0o022:
+        raise _PkgStateError("%s is group/world-writable — refusing (fail-closed)"
+                             % path)
+
+
+def _pkg_secure_home():
+    """Ensure ~/.agentware exists as a 0700 directory owned by this euid and is
+    not a symlink. Raises _PkgStateError on a tampered/symlinked directory."""
+    d = _pkg_home_dir()
+    if os.path.lexists(d):
+        _pkg_assert_secure_path(d, is_dir=True)
+    else:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+
+
+def _pkg_state_read():
+    """Read the HOME-local update-state sidecar as a dict.
+
+    TOLERANT of a missing or corrupt/unparseable file (returns {} = empty). But
+    FAIL-CLOSED (raises _PkgStateError) on a security-tampered sidecar — a
+    symlink, wrong-owner, or group/world-writable file — so a caller never trusts
+    a redirected or attacker-writable rollback target."""
+    path = _pkg_state_path()
+    if not os.path.lexists(path):
+        return {}
+    _pkg_assert_secure_path(path, is_dir=False)   # raises on tamper (fail-closed)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _pkg_secure_atomic_write(path, text, mode=0o600):
+    """Atomic, symlink-safe write of `text` to a HOME state/trust file at `mode`.
+
+    Refuses to overwrite a tampered/symlinked target (fail-closed), writes via an
+    O_EXCL+O_NOFOLLOW temp then `os.replace`, and SURFACES every failure by
+    re-raising so a full/read-only HOME can never silently drop a write."""
+    if os.path.lexists(path):
+        _pkg_assert_secure_path(path, is_dir=False)
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(tmp, flags, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _pkg_state_write(state):
+    """Atomically persist the sidecar (mode 0600) under a secured ~/.agentware
+    (0700). SURFACES any failure by raising — callers MUST fail closed on a full
+    or read-only HOME (an update must never advance the tree with no rollback
+    target). Never follows a symlink."""
+    _pkg_secure_home()                    # raises on a tampered/symlinked home dir
+    text = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    _pkg_secure_atomic_write(_pkg_state_path(), text, mode=0o600)
+
+
+def _pkg_state_update(**fields):
+    """Read-modify-write convenience: merge `fields` into the sidecar and persist.
+    Raises _PkgStateError / OSError on write failure (fail-closed by design)."""
+    state = _pkg_state_read()
+    state.update(fields)
+    _pkg_state_write(state)
+    return state
+
+
+def _pkg_quarantine_tag(tag, reason=None):
+    """Append `tag` to the bounded quarantined_tags ledger (dedup, capped).
+    Persisted so a broken release is not re-attempted every tick (anti-thrash)."""
+    state = _pkg_state_read()
+    q = state.get("quarantined_tags")
+    if not isinstance(q, list):
+        q = []
+    entry = {"tag": tag, "reason": (reason or "")[:200], "ts": _now_iso()}
+    q = [e for e in q if not (isinstance(e, dict) and e.get("tag") == tag)]
+    q.append(entry)
+    if len(q) > MAX_QUARANTINED_TAGS:
+        q = q[-MAX_QUARANTINED_TAGS:]
+    state["quarantined_tags"] = q
+    _pkg_state_write(state)
+    return state
+
+
+def _pkg_is_quarantined(tag):
+    q = _pkg_state_read().get("quarantined_tags") or []
+    return any(isinstance(e, dict) and e.get("tag") == tag for e in q)
+
+
+# --- Task 2: trust anchor (HOME-pinned publisher SSH signing key) ------------
+# The trust root lives OUTSIDE the tree the updater rewrites (~/.agentware/
+# allowed_signers), so a malicious push can never rotate the key it is checked
+# against. Managed as a MULTI-KEY file (append/list, honoring SSH valid-after/
+# valid-before) so a new publisher key is trusted during an overlap window before
+# the old one retires — closing the fleet-stranding case. Verification uses plain
+# git/SSH (`gpg.ssh.allowedSignersFile`), NO keyring, NO network, NO gh.
+PKG_PUBLISHER_PRINCIPAL = "agentware-release"   # default signer identity (tagger)
+_SSH_KEYTYPES = (
+    "ssh-ed25519", "ssh-rsa", "ssh-dss",
+    "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com",
+)
+
+
+def _pkg_allowed_signers_path():
+    return os.path.join(_pkg_home_dir(), ALLOWED_SIGNERS_NAME)
+
+
+def _pkg_assert_signers_secure():
+    """lstat the allowed_signers trust anchor and REFUSE fail-closed on a
+    symlink, wrong-owner, or group/world-writable file BEFORE it is consulted for
+    verification (a tampered trust root must never be trusted). Returns the path
+    (whether or not it exists yet)."""
+    path = _pkg_allowed_signers_path()
+    if os.path.lexists(path):
+        _pkg_assert_secure_path(path, is_dir=False)
+    return path
+
+
+def _pkg_ssh_key_fingerprint(keydata):
+    """OpenSSH SHA256 fingerprint ('SHA256:<b64-no-pad>') of a base64 key blob,
+    computed in pure stdlib (matches `ssh-keygen -lf`). None on a non-base64 blob."""
+    try:
+        raw = base64.b64decode(keydata, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if not raw:
+        return None
+    digest = hashlib.sha256(raw).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _pkg_parse_signers(text):
+    """Parse allowed_signers content into records
+    {principal, options, keytype, keydata, comment, fingerprint, raw}. Skips
+    blank/comment/malformed lines. Robust to optional valid-after/valid-before
+    options by locating the keytype token."""
+    records = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        toks = s.split()
+        kt_idx = next((i for i, t in enumerate(toks) if t in _SSH_KEYTYPES), None)
+        if kt_idx is None or kt_idx == 0 or kt_idx + 1 >= len(toks):
+            continue  # malformed / no key — skip (never trust an unparseable line)
+        records.append({
+            "principal": toks[0],
+            "options": toks[1:kt_idx],
+            "keytype": toks[kt_idx],
+            "keydata": toks[kt_idx + 1],
+            "comment": " ".join(toks[kt_idx + 2:]),
+            "fingerprint": _pkg_ssh_key_fingerprint(toks[kt_idx + 1]),
+            "raw": s,
+        })
+    return records
+
+
+def _pkg_list_signers():
+    """Parsed records of the HOME-pinned trust anchor ([] if unpinned).
+    Fail-closed on a tampered file."""
+    path = _pkg_assert_signers_secure()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _pkg_parse_signers(f.read())
+    except OSError:
+        return []
+
+
+def _pkg_pin_publisher_key(principal, keytype, keydata, valid_after=None,
+                           valid_before=None, comment=None):
+    """Append a publisher signer to ~/.agentware/allowed_signers (multi-key,
+    honoring valid-after/valid-before overlap windows). Idempotent: dedup by
+    keydata. Returns (fingerprint, added:bool). Fail-closed on a tampered anchor
+    or unwritable HOME (raises)."""
+    if keytype not in _SSH_KEYTYPES:
+        raise _PkgStateError("unsupported SSH key type %r" % keytype)
+    if _pkg_ssh_key_fingerprint(keydata) is None:
+        raise _PkgStateError("key data is not valid base64 — refusing to pin")
+    _pkg_secure_home()
+    path = _pkg_assert_signers_secure()
+    existing = ""
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            existing = f.read()
+    for rec in _pkg_parse_signers(existing):
+        if rec["keydata"] == keydata:
+            return rec["fingerprint"], False   # already pinned (idempotent)
+    opts = []
+    if valid_after:
+        opts.append('valid-after="%s"' % valid_after)
+    if valid_before:
+        opts.append('valid-before="%s"' % valid_before)
+    parts = [principal] + opts + [keytype, keydata]
+    if comment:
+        parts.append(comment)
+    line = " ".join(parts)
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += line + "\n"
+    _pkg_secure_atomic_write(path, text, mode=0o600)
+    return _pkg_ssh_key_fingerprint(keydata), True
+
+
+def _pkg_intree_signing_key_path():
+    """Conventional in-repo publisher pubkey copy (committed for discovery), or
+    None. There is no in-tree key until the publisher ships one (go-live)."""
+    for rel in ("catalog/agentware-release.pub", ".agentware-release.pub"):
+        p = os.path.join(REPO_ROOT, rel)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _pkg_pubkey_records(path):
+    """Parse an OpenSSH pubkey file ('keytype keydata [comment]' per line) into
+    (keytype, keydata, fingerprint) tuples."""
+    out = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        toks = line.split()
+        if len(toks) >= 2 and toks[0] in _SSH_KEYTYPES:
+            fp = _pkg_ssh_key_fingerprint(toks[1])
+            if fp:
+                out.append((toks[0], toks[1], fp))
+    return out
+
+
+def _pkg_trust_fingerprint_warnings():
+    """Loud warnings when an in-tree publisher key copy differs from the
+    HOME-pinned trust anchor: a rotation MUST be operator-confirmed via
+    `scripts/agentware trust rotate`, never silently auto-trusted from a push."""
+    intree = _pkg_intree_signing_key_path()
+    if not intree:
+        return []
+    intree_fps = {fp for _kt, _kd, fp in _pkg_pubkey_records(intree)}
+    if not intree_fps:
+        return []
+    pinned = {r["fingerprint"] for r in _pkg_list_signers() if r.get("fingerprint")}
+    if not pinned:
+        return []   # nothing pinned yet — onboarding/go-live performs the first pin
+    warnings = []
+    for fp in sorted(intree_fps - pinned):
+        warnings.append(
+            "in-tree signing key %s is NOT in the HOME-pinned trust anchor — a key "
+            "rotation must be operator-confirmed via `scripts/agentware trust "
+            "rotate` (refusing to auto-trust a pushed key)" % fp)
+    return warnings
+
+
+def cmd_trust(args):
+    """Manage the HOME-pinned publisher trust anchor (~/.agentware/allowed_signers).
+
+    Subcommands: `list` (show pinned signers), `pin` (trust a publisher key —
+    trust-on-first-clone / onboarding), `rotate` (trust a NEW key during an
+    overlap window; both remain valid so the fleet is never stranded — the
+    operator confirms the fingerprint out of band), `verify` (integrity + in-tree
+    fingerprint-compare). Fail-closed on a tampered anchor."""
+    action = getattr(args, "trust_command", None) or "list"
+    as_json = getattr(args, "format", "text") == "json"
+    try:
+        if action == "list":
+            recs = _pkg_list_signers()
+            if as_json:
+                json.dump({"ok": True, "path": _pkg_allowed_signers_path(),
+                           "signers": [{"principal": r["principal"],
+                                        "keytype": r["keytype"],
+                                        "fingerprint": r["fingerprint"],
+                                        "options": r["options"]} for r in recs]},
+                          sys.stdout, ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                if not recs:
+                    print("trust: no publisher keys pinned in %s"
+                          % _pkg_allowed_signers_path())
+                for r in recs:
+                    print("trust: %s %s %s%s" % (
+                        r["principal"], r["keytype"], r["fingerprint"],
+                        (" [" + " ".join(r["options"]) + "]") if r["options"] else ""))
+            return 0
+
+        if action in ("pin", "rotate"):
+            principal = getattr(args, "principal", None) or PKG_PUBLISHER_PRINCIPAL
+            key_file = getattr(args, "key_file", None)
+            from_repo = getattr(args, "from_repo", False)
+            if from_repo and not key_file:
+                key_file = _pkg_intree_signing_key_path()
+                if not key_file:
+                    sys.stderr.write("trust %s: no in-tree publisher key found "
+                                     "(catalog/agentware-release.pub) — pass "
+                                     "--key-file.\n" % action)
+                    return 1
+            if not key_file:
+                sys.stderr.write("trust %s: --key-file or --from-repo required.\n"
+                                 % action)
+                return 2
+            recs = _pkg_pubkey_records(key_file)
+            if not recs:
+                sys.stderr.write("trust %s: %s has no parseable SSH public key.\n"
+                                 % (action, key_file))
+                return 1
+            added_any = False
+            for keytype, keydata, fp in recs:
+                _fp, added = _pkg_pin_publisher_key(
+                    principal, keytype, keydata,
+                    valid_after=getattr(args, "valid_after", None),
+                    valid_before=getattr(args, "valid_before", None),
+                    comment=getattr(args, "comment", None))
+                added_any = added_any or added
+                verb = "pinned" if added else "already trusted"
+                if action == "rotate" and added:
+                    verb = "pinned (ROTATION — overlap window; old key still valid)"
+                print("trust %s: %s %s %s" % (action, verb, principal, fp))
+            if action == "rotate" and added_any:
+                print("trust rotate: confirm this fingerprint with the publisher "
+                      "OUT OF BAND, then retire the old key after the overlap "
+                      "window (see docs/release-signing.md).")
+            return 0
+
+        if action == "verify":
+            path = _pkg_allowed_signers_path()
+            try:
+                _pkg_assert_signers_secure()
+                integrity = "ok"
+            except _PkgStateError as exc:
+                integrity = "FAIL: %s" % exc
+            recs = _pkg_list_signers()
+            warnings = _pkg_trust_fingerprint_warnings()
+            ok = integrity == "ok" and not warnings
+            if as_json:
+                json.dump({"ok": ok, "path": path, "integrity": integrity,
+                           "pinned_count": len(recs), "warnings": warnings},
+                          sys.stdout, ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                print("trust verify: integrity=%s, %d key(s) pinned"
+                      % (integrity, len(recs)))
+                for w in warnings:
+                    print("  ⚠ %s" % w)
+            return 0 if ok else 1
+
+        sys.stderr.write("trust: unknown action %r\n" % action)
+        return 2
+    except _PkgStateError as exc:
+        sys.stderr.write("trust: %s\n" % exc)
+        return 1
+
+
+# --- Task 3: signed-tag channel resolver + verify (fail-closed, TOCTOU-safe) --
+# The core security primitive that REPLACES the branch-tip @{upstream} resolution.
+# Pure resolution + verification: executes NO pulled code. Plain git/SSH only
+# (no gh, no keyring, no network beyond the read-only fetch).
+
+def _pkg_version_tuple(s):
+    """(MAJOR, MINOR, PATCH) ints from 'vX.Y.Z' or 'X.Y.Z', else None. Gives the
+    TOTAL ORDER the no-downgrade guard needs."""
+    if not s:
+        return None
+    t = s if s.startswith("v") else "v" + s
+    m = PKG_CHANNEL_RE.match(t.strip())
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _pkg_ver_str(ver):
+    return ".".join(str(x) for x in ver) if ver else None
+
+
+def _pkg_channel_tags(target):
+    """Stable SemVer channel tags (vX.Y.Z) present in `target`, newest-version
+    first. Sorted by our OWN version tuple (not git's -v:refname) for a
+    deterministic total order regardless of git version."""
+    cp = _git(target, "tag", "--list")
+    if cp.returncode != 0:
+        return []
+    tags = [t.strip() for t in cp.stdout.splitlines()
+            if PKG_CHANNEL_RE.match(t.strip())]
+    return sorted(tags, key=_pkg_version_tuple, reverse=True)
+
+
+def _pkg_verify_tag(target, tag, signers_path):
+    """Verify `tag`'s signature against the HOME-pinned allowed_signers using
+    plain git/SSH (`gpg.format=ssh` injected per-invocation — never mutates repo
+    config). Returns (ok, detail). FAIL-CLOSED: an unsigned, tampered, or
+    unknown-signer tag (any non-zero `git tag -v`) is ok=False."""
+    if not signers_path or not os.path.isfile(signers_path):
+        return False, "no HOME-pinned allowed_signers — cannot verify (fail-closed)"
+    cp = _git(target, "-c", "gpg.format=ssh",
+              "-c", "gpg.ssh.allowedSignersFile=%s" % signers_path,
+              "tag", "-v", tag)
+    if cp.returncode == 0:
+        return True, "verified signed tag"
+    detail = ((cp.stderr or "") + (cp.stdout or "")).strip().splitlines()
+    return False, (detail[-1] if detail else "signature verification failed")
+
+
+def _pkg_tag_sha(target, tag):
+    """Resolve a tag NAME to its concrete commit SHA (dereferencing an annotated
+    tag to its commit). Called ONCE per resolution so verify and apply pin the
+    exact same object (TOCTOU-safe)."""
+    cp = _git(target, "rev-list", "-n", "1", tag)
+    if cp.returncode == 0 and cp.stdout.strip():
+        return cp.stdout.strip().splitlines()[0].strip()
+    return None
+
+
+def _pkg_resolve_verified_tag(target=None, now_iso=None):
+    """Read-only fetch + resolve the newest VERIFIED, no-downgrade signed tag to a
+    concrete SHA. Executes NO pulled code. Records last_check_ts + last_fetch_ts.
+
+    Returns a dict {status, tag, sha, version, warnings, detail} where status is:
+      resolved   — a verified tag NEWER than last_applied_version; {tag,sha,version} set
+      up-to-date — the newest verified tag is not newer than last_applied
+      none       — no channel tags, or no verifiable tag and never applied
+      skipped    — fetch timed out / offline (graceful; no apply, no rollback)
+      no-trust   — trust anchor absent/tampered — fail-closed, cannot verify
+
+    Audit-hardening: iterates version-sorted candidates newest->down and picks the
+    FIRST that BOTH verifies AND satisfies no-downgrade, so one stray/unsigned
+    higher tag cannot freeze delivery; a newer-than-applied tag that fails
+    verification emits a LOUD anomaly warning and is quarantined (bounded)."""
+    target = target or REPO_ROOT
+    now_iso = now_iso or _now_iso()
+    result = {"status": "none", "tag": None, "sha": None, "version": None,
+              "warnings": [], "detail": ""}
+
+    # Integrity guard on the trust anchor BEFORE consulting it (fail-closed).
+    signers = _pkg_allowed_signers_path()
+    try:
+        _pkg_assert_signers_secure()
+    except _PkgStateError as exc:
+        _pkg_state_update(last_check_ts=now_iso)
+        result.update(status="no-trust", detail=str(exc))
+        return result
+    if not _pkg_list_signers():
+        _pkg_state_update(last_check_ts=now_iso)
+        result.update(status="no-trust",
+                      detail="no publisher key pinned (~/.agentware/allowed_signers)"
+                             " — updater fail-closed until go-live")
+        return result
+
+    # Read-only fetch of tags through the timeout-bounded runner. NEVER touches
+    # the work tree. rc-124 = graceful skip. last_check/last_fetch recorded on
+    # every ATTEMPT (incl. timeout) so a slept/offline machine self-corrects and
+    # the layer-2 staleness pre-hook does not hammer the remote.
+    env = _git_noninteractive_env()
+    fetch = _git_timed(target, "fetch", "--tags", "--quiet",
+                       env=env, timeout=PKG_FETCH_TIMEOUT)
+    _pkg_state_update(last_check_ts=now_iso, last_fetch_ts=now_iso)
+    if fetch.returncode == 124:
+        result.update(status="skipped",
+                      detail="fetch --tags timed out (%ds) — graceful skip"
+                             % PKG_FETCH_TIMEOUT)
+        return result
+    if fetch.returncode != 0:
+        first = ((fetch.stderr or "") + (fetch.stdout or "")).strip().splitlines()
+        result.update(status="skipped",
+                      detail="fetch --tags failed (offline?): %s"
+                             % (first[0] if first else "unknown"))
+        return result
+
+    tags = _pkg_channel_tags(target)
+    if not tags:
+        result.update(status="none", detail="no signed SemVer channel tags present")
+        return result
+
+    applied = _pkg_version_tuple(_pkg_state_read().get("last_applied_version"))
+    for tag in tags:
+        ver = _pkg_version_tuple(tag)
+        # No-downgrade: tags are sorted DESC, so the first tag <= applied means
+        # nothing newer remains — refuse (defends anti-rewind / re-served old CVE).
+        if applied is not None and ver <= applied:
+            result.update(status="up-to-date",
+                          detail="no verified tag newer than applied %s"
+                                 % _pkg_ver_str(applied))
+            return result
+        if _pkg_is_quarantined(tag):
+            continue   # a previously smoke-failed / unverifiable tag (anti-thrash)
+        ok, detail = _pkg_verify_tag(target, tag, signers)
+        if not ok:
+            warn = ("anomalous newer tag %s is UNVERIFIABLE (%s) — refusing "
+                    "fail-closed and quarantining; falling back to the next "
+                    "verified tag" % (tag, detail))
+            result["warnings"].append(warn)
+            _pkg_quarantine_tag(tag, "unverifiable: %s" % detail)
+            continue
+        sha = _pkg_tag_sha(target, tag)
+        if not sha:
+            result["warnings"].append("verified %s but could not resolve its SHA "
+                                      "— skipping" % tag)
+            continue
+        result.update(status="resolved", tag=tag, sha=sha, version=_pkg_ver_str(ver))
+        return result
+
+    # Exhausted with no verifiable newer tag.
+    if applied is not None:
+        result.update(status="up-to-date",
+                      detail="no verifiable tag newer than applied %s"
+                             % _pkg_ver_str(applied))
+    else:
+        result.update(status="none",
+                      detail="no verifiable signed tag in the channel (fail-closed)")
+    return result
+
+
+# --- Task 4: post-update smoke-test contract (exit-code-gated, hard timeout) --
+# Fast enough for an unattended tick. PASS iff every step exits 0. Emits NO new
+# metric (decide-smoke-test-observability-no-new-emission) and — critically —
+# writes NOTHING to benchmarks/history.jsonl or SCORECARD.md: it deliberately
+# does NOT run `audit --with-tests` (whose `_audit_gate_check` runs the FULL
+# suite AND appends the ledger + rewrites the scorecard, dirtying the live KB).
+
+def _pkg_syntax_check(target=None):
+    """py_compile the on-disk CLI; None if OK, else an error string. Neutral
+    neutral generalization of the (now-retired) dream pkg-pull syntax check
+    (bootstrap-deadlock: the updater never depends on dream code)."""
+    import py_compile
+    script = os.path.join(target or REPO_ROOT, "scripts", "agentware")
+    try:
+        py_compile.compile(script, doraise=True)
+        return None
+    except py_compile.PyCompileError as exc:
+        return str(exc)
+
+
+def _pkg_run_bounded(cmd, cwd, kdir, timeout):
+    """Run one smoke subcommand with a HARD timeout: on expiry kill the entire
+    process group (so a hung new version FAILS rather than hanging the tick) and
+    return rc 124. Returns (rc, last_output_line). Read-only w.r.t. the ledger."""
+    env = _git_noninteractive_env()
+    if kdir:
+        env["AGENTWARE_KNOWLEDGE_DIR"] = kdir
+    env.setdefault("AGENTWARE_NESTED_UNITTEST", "1")   # never recurse into the suite
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                start_new_session=True)
+        with proc:
+            try:
+                out, _e = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, 9)
+                except (OSError, ProcessLookupError):
+                    proc.kill()
+                proc.wait()
+                return 124, "timed out after %ds" % timeout
+            rc = proc.returncode
+        lines = (out or "").strip().splitlines()
+        return rc, (lines[-1] if lines else "")
+    except FileNotFoundError:
+        return 127, "CLI not found"
+    except OSError as exc:
+        return 126, "OS error: %s" % exc
+
+
+def _pkg_smoke(kdir, timeout=PKG_SMOKE_TIMEOUT, target=None):
+    """Decide PASS/FAIL of a freshly-applied package by EXIT CODE. Steps (none
+    write the ledger/scorecard):
+      (0) py_compile syntax check (cheapest; catches a broken pull pre-exec);
+      (1) steering lint (R-PKG-04);
+      (2) CLI-liveness — config resolve + index validate + a canary recall all
+          exit 0 (a broken/import-broken toolkit IS a bricked machine, the single
+          most important check).
+    Each exec'd subcommand runs the ON-DISK (possibly newly-pulled) CLI under a
+    GENEROUS hard timeout so a growing suite never false-FAILs a good tag into
+    rollback. PASS = every step exits 0. Returns {ok, steps, detail}."""
+    target = target or REPO_ROOT
+    cli = os.path.join(target, "scripts", "agentware")
+    steps = []
+    syn = _pkg_syntax_check(target)
+    steps.append({"name": "syntax", "ok": syn is None,
+                  "rc": 0 if syn is None else 1, "detail": syn or "parses"})
+    # Short-circuit: a syntax-broken CLI cannot be exec'd — skip the rest, FAIL.
+    if syn is None:
+        checks = [
+            ("steering-lint", [cli, "steering", "lint"], None),
+            ("config-resolve", [cli, "config", "--knowledge-dir-only"], kdir),
+            ("index-validate", [cli, "index", "validate"], kdir),
+            ("canary-recall", [cli, "recall", "smoke canary liveness probe",
+                               "--format", "json"], kdir),
+        ]
+        for name, cmd, kd in checks:
+            rc, detail = _pkg_run_bounded(cmd, target, kd, timeout)
+            steps.append({"name": name, "ok": rc == 0, "rc": rc, "detail": detail})
+    ok = all(s["ok"] for s in steps)
+    return {"ok": ok, "steps": steps,
+            "detail": ("smoke PASS" if ok else "smoke FAIL: " +
+                       ", ".join(s["name"] for s in steps if not s["ok"]))}
+
+
+# --- Task 5: scoped auto-rollback (authorized R-GIT-02 exception) -------------
+# On smoke failure: `git reset --hard` to the PERSISTED last_good_sha, scoped to
+# REPO_ROOT only, backward-only, clean-tree-guarded (never eats operator edits),
+# then RE-SMOKE to confirm restoration, then quarantine the failed tag
+# (anti-thrash). Neutral generalization of the (now-retired) dream pkg-pull revert
+# targeting the PERSISTED last_good, not an in-process pre-pull SHA. A DECISION.
+
+def _pkg_git_process_live(target):
+    """Best-effort: True only if a git process referencing `target` is POSITIVELY
+    found. Conservative — an unknown state reads as not-live, so a genuinely stale
+    lock is still cleanable (the caller also gates on lock mtime age)."""
+    try:
+        cp = subprocess.run(["pgrep", "-fl", "git"], stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, text=True, timeout=5,
+                            check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if cp.returncode != 0:
+        return False
+    return any(target in line for line in cp.stdout.splitlines())
+
+
+def _pkg_clear_stale_index_lock(target, max_age=None):
+    """Remove a STALE `.git/index.lock` — mtime older than the apply timeout AND
+    no live git process on `target` — that a crashed prior apply left behind and
+    that would otherwise block `git reset --hard`. Returns True if it cleared one."""
+    max_age = max_age if max_age is not None else PKG_FETCH_TIMEOUT
+    lock = os.path.join(target, ".git", "index.lock")
+    try:
+        st = os.lstat(lock)
+    except OSError:
+        return False
+    age = time.time() - st.st_mtime
+    if age > max_age and not _pkg_git_process_live(target):
+        try:
+            os.remove(lock)
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _pkg_rollback(failed_tag, target=None, kdir=None, reason="smoke failed"):
+    """Roll REPO_ROOT back to the recorded last_good_sha and re-smoke.
+
+    Authorized R-GIT-02 exception (self-extension warning): REPO_ROOT-only,
+    backward-only, clean-tree-guarded. FORBIDDEN once migrate stamped a higher KB
+    schema (brick-ordering: an older package meeting a newer .schema fails loud).
+    If the rollback itself cannot complete, escalates to `needs_manual_recovery`
+    (last_good PRESERVED) and returns loudly — NEVER a silent skip.
+
+    Returns {ok, restored, sha, resmoke_ok, needs_manual_recovery, detail}."""
+    target = target or REPO_ROOT
+    kdir = kdir or resolve_knowledge_dir()
+    state = _pkg_state_read()
+    last_good = state.get("last_good_sha")
+    result = {"ok": False, "restored": False, "sha": last_good,
+              "resmoke_ok": None, "needs_manual_recovery": False, "detail": ""}
+
+    def _escalate(detail):
+        # Preserve last_good; flag manual recovery; loud (never status:skipped).
+        try:
+            _pkg_state_update(needs_manual_recovery=True)
+        except (OSError, _PkgStateError):
+            pass
+        result["needs_manual_recovery"] = True
+        result["detail"] = detail
+        return result
+
+    if not last_good:
+        return _escalate("no recorded last_good_sha — cannot roll back "
+                         "(needs_manual_recovery)")
+
+    # Brick-ordering guard: refuse a package rollback once migrate advanced the
+    # schema (would strand: older CLI vs newer .schema).
+    pending = state.get("pending_apply") or {}
+    if pending.get("migrated"):
+        return _escalate("migrate already stamped a higher KB schema — package "
+                         "rollback FORBIDDEN (brick-ordering); needs_manual_recovery")
+
+    # Clear a crashed prior apply's stale index.lock so the reset can proceed.
+    _pkg_clear_stale_index_lock(target)
+
+    # Clean-tree guard: never discard operator edits with a hard reset.
+    if not git_is_clean(target):
+        return _escalate("work tree not clean — refusing hard reset to avoid "
+                         "eating operator edits; needs_manual_recovery")
+
+    head = _git_head(target)
+    if head and head != last_good and not _is_ancestor(target, last_good, "HEAD"):
+        return _escalate("last_good %s is not an ancestor of HEAD — refusing a "
+                         "non-backward reset; needs_manual_recovery" % last_good[:9])
+
+    rc = _git(target, "reset", "--hard", last_good)   # authorized R-GIT-02 exception
+    if rc.returncode != 0:
+        return _escalate("git reset --hard %s FAILED: %s; needs_manual_recovery"
+                         % (last_good[:9], (rc.stderr or "").strip()[:200]))
+    now_head = _git_head(target)
+    if now_head != last_good:
+        return _escalate("post-reset HEAD %s != last_good %s; needs_manual_recovery"
+                         % ((now_head or "?")[:9], last_good[:9]))
+    result["restored"] = True
+
+    # Quarantine the failed tag + clear the crash-window marker (anti-thrash).
+    if failed_tag:
+        _pkg_quarantine_tag(failed_tag, reason)
+    _pkg_state_update(pending_apply=None)
+
+    # Re-smoke to CONFIRM the machine is restored to known-good.
+    resmoke = _pkg_smoke(kdir or target, target=target)
+    result["resmoke_ok"] = resmoke["ok"]
+    result["ok"] = resmoke["ok"]
+    result["detail"] = ("rolled back to last_good %s; re-smoke %s"
+                        % (last_good[:9], "PASS" if resmoke["ok"] else "FAIL"))
+    if not resmoke["ok"]:
+        # Even known-good fails smoke now — escalate (do not leave silently broken).
+        _escalate(result["detail"] + " — known-good STILL fails smoke; "
+                  "needs_manual_recovery")
+    return result
+
+
+# --- Task 6: the DEDICATED updater apply path (strict, non-reorderable) -------
+# Both the MANUAL `update` command and the tick job call _pkg_run_update, so they
+# serialize on the SAME single-writer updater lock. Client apply gate = SMOKE ONLY
+# (the eval --record --gate half is a publisher pre-tag concern via
+# `gate release --full`; re-running it here would write reliability rows into the
+# operator KB). No gate/rollback step runs AFTER `migrate --apply` (brick-ordering).
+
+def _pkg_version(target=None):
+    """Current package version signal for rollout visibility: the stable tag at
+    HEAD via `git describe --tags --exact-match` (vX.Y.Z), else last_applied_version
+    from the sidecar, else None. Extends `_pinned_ref` (Task 11)."""
+    target = target or REPO_ROOT
+    cp = _git(target, "describe", "--tags", "--exact-match")
+    if cp.returncode == 0:
+        t = cp.stdout.strip()
+        if PKG_CHANNEL_RE.match(t):
+            return t.lstrip("v")
+    return _pkg_state_read().get("last_applied_version")
+
+
+def _pkg_migrate_after_apply(target, kdir):
+    """Trigger the NEWLY-APPLIED on-disk CLI's migration runner as a SUBPROCESS
+    (the running process still holds the OLD code in memory, so an in-process call
+    would run the OLD migrations). Returns (status, payload):
+      'ok'      — migrate applied / nothing pending (payload = JSON result)
+      'refused' — a RESTRUCTURING migration is pending (emit a workorder, keep pkg)
+      'error'   — older-CLI guard or exec failure (a real error)."""
+    cli = os.path.join(target, "scripts", "agentware")
+    env = _git_noninteractive_env()
+    env["AGENTWARE_KNOWLEDGE_DIR"] = kdir
+    try:
+        cp = subprocess.run([cli, "migrate", "--apply", "--format", "json"],
+                            cwd=target, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            timeout=PKG_SMOKE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return "error", {"detail": "migrate --apply timed out"}
+    except OSError as exc:
+        return "error", {"detail": "migrate exec failed: %s" % exc}
+    # `migrate --apply --format json` prints the JSON object FOLLOWED BY a human
+    # summary line (e.g. "migrate: refusing to auto-apply RESTRUCTURING ..."), so a
+    # plain json.loads(cp.stdout) would fail on the trailing text and mis-triage a
+    # restructuring-refusal as an 'error'. Parse only the LEADING JSON object.
+    payload = {}
+    out = (cp.stdout or "").strip()
+    if out:
+        try:
+            payload, _end = json.JSONDecoder().raw_decode(out)
+        except (ValueError, TypeError):
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    if cp.returncode == 0:
+        return "ok", payload
+    if payload.get("refused"):
+        return "refused", payload
+    return "error", (payload or {"detail": (cp.stderr or cp.stdout or "").strip()[:300]})
+
+
+def _pkg_run_update(target=None, kdir=None, now_iso=None):
+    """Dedicated updater apply sequence. Serializes on the single-writer updater
+    lock (SAME lock as the tick; the reverse loop-guard depends on it being held
+    during ANY apply). Returns a result dict {status, detail, tag, sha, version,
+    warnings, needs_manual_recovery?}. status ∈ {applied, up-to-date, none,
+    skipped, no-trust, dirty, rolled-back, migrate-workorder, migrate-error,
+    error, locked}."""
+    target = target or REPO_ROOT
+    kdir = kdir or require_knowledge_dir()
+    now_iso = now_iso or _now_iso()
+    res = {"status": "error", "detail": "", "warnings": [],
+           "tag": None, "sha": None, "version": None}
+    if not kdir:
+        res["detail"] = "no knowledge dir configured — cannot lock/update"
+        return res
+    if not git_is_work_tree(target):
+        res.update(status="none", detail="package is not a git work tree")
+        return res
+    # Single-writer lock (SAME lock as the tick). The dirty-tree check is done
+    # INSIDE the lock (TOCTOU-safe) by _pkg_run_update_locked.
+    if not dream_acquire_lock(kdir, lock_rel=UPDATER_LOCK_REL):
+        res.update(status="locked",
+                   detail="another updater/tick apply holds the lock — skipping")
+        return res
+    try:
+        # Reconcile a crashed prior apply FIRST, UNDER THE LOCK — so a concurrent
+        # tick/manual apply can never misread a LIVE apply's marker as crashed and
+        # run `git reset --hard` on the same tree. If reconciliation acts, stop
+        # (heal now; the normal apply runs on the next tick).
+        rec = _pkg_reconcile_pending(target, kdir)
+        if rec is not None:
+            return rec
+        return _pkg_run_update_locked(target, kdir, now_iso, res)
+    finally:
+        dream_release_lock(kdir, lock_rel=UPDATER_LOCK_REL)
+
+
+def _pkg_run_update_locked(target, kdir, now_iso, res):
+    # Assumes the single-writer updater lock is HELD by the caller.
+    # Dirty package tree -> graceful skip (never ff onto uncommitted edits).
+    if not git_is_clean(target):
+        res.update(status="dirty",
+                   detail="package work tree has uncommitted changes — skipping "
+                          "(commit/stash first; never applying onto edits)")
+        return res
+    # 1-2. resolve + verify + no-downgrade (records last_check_ts/last_fetch_ts).
+    r = _pkg_resolve_verified_tag(target, now_iso=now_iso)
+    res["warnings"] = r.get("warnings", [])
+    if r["status"] in ("skipped", "no-trust", "none", "up-to-date"):
+        res.update(status=r["status"], detail=r["detail"])
+        return res
+    if r["status"] != "resolved":
+        res.update(status="error", detail="unexpected resolver status %r" % r["status"])
+        return res
+    tag, sha, version = r["tag"], r["sha"], r["version"]
+    res.update(tag=tag, sha=sha, version=version)
+
+    # 3. record last_good BEFORE advance — HARD fail-closed precondition. A
+    # first-ever apply must NEVER advance with an empty rollback target.
+    cur_head = _git_head(target)
+    if not cur_head:
+        res.update(status="error", detail="cannot resolve current HEAD")
+        return res
+    prior = _pkg_state_read()
+    try:
+        _pkg_state_write(dict(prior,
+                              last_good_sha=cur_head,
+                              pending_apply={"applying_tag": tag,
+                                             "applying_sha": sha,
+                                             "migrated": False}))
+    except (OSError, _PkgStateError) as exc:
+        try:
+            _pkg_state_update(last_check_ts=now_iso)
+        except (OSError, _PkgStateError):
+            pass
+        res.update(status="error",
+                   detail="pre-advance last_good write FAILED (%s) — NOT applying "
+                          "(fail-closed: no rollback target)" % exc)
+        return res
+
+    # 5. ff-only apply the CONCRETE verified SHA (never re-resolve — TOCTOU-safe).
+    ff = _git(target, "merge", "--ff-only", sha)
+    if ff.returncode != 0:
+        _pkg_state_update(pending_apply=None)   # tree untouched by a refused ff
+        res.update(status="error",
+                   detail="ff-only apply to %s refused: %s (diverged/ahead)"
+                          % (sha[:9], (ff.stderr or "").strip()[:200]))
+        return res
+
+    # 6. assert HEAD == verified SHA (re-assert; TOCTOU).
+    new_head = _git_head(target)
+    if new_head != sha:
+        rb = _pkg_rollback(tag, target=target, kdir=kdir,
+                           reason="HEAD != verified SHA after apply")
+        res.update(status="rolled-back",
+                   needs_manual_recovery=rb.get("needs_manual_recovery"),
+                   detail="post-apply HEAD %s != verified SHA %s — rolled back (%s)"
+                          % ((new_head or "?")[:9], sha[:9], rb["detail"]))
+        return res
+
+    # 7. smoke (client apply gate = SMOKE ONLY; no eval --record --gate).
+    smoke = _pkg_smoke(kdir, target=target)
+    if not smoke["ok"]:
+        # 8. rollback + quarantine (migrate has NOT run — rollback is safe).
+        rb = _pkg_rollback(tag, target=target, kdir=kdir,
+                           reason="smoke failed: %s" % smoke["detail"])
+        res.update(status="rolled-back",
+                   needs_manual_recovery=rb.get("needs_manual_recovery"),
+                   detail="smoke FAILED (%s) — %s" % (smoke["detail"], rb["detail"]))
+        return res
+
+    # 9. migrate --apply (smoke passed). Triage exit; NO gate/rollback after this.
+    mstatus, mpayload = _pkg_migrate_after_apply(target, kdir)
+    if mstatus == "refused":
+        # restructuring-refused: emit workorder, KEEP package, do NOT rollback.
+        _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha, last_good_tag=tag,
+                              last_applied_version=version, pending_apply=None))
+        ref = mpayload.get("refused") or {}
+        res.update(status="migrate-workorder",
+                   detail="applied signed tag %s (%s); migrate REFUSED a "
+                          "restructuring migration (%s) — create a migration "
+                          "workorder (package KEPT, not rolled back)"
+                          % (tag, version, ref.get("name", "?")))
+        return res
+    if mstatus == "error":
+        # older-CLI / exec error: a real anomaly. Package is applied + smoke-passed;
+        # keep it (rollback is not warranted — smoke passed), surface LOUDLY. The
+        # loop pre-hook re-runs migrate each run, so a transient issue self-heals.
+        _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha, last_good_tag=tag,
+                              last_applied_version=version, pending_apply=None))
+        res.update(status="migrate-error",
+                   detail="applied signed tag %s (%s); smoke PASS but migrate "
+                          "--apply errored: %s (package KEPT; surfaced)"
+                          % (tag, version, mpayload.get("detail", "see logs")))
+        return res
+
+    # migrate ok -> set migrated=true (crash-window marker), then FINALIZE.
+    _pkg_state_update(pending_apply={"applying_tag": tag, "applying_sha": sha,
+                                     "migrated": True})
+    _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha, last_good_tag=tag,
+                          last_applied_version=version))
+    _pkg_state_update(pending_apply=None)        # clear marker LAST
+    res.update(status="applied",
+               detail="applied signed tag %s (%s) -> %s; smoke PASS; migrate ok"
+                      % (tag, version, sha[:9]))
+    return res
+
+
+# --- Task 7: shared 30-min tick daemon (StartInterval; job-agnostic dispatch) -
+# A single sleep-proof scheduler that dispatches DUE-gated jobs from a job-agnostic
+# registry. The updater is the first job; the P2c 6h dream-cadence bump is a purely
+# ADDITIVE second job. The scheduler cadence is only a wake-inclusive NUDGE — each
+# job computes its real due-ness IN-BAND from wall-clock-since-last-check, so a
+# slept-through machine self-corrects on the next post-wake tick.
+TICK_LAUNCHD_LABEL = "com.agentware.tick"      # DISTINCT from DREAM_LAUNCHD_LABEL
+TICK_CRON_REL = os.path.join(".agentware", "tick.cron")
+TICK_INTERVAL_SEC = 1800                        # 30-min StartInterval / cron */30
+
+
+def _crontab_filter(text, marker_tokens):
+    """Pure crontab write-filter: DROP a line iff it contains ALL of
+    `marker_tokens`, else KEEP it. Parametrizing the marker means installing the
+    tick (tokens agentware+tick) never strips the dream line (agentware+dream) and
+    vice versa."""
+    out = []
+    for line in (text or "").splitlines(keepends=True):
+        if all(tok in line for tok in marker_tokens):
+            continue
+        out.append(line)
+    return "".join(out)
+
+
+def _tick_cli_path():
+    return os.path.join(REPO_ROOT, "scripts", "agentware")
+
+
+def _tick_scheduler_log_path():
+    """Gitignored tick scheduler log (DISTINCT from dream's), under the KB's
+    logs/ (already gitignored) or ~/.agentware/logs/ when unconfigured."""
+    kdir = resolve_knowledge_dir()
+    base = kdir if kdir else os.path.join(os.path.expanduser("~"), ".agentware")
+    return os.path.join(base, "logs", "tick-scheduler.log")
+
+
+def _tick_launchd_plist(cli_path, log_path=None, interval=TICK_INTERVAL_SEC):
+    """LaunchAgent plist using StartInterval (NOT StartCalendarInterval) so the
+    shared tick wakes ~every `interval` seconds. Runs at low priority; captures
+    stdout+stderr to the gitignored tick scheduler log."""
+    log = log_path or _tick_scheduler_log_path()
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        '  <key>Label</key>\n  <string>%s</string>\n'
+        '  <key>ProgramArguments</key>\n'
+        '  <array>\n'
+        '    <string>/usr/bin/nice</string>\n'
+        '    <string>-n</string>\n    <string>%d</string>\n'
+        '    <string>%s</string>\n'
+        '    <string>tick</string>\n'
+        '  </array>\n'
+        '  <key>StartInterval</key>\n  <integer>%d</integer>\n'
+        '  <key>StandardOutPath</key>\n  <string>%s</string>\n'
+        '  <key>StandardErrorPath</key>\n  <string>%s</string>\n'
+        '  <key>RunAtLoad</key>\n  <false/>\n'
+        '</dict>\n</plist>\n'
+        % (TICK_LAUNCHD_LABEL, DREAM_NICE, cli_path, interval, log, log))
+
+
+def _tick_cron_line(cli_path, log_path=None):
+    """crontab line running the tick every 30 minutes at low priority."""
+    log = log_path or _tick_scheduler_log_path()
+    return "*/30 * * * * nice -n %d %s tick >> %s 2>&1\n" % (
+        DREAM_NICE, cli_path, log)
+
+
+def _tick_launchd_plist_path():
+    return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents",
+                        "%s.plist" % TICK_LAUNCHD_LABEL)
+
+
+def _tick_jobs():
+    """Job-agnostic tick registry. Each job is a dict:
+      {key, enabled: ()->bool, due: (kdir, now)->bool, run: (kdir, now)->dict}.
+    Task 8 registers the dedicated-updater job; the P2c dream-cadence job is purely
+    additive (append another entry — the dispatcher makes NO per-job assumptions)."""
+    return list(_TICK_JOB_REGISTRY)
+
+
+_TICK_JOB_REGISTRY = []      # Task 8 appends the updater job here at import time
+
+
+def _tick_any_job_enabled(jobs=None):
+    """True iff at least one registered job is enabled (install guard)."""
+    for job in (jobs if jobs is not None else _tick_jobs()):
+        try:
+            if job["enabled"]():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _tick_install_schedule(kdir, as_json, jobs=None):
+    """Install the shared 30-min tick into the operator's HOME (opt-in). macOS ->
+    launchd StartInterval plist; else -> crontab */30 fragment. REFUSES when NO
+    job is enabled (mirrors _dream_install_schedule). Fully non-interactive; writes
+    ONLY under HOME; best-effort activation skipped under the test guard."""
+    if not _tick_any_job_enabled(jobs):
+        sys.stderr.write("agentware: no tick job is enabled — nothing to schedule "
+                         "(enable one, e.g. `scripts/agentware config "
+                         "--set-updater on`).\n")
+        return 2
+    cli = _tick_cli_path()
+    log_path = _tick_scheduler_log_path()
+    if sys.platform == "darwin":
+        path = _tick_launchd_plist_path()
+        content = _tick_launchd_plist(cli, log_path)
+        platform = "launchd"
+    else:
+        path = os.path.join(os.path.expanduser("~"), TICK_CRON_REL)
+        content = _tick_cron_line(cli, log_path)
+        platform = "cron"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except OSError as exc:
+        sys.stderr.write("agentware: could not write tick schedule %s: %s\n"
+                         % (path, exc))
+        return 1
+    if os.environ.get("AGENTWARE_NESTED_UNITTEST") != "1":
+        try:
+            if platform == "launchd":
+                subprocess.run(["launchctl", "load", "-w", path],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               check=False)
+            else:
+                existing = subprocess.run(["crontab", "-l"], stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, check=False)
+                base = existing.stdout.decode("utf-8", "replace") \
+                    if existing.returncode == 0 else ""
+                # OWN marker only — never strip the dream cron line.
+                base = _crontab_filter(base, ("agentware", "tick"))
+                subprocess.run(["crontab", "-"], input=(base + content).encode(),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               check=False)
+        except (OSError, ValueError):
+            pass
+    if as_json:
+        json.dump({"ok": True, "platform": platform, "path": path,
+                   "interval_sec": TICK_INTERVAL_SEC}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("TICK schedule installed (%s): %s @ every %dm"
+              % (platform, path, TICK_INTERVAL_SEC // 60))
+    return 0
+
+
+def _tick_uninstall_schedule(as_json):
+    """Remove an installed tick schedule from HOME (idempotent; clean no-op if
+    absent). Never touches the dream schedule."""
+    if sys.platform == "darwin":
+        path, platform = _tick_launchd_plist_path(), "launchd"
+    else:
+        path = os.path.join(os.path.expanduser("~"), TICK_CRON_REL)
+        platform = "cron"
+    removed = False
+    if os.path.isfile(path):
+        if os.environ.get("AGENTWARE_NESTED_UNITTEST") != "1":
+            try:
+                if platform == "launchd":
+                    subprocess.run(["launchctl", "unload", "-w", path],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   check=False)
+                else:
+                    # Strip the LIVE crontab line (removing the fragment file alone
+                    # would leave the tick running forever). OWN marker only — never
+                    # touches the dream cron line.
+                    existing = subprocess.run(["crontab", "-l"],
+                                              stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, check=False)
+                    if existing.returncode == 0:
+                        base = _crontab_filter(
+                            existing.stdout.decode("utf-8", "replace"),
+                            ("agentware", "tick"))
+                        subprocess.run(["crontab", "-"], input=base.encode(),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       check=False)
+            except (OSError, ValueError):
+                pass
+        try:
+            os.remove(path)
+            removed = True
+        except OSError:
+            pass
+    if as_json:
+        json.dump({"ok": True, "platform": platform, "path": path,
+                   "removed": removed}, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("TICK schedule %s (%s): %s"
+              % ("removed" if removed else "not present", platform, path))
+    return 0
+
+
+def _tick_dispatch(kdir, now=None, jobs=None):
+    """Walk the job-agnostic registry and run each ENABLED + DUE job. Makes NO
+    updater-only assumptions. Returns a per-job result list. A job that raises is
+    isolated (recorded, never aborts the tick)."""
+    now = now if now is not None else time.time()
+    results = []
+    for job in (jobs if jobs is not None else _tick_jobs()):
+        key = job.get("key", "?")
+        try:
+            if not job["enabled"]():
+                results.append({"job": key, "status": "disabled"})
+                continue
+            if not job["due"](kdir, now):
+                results.append({"job": key, "status": "not-due"})
+                continue
+            r = job["run"](kdir, now)
+            results.append({"job": key, "status": "ran", "result": r})
+        except Exception as exc:   # noqa: BLE001 — isolate one job's failure
+            results.append({"job": key, "status": "error", "detail": str(exc)})
+    return results
+
+
+def cmd_tick(args):
+    """Shared 30-min tick: dispatch DUE jobs, or install/uninstall the schedule."""
+    as_json = getattr(args, "format", "text") == "json"
+    if getattr(args, "lock_status", False):
+        kdir = resolve_knowledge_dir()
+        print(_pkg_lock_status_word(kdir) if kdir else "free")
+        return 0
+    if getattr(args, "install_schedule", False):
+        return _tick_install_schedule(require_knowledge_dir(), as_json)
+    if getattr(args, "uninstall_schedule", False):
+        return _tick_uninstall_schedule(as_json)
+    kdir = resolve_knowledge_dir()
+    if not kdir:
+        if as_json:
+            json.dump({"ok": True, "dispatched": [], "detail": "no KB configured"},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("tick: no knowledge dir configured — nothing to dispatch.")
+        return 0
+    results = _tick_dispatch(kdir)
+    _pkg_emit_heartbeat(kdir)     # Layer-3 rollout-visibility signal (once per tick)
+    if as_json:
+        json.dump({"ok": True, "dispatched": results}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        for r in results:
+            line = "tick: job %s -> %s" % (r["job"], r["status"])
+            if r.get("result", {}).get("detail"):
+                line += " (%s)" % r["result"]["detail"]
+            elif r.get("detail"):
+                line += " (%s)" % r["detail"]
+            print(line)
+        if not results:
+            print("tick: no jobs registered.")
+    return 0
+
+
+# --- Task 8 + 14: the dedicated-updater tick job (due-gated, locked, guarded) -
+UPDATER_KEY = "AGENTWARE_UPDATE"
+UPDATER_DEFAULT = "0"       # opt-in + OFF, like dream (consequential automation)
+
+
+def _parse_updater(raw):
+    """Lenient on/off parse for the updater flag ('1'/'0'/None-if-unknown)."""
+    if raw is None:
+        return None
+    v = str(raw).strip().strip('"').strip("'").lower()
+    if v == "":
+        return None
+    if v in _DREAM_OFF_TOKENS:
+        return "0"
+    if v in _DREAM_ON_TOKENS:
+        return "1"
+    return None
+
+
+def resolve_updater():
+    """Effective updater setting '1' (on) / '0' (off). Precedence:
+    AGENTWARE_UPDATE env -> config.env -> default OFF. Read per-run; the tick job
+    and the audit check gate on it (a runtime kill switch)."""
+    env = _parse_updater(os.environ.get(UPDATER_KEY))
+    if env is not None:
+        return env
+    cfg = _parse_updater(_read_config_key(UPDATER_KEY))
+    if cfg is not None:
+        return cfg
+    return UPDATER_DEFAULT
+
+
+def _pkg_iso_to_epoch(ts):
+    """Epoch seconds from an ISO 'Z' timestamp, or None if unparseable."""
+    try:
+        dt = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _pkg_updater_due(kdir, now):
+    """Due when >= UPDATER_CHECK_INTERVAL_SEC (~6h) since last_check_ts. A crashed
+    prior apply (pending_apply marker / needs_manual_recovery) is ALWAYS due so the
+    reconcile / escalation runs promptly. Sleep-proof: keyed off wall-clock, not
+    the scheduler cadence."""
+    state = _pkg_state_read()
+    if state.get("pending_apply") or state.get("needs_manual_recovery"):
+        return True
+    last = _pkg_iso_to_epoch(state.get("last_check_ts"))
+    if last is None:
+        return True
+    return (now - last) >= UPDATER_CHECK_INTERVAL_SEC
+
+
+def _pkg_tag_at_head_if_newer(target, applied):
+    """If HEAD is exactly at a VERIFIED channel tag whose version > `applied`,
+    return (tag, version_tuple); else (None, None). Detects an unfinalized apply
+    after a crash between ff-advance and finalize."""
+    head = _git_head(target)
+    if not head:
+        return None, None
+    signers = _pkg_allowed_signers_path()
+    for tag in _pkg_channel_tags(target):
+        if _pkg_tag_sha(target, tag) != head:
+            continue
+        ver = _pkg_version_tuple(tag)
+        if applied is not None and ver is not None and ver <= applied:
+            return None, None
+        ok, _d = _pkg_verify_tag(target, tag, signers)
+        if ok:
+            return tag, ver
+        return None, None
+    return None, None
+
+
+def _pkg_reconcile_pending(target, kdir):
+    """Reconcile a partial/interrupted prior apply, if any (else None). Assumes the
+    updater lock is HELD by the caller (it mutates git/state).
+
+    Detection: a `pending_apply` marker set, OR HEAD at a verified tag newer than
+    last_applied. Before accepting ANYTHING it CONFIRMS the ff-advance actually
+    landed (`HEAD == the applying SHA`): a crash BETWEEN the pre-advance marker write
+    and `git merge --ff-only` leaves HEAD at the OLD good SHA, so re-smoking the OLD
+    code would falsely stamp the NEW version — that case clears the marker WITHOUT
+    advancing last_applied (the tag is re-attempted, never silently suppressed).
+    When the advance DID land: never accept unsmoked code — re-smoke, finalize on
+    pass; on FAIL roll back + quarantine when migrated==false, else strand LOUDLY
+    (rollback forbidden post-migrate)."""
+    state = _pkg_state_read()
+    pending = state.get("pending_apply") or {}
+    applied = _pkg_version_tuple(state.get("last_applied_version"))
+    head_tag, head_tag_ver = _pkg_tag_at_head_if_newer(target, applied)
+
+    if not pending and not head_tag:
+        # No marker and HEAD is not at a newer verified tag -> nothing to reconcile
+        # (a dirty tree here is an operator's in-progress edit — never touch it).
+        return None
+
+    head = _git_head(target)
+    if head is None:
+        # Transient git failure — do NOT mutate state; retry on the next tick.
+        return {"status": "error",
+                "detail": "cannot resolve HEAD during reconcile — retry next tick"}
+
+    applying_sha = pending.get("applying_sha") or (head if head_tag else None)
+    applying_tag = pending.get("applying_tag") or head_tag
+    migrated = bool(pending.get("migrated"))
+
+    # CONFIRM the ff-advance completed. If HEAD != the intended SHA, the advance
+    # never happened (crash between the marker write and the merge) — the OLD code
+    # is on disk, so DO NOT finalize a version bump onto it.
+    if applying_sha is not None and head != applying_sha:
+        if migrated:
+            # migrate stamped but HEAD is not at the applied SHA — inconsistent.
+            try:
+                _pkg_state_update(needs_manual_recovery=True)
+            except (OSError, _PkgStateError):
+                pass
+            return {"status": "stranded", "needs_manual_recovery": True,
+                    "detail": "pending marks migrated but HEAD != applying_sha — "
+                              "inconsistent; needs_manual_recovery"}
+        try:
+            _pkg_state_update(pending_apply=None)
+        except (OSError, _PkgStateError):
+            pass
+        return {"status": "reconciled-cleared",
+                "detail": "crashed BEFORE the ff-advance (HEAD != applying_sha) — "
+                          "cleared the stale marker; last_applied unchanged; the "
+                          "tag will be re-attempted"}
+
+    # HEAD == applying_sha (the advance landed). Never accept unsmoked code.
+    smoke = _pkg_smoke(kdir, target=target)
+    if smoke["ok"]:
+        ver = _pkg_version_tuple(applying_tag) if applying_tag else head_tag_ver
+        _pkg_state_write(dict(_pkg_state_read(), last_good_sha=head,
+                              last_good_tag=applying_tag,
+                              last_applied_version=_pkg_ver_str(ver),
+                              pending_apply=None))
+        return {"status": "reconciled-finalized", "tag": applying_tag,
+                "detail": "reconciled a crashed apply: re-smoke PASS -> finalized "
+                          "%s (migrate runs via the loop pre-hook)" % applying_tag}
+    if not migrated:
+        rb = _pkg_rollback(applying_tag, target=target, kdir=kdir,
+                           reason="reconcile: unfinalized apply fails smoke")
+        return {"status": "reconciled-rolledback",
+                "needs_manual_recovery": rb.get("needs_manual_recovery"),
+                "detail": "reconciled: re-smoke FAIL, migrate had NOT run -> "
+                          "rolled back (%s)" % rb["detail"]}
+    try:
+        _pkg_state_update(needs_manual_recovery=True)
+    except (OSError, _PkgStateError):
+        pass
+    return {"status": "stranded", "needs_manual_recovery": True,
+            "detail": "STRANDED: post-migrate apply is unfinalized and fails smoke "
+                      "— rollback forbidden (brick-ordering); needs_manual_recovery"}
+
+
+def _pkg_updater_run(kdir, now, target=None):
+    """The dedicated-updater tick job. Defers when a loop session is active (never
+    lands an apply mid-loop), records last_check_ts on EVERY attempt (anti-thrash),
+    then delegates to `_pkg_run_update`, which — UNDER the single-writer lock —
+    reconciles a crashed prior apply FIRST and then runs the normal apply. SMOKE
+    only (never eval --record --gate)."""
+    target = target or REPO_ROOT
+    if is_session_active(kdir):
+        return {"status": "deferred",
+                "detail": "loop session active — deferring apply to a later tick"}
+    now_iso = _now_iso()
+    try:
+        _pkg_state_update(last_check_ts=now_iso)   # every attempt, even on failure
+    except (OSError, _PkgStateError):
+        pass
+    return _pkg_run_update(target, kdir, now_iso=now_iso)
+
+
+# Register the dedicated updater as the FIRST tick job (P2c dream cadence is
+# purely additive). Gated on resolve_updater()==1 so it SKIPS when OFF — a runtime
+# kill switch that does NOT require uninstalling the shared tick.
+_TICK_JOB_REGISTRY.append({
+    "key": "updater",
+    "enabled": lambda: resolve_updater() == "1",
+    "due": _pkg_updater_due,
+    "run": _pkg_updater_run,
+})
+
+
+# --- Task 9: reverse loop-guard support (read-only lock-status + self-heal) ---
+# The agentware.sh RUN-BEGINS block queries the updater/tick lock so a loop never
+# starts while an apply is live (reading a half-updated package). Checks the
+# updater lock SPECIFICALLY (never dream.lock — no contention/deadlock).
+
+def _pkg_lock_status_word(kdir):
+    """Read-only updater/tick lock state: 'free' | 'held' | 'stale'. Modeled on
+    dream_acquire_lock's read-before-write — mutates NOTHING."""
+    rec = _dream_read_lock(_dream_lock_path(kdir, UPDATER_LOCK_REL))
+    if rec is None:
+        return "free"
+    return "stale" if dream_lock_is_stale(rec) else "held"
+
+
+def _pkg_self_heal(kdir, target=None):
+    """One-shot self-heal for a crashed prior apply (stale updater lock): clear the
+    stale lock, then reconcile (re-smoke -> finalize / rollback / strand) under the
+    updater lock. Mirrors Task 8's loop-start reconcile."""
+    target = target or REPO_ROOT
+    lock_path = _dream_lock_path(kdir, UPDATER_LOCK_REL)
+    rec = _dream_read_lock(lock_path)
+    if rec is not None and dream_lock_is_stale(rec):
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
+    if not dream_acquire_lock(kdir, lock_rel=UPDATER_LOCK_REL):
+        return {"status": "locked",
+                "detail": "updater lock held by a LIVE process — not healing"}
+    try:
+        r = _pkg_reconcile_pending(target, kdir)
+        return r or {"status": "clean", "detail": "no crashed apply to heal"}
+    finally:
+        dream_release_lock(kdir, lock_rel=UPDATER_LOCK_REL)
+
+
+# --- Task 10: Layer-2 on-use package-staleness pre-hook (non-blocking) --------
+# For scheduler-OFF but active machines: if the last signed-channel fetch is >24h
+# old, do a READ-ONLY tag fetch + WARN so an active user cannot stay stale. NEVER
+# applies executable code inline (that is the dedicated updater's job) and ALWAYS
+# returns 0 (a bare non-zero exit in a pre-hook is emitted as a pre_hook_abort).
+PKG_STALENESS_MAX_AGE_SEC = 24 * 3600
+
+
+def _pkg_staleness_prehook(kdir=None, target=None, max_age_sec=None, now=None):
+    """Layer-2 staleness nudge. Returns 0 on EVERY path (fresh/stale/offline/
+    error) — the caller wraps it with `|| true` and it NEVER calls exit."""
+    target = target or REPO_ROOT
+    max_age_sec = max_age_sec if max_age_sec is not None else PKG_STALENESS_MAX_AGE_SEC
+    now = now if now is not None else time.time()
+    if not git_is_work_tree(target):
+        return 0
+    try:
+        state = _pkg_state_read()
+    except _PkgStateError:
+        return 0   # tampered sidecar — never block the loop on it here
+    last = _pkg_iso_to_epoch(state.get("last_fetch_ts"))
+    if last is not None and (now - last) < max_age_sec:
+        return 0   # fresh — silent no-op
+    # Stale or never fetched: read-only tag fetch (remote-tracking refs only).
+    env = _git_noninteractive_env()
+    fetch = _git_timed(target, "fetch", "--tags", "--quiet", env=env,
+                       timeout=PKG_FETCH_TIMEOUT)
+    now_iso = _now_iso()
+    try:
+        _pkg_state_update(last_fetch_ts=now_iso, last_check_ts=now_iso)
+    except (OSError, _PkgStateError):
+        pass   # never block on a state-write failure
+    if fetch.returncode != 0:
+        print("[pkg-staleness] package channel fetch skipped (offline/timeout) — "
+              "last fetch >24h ago; not blocking.")
+        return 0
+    msg = ("[pkg-staleness] refreshed the signed update channel "
+           "(>24h since last fetch).")
+    if resolve_updater() != "1":
+        msg += (" Automatic updates are OFF — run `scripts/agentware update` or "
+                "enable with `scripts/agentware config --set-updater on`.")
+    print(msg)
+    return 0
+
+
+# --- Task 11: Layer-3 pkg_version heartbeat + this-machine staleness audit -----
+# LOCAL rollout-visibility signal now; the cross-machine fleet-coverage sink
+# (per-machine records in shared git) is DEFERRED to team-mode/P2d, since machine-id
+# records in shared git carry the same PII/retention boundary as P2d.
+
+def _pkg_emit_heartbeat(kdir):
+    """Append ONE pkg_version heartbeat to logs/metrics.jsonl (ts, pkg_version,
+    schema, updater). Best-effort + read-only w.r.t. the KB/index; never raises
+    (mirrors _dream_emit_metric)."""
+    try:
+        rec = {"event": "pkg_version", "ts": _now_iso(),
+               "pkg_version": _pkg_version(), "schema": _kb_schema_read(kdir),
+               "updater": resolve_updater()}
+        logs = os.path.join(kdir, "logs")
+        os.makedirs(logs, exist_ok=True)
+        with open(os.path.join(logs, "metrics.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _audit_pkg_version_check(kdir):
+    """Rule-7 rollout visibility: flag THIS machine as BEHIND the newest VERIFIED
+    stable tag in the local channel. INERT when the updater is OFF (opt-in default)
+    or pre-go-live (no signed channel / no pinned key). Read-only (no network
+    fetch). The cross-machine fleet-coverage sink is DEFERRED to team-mode."""
+    name = "pkg_version"
+    if resolve_updater() != "1":
+        return {"name": name, "ok": True, "pkg_version": _pkg_version(),
+                "details": ["inert: automatic updates OFF (opt-in; enable with "
+                            "`scripts/agentware config --set-updater on`)"]}
+    try:
+        signers_present = bool(_pkg_list_signers())
+    except _PkgStateError as exc:
+        return {"name": name, "ok": False,
+                "details": ["trust anchor tampered — %s" % exc]}
+    if not signers_present:
+        return {"name": name, "ok": True, "pkg_version": _pkg_version(),
+                "details": ["inert: no publisher key pinned (pre-go-live)"]}
+    state = _pkg_state_read()
+    if state.get("needs_manual_recovery"):
+        return {"name": name, "ok": False, "pkg_version": _pkg_version(),
+                "details": ["needs_manual_recovery is set — a prior apply is "
+                            "stranded (see ~/.agentware/update-state.json)"]}
+    target = REPO_ROOT
+    signers = _pkg_allowed_signers_path()
+    newest_verified = None
+    for tag in _pkg_channel_tags(target):
+        ok, _d = _pkg_verify_tag(target, tag, signers)
+        if ok:
+            newest_verified = tag
+            break
+    applied_str = _pkg_version(target)
+    base = {"name": name, "pkg_version": applied_str,
+            "newest_verified_tag": newest_verified}
+    if not newest_verified:
+        return dict(base, ok=True,
+                    details=["no verified stable tag in the local channel yet"])
+    nv = _pkg_version_tuple(newest_verified)
+    applied = _pkg_version_tuple(applied_str)
+    if applied is None or (nv is not None and nv > applied):
+        return dict(base, ok=False,
+                    details=["BEHIND: newest verified stable tag %s > applied %s — "
+                             "the updater has not applied it yet (check the tick / "
+                             "run `scripts/agentware update`)"
+                             % (newest_verified, applied_str or "none")])
+    return dict(base, ok=True,
+                details=["up to date: applied %s (newest verified %s)"
+                         % (applied_str, newest_verified)])
+
+
+# --- Task 12: release-signing go-live preflight (OPERATOR-GATED handoff) -------
+# AUTONOMOUS: a READ-ONLY readiness check + the docs/release-signing.md runbook.
+# OPERATOR-GATED (R-GIT-01): generating the real signing key and cutting+pushing
+# the first signed tag stay operator actions via the runbook — never this command.
+
+def _pkg_preflight_selftest():
+    """Hermetic end-to-end machinery test with a THROWAWAY key: temp repo -> SSH-sign
+    a v-tag -> verify against a temp allowed_signers -> resolve name->SHA. Proves the
+    sign->pin->verify->resolve path works on THIS machine's git/ssh. NEVER touches a
+    real key/tag/remote. Returns (ok, detail)."""
+    if not shutil.which("ssh-keygen"):
+        return False, "ssh-keygen not available — cannot verify SSH-signed tags"
+    tmp = tempfile.mkdtemp(prefix="agentware-preflight-")
+    try:
+        key = os.path.join(tmp, "k")
+        if subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key,
+                           "-C", "preflight@test", "-q"], check=False).returncode != 0:
+            return False, "throwaway key generation failed"
+        repo = os.path.join(tmp, "repo")
+        os.makedirs(repo)
+
+        def g(*a):
+            return subprocess.run(["git", "-C", repo] + list(a), check=False,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  text=True)
+        g("init", "-q", "-b", "main")
+        g("config", "user.email", "preflight@test")
+        g("config", "user.name", "Preflight")
+        g("config", "gpg.format", "ssh")
+        g("config", "user.signingkey", key + ".pub")
+        with open(os.path.join(repo, "f"), "w") as f:
+            f.write("x")
+        g("add", "-A")
+        g("commit", "-qm", "c")
+        tagr = g("tag", "-s", "-m", "preflight v2.0.0", "v2.0.0")
+        if tagr.returncode != 0:
+            return False, ("SSH tag signing unsupported by this git: %s"
+                           % (tagr.stderr or "").strip()[:120])
+        with open(key + ".pub") as f:
+            keytype, keydata = f.read().split()[:2]
+        signers = os.path.join(tmp, "allowed_signers")
+        with open(signers, "w") as f:
+            f.write("preflight@test %s %s\n" % (keytype, keydata))
+        if not PKG_CHANNEL_RE.match("v2.0.0"):
+            return False, "channel regex rejected v2.0.0"
+        ok, detail = _pkg_verify_tag(repo, "v2.0.0", signers)
+        if not ok:
+            return False, "hermetic verify failed: %s" % detail
+        if not _pkg_tag_sha(repo, "v2.0.0"):
+            return False, "hermetic name->SHA resolution failed"
+        return True, "sign->pin->verify->resolve OK (throwaway key)"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _pkg_release_preflight():
+    """READ-ONLY go-live readiness. Returns (machinery_ok, report). Gates exit 0 on
+    the HERMETIC machinery self-test; also reports publisher-signing-config and
+    client-trust-anchor readiness for the operator to complete the gated steps."""
+    report = {"checks": []}
+
+    def add(name, ok, detail):
+        report["checks"].append({"name": name, "ok": ok, "detail": detail})
+
+    fmt = _git(REPO_ROOT, "config", "--get", "gpg.format").stdout.strip()
+    sign = _git(REPO_ROOT, "config", "--get", "tag.gpgsign").stdout.strip()
+    skey = _git(REPO_ROOT, "config", "--get", "user.signingkey").stdout.strip()
+    pub_ready = fmt == "ssh" and sign in ("true", "1") and bool(skey)
+    add("publisher-signing-config", pub_ready,
+        "gpg.format=%s tag.gpgsign=%s signingkey=%s"
+        % (fmt or "unset", sign or "unset", "set" if skey else "unset"))
+
+    try:
+        pinned = _pkg_list_signers()
+        anchor_ok = bool(pinned)
+        add("client-trust-anchor", anchor_ok,
+            ("%d publisher key(s) pinned" % len(pinned)) if pinned
+            else "no key pinned (pin at onboarding / go-live)")
+    except _PkgStateError as exc:
+        anchor_ok = False
+        add("client-trust-anchor", False, "tampered: %s" % exc)
+
+    machinery_ok, detail = _pkg_preflight_selftest()
+    add("hermetic-verify-selftest", machinery_ok, detail)
+
+    report["ok"] = machinery_ok
+    report["publisher_ready"] = pub_ready
+    report["client_ready"] = anchor_ok
+    report["go_live_ready"] = machinery_ok and pub_ready and anchor_ok
+    return machinery_ok, report
+
+
+def cmd_release(args):
+    """Release-signing utilities. `release preflight` is a READ-ONLY go-live
+    readiness check. The sensitive production actions (generating the real signing
+    key, cutting+pushing the first signed tag) are OPERATOR-GATED (R-GIT-01) and
+    performed via docs/release-signing.md — NEVER by this command."""
+    action = getattr(args, "release_command", None) or "preflight"
+    as_json = getattr(args, "format", "text") == "json"
+    if action == "preflight":
+        ok, report = _pkg_release_preflight()
+        if as_json:
+            json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("release preflight: %s" % ("READY" if ok else "NOT READY"))
+            for c in report["checks"]:
+                print("  [%s] %s — %s"
+                      % ("ok" if c["ok"] else "x", c["name"], c["detail"]))
+            print("  publisher_ready=%s client_ready=%s go_live_ready=%s"
+                  % (report["publisher_ready"], report["client_ready"],
+                     report["go_live_ready"]))
+        return 0 if ok else 1
+    sys.stderr.write("release: unknown action %r\n" % action)
+    return 2
+
+
+# === P2B_SECTION_END ===
 
 
 # --- skill catalog + installer ---------------------------------------------
@@ -18558,19 +20256,21 @@ def _catalog_skill_names_at_ref(ref):
 
 
 def cmd_update(args):
-    """User-initiated, fast-forward-only self-update of the agentware PACKAGE.
+    """Dedicated, hardened self-update of the agentware PACKAGE via a SIGNED
+    SemVer tag channel — NEVER @{upstream}/tip-of-main.
 
-    Modeled on `cmd_kb_git_pull` but targets REPO_ROOT (the package repo) and is
-    explicit/manual, never an automatic background pull. Preconditions: a git
-    work tree with a configured upstream. The fetch is READ-ONLY (touches only
-    remote-tracking refs, never the work tree), so `--check` is safe for a
-    SessionStart "updates available" nudge. Apply requires a CLEAN tree, runs
-    `git pull --ff-only` (never a merge commit, never destructive — R-GIT-02),
-    then re-runs the R-PKG-04 (steering lint) + R-PKG-05 (eval --record --gate)
-    package gates because the apply mutated package files. `--catalog` adds a
-    read-only diff of the authored skill catalog between HEAD and upstream so the
-    operator sees which skills a pending update would add/remove.
-    """
+    The apply decision is keyed off a `vX.Y.Z` tag VERIFIED against the HOME-pinned
+    publisher key (Task 3), not the branch-tip behind count. Strict, non-reorderable
+    sequence (Task 6): record last_good BEFORE advance -> ff-only apply the verified
+    CONCRETE SHA -> assert HEAD==SHA -> smoke -> (pass) `migrate --apply`; a smoke
+    failure auto-rolls-back to last_good and quarantines the tag. The manual `update`
+    and the tick serialize on ONE updater lock. Client apply gate = SMOKE ONLY
+    (`eval --record --gate` is a publisher pre-tag concern via `gate release --full`,
+    never re-run here — it would write reliability rows into the operator KB).
+
+    `--check` is READ-ONLY (safe for a SessionStart nudge) and reports the verified-
+    tag resolution. The @{upstream} behind/ahead + `--catalog` diff is kept purely
+    INFORMATIONAL (never the apply decision)."""
     target = REPO_ROOT
     check_only = getattr(args, "check", False)
     show_catalog = getattr(args, "catalog", False)
@@ -18585,141 +20285,114 @@ def cmd_update(args):
                 print(line)
         return rc
 
+    if getattr(args, "status_line", False):
+        # Read-only, NO-NETWORK one-liner for SessionStart. Prints ONLY when there
+        # is something to surface; SILENT (suppressed) when up-to-date. Never blocks.
+        try:
+            st = _pkg_state_read()
+        except _PkgStateError:
+            print("agentware update: ⚠ trust/state anchor tampered — run "
+                  "`scripts/agentware trust verify`")
+            return 0
+        if st.get("needs_manual_recovery"):
+            print("agentware update: ⚠ a prior package apply is STRANDED "
+                  "(needs_manual_recovery) — run `scripts/agentware update "
+                  "--self-heal` (see ~/.agentware/update-state.json)")
+        elif st.get("pending_apply"):
+            print("agentware update: a package apply is unfinalized — the next "
+                  "tick will reconcile it")
+        return 0
+
+    if getattr(args, "staleness_check", False):
+        return _pkg_staleness_prehook(resolve_knowledge_dir(), target)
+
+    if getattr(args, "self_heal", False):
+        kdir = require_knowledge_dir()
+        if not kdir:
+            return emit({"ok": True, "status": "no-kb"},
+                        ["update: no knowledge dir — nothing to heal."], 0)
+        r = _pkg_self_heal(kdir, target)
+        return emit({"ok": not r.get("needs_manual_recovery"), "self_heal": r},
+                    ["update: self-heal -> %s (%s)"
+                     % (r["status"], r.get("detail", ""))],
+                    1 if r.get("needs_manual_recovery") else 0)
+
     if not git_is_work_tree(target):
         return emit(
             {"ok": True, "status": "not-a-git-repo", "applied": False},
             ["update: package is not a git work tree — no self-update available."],
             0)
 
-    if not git_has_upstream(target):
-        return emit(
-            {"ok": True, "status": "no-upstream", "applied": False},
-            ["update: no upstream tracking branch configured — skipping "
-             "(set one with `git branch --set-upstream-to=origin/main`)."],
-            0)
+    lines = ["update: current %s (package %s)"
+             % (_pinned_ref(), _pkg_version(target) or "unversioned")]
+    payload = {"ok": True, "applied": False, "current": _pinned_ref()}
 
-    # Read-only fetch: updates remote-tracking refs only; never the work tree.
-    fetch = git_fetch(target)
-    if fetch.returncode != 0:
-        detail = [l for l in (fetch.stderr or "").strip().splitlines() if l.strip()]
-        first = detail[0] if detail else "fetch failed"
-        return emit(
-            {"ok": True, "status": "fetch-failed", "applied": False,
-             "detail": first},
-            ["update: fetch failed — %s (offline or no remote access; not "
-             "blocking)." % first],
-            0)
+    # --- Informational @{upstream} view (NOT the apply decision) -------------
+    info = {}
+    if git_has_upstream(target) and git_fetch(target).returncode == 0:
+        upstream_ref = _git(target, "rev-parse", "--abbrev-ref",
+                            "--symbolic-full-name", "@{upstream}").stdout.strip()
+        behind_s = _git(target, "rev-list", "--count", "HEAD..@{upstream}").stdout.strip()
+        ahead_s = _git(target, "rev-list", "--count", "@{upstream}..HEAD").stdout.strip()
+        info = {"upstream_ref": upstream_ref,
+                "behind": int(behind_s) if behind_s.isdigit() else 0,
+                "ahead": int(ahead_s) if ahead_s.isdigit() else 0}
+        if show_catalog:
+            up_names = _catalog_skill_names_at_ref("@{upstream}")
+            if up_names is not None:
+                cur_names = _catalog_skill_names_at_ref("HEAD") or set()
+                info["catalog_changes"] = {"added": sorted(up_names - cur_names),
+                                           "removed": sorted(cur_names - up_names)}
+        lines.append("update: [informational] @{upstream} %s — behind %d / ahead %d "
+                     "(NOT the apply decision; the signed-tag channel is)."
+                     % (info["upstream_ref"], info["behind"], info["ahead"]))
+        cc = info.get("catalog_changes")
+        if cc and cc["added"]:
+            lines.append("update: catalog skills added upstream: %s" % ", ".join(cc["added"]))
+        if cc and cc["removed"]:
+            lines.append("update: catalog skills removed upstream: %s" % ", ".join(cc["removed"]))
+    payload["informational_upstream"] = info
 
-    upstream_ref = _git(target, "rev-parse", "--abbrev-ref",
-                        "--symbolic-full-name", "@{upstream}").stdout.strip()
-    behind_s = _git(target, "rev-list", "--count",
-                    "HEAD..@{upstream}").stdout.strip()
-    ahead_s = _git(target, "rev-list", "--count",
-                   "@{upstream}..HEAD").stdout.strip()
-    behind = int(behind_s) if behind_s.isdigit() else 0
-    ahead = int(ahead_s) if ahead_s.isdigit() else 0
-    cur = _pinned_ref()
-    up_cp = _git(target, "rev-parse", "--short", "@{upstream}")
-    up = up_cp.stdout.strip() if up_cp.returncode == 0 else "unknown"
-
-    changelog = []
-    if behind:
-        log = _git(target, "log", "--oneline", "--no-decorate",
-                   "HEAD..@{upstream}")
-        if log.returncode == 0:
-            changelog = [l for l in log.stdout.splitlines() if l.strip()]
-
-    catalog_changes = None
-    if show_catalog:
-        up_names = _catalog_skill_names_at_ref("@{upstream}")
-        if up_names is not None:
-            cur_names = _catalog_skill_names_at_ref("HEAD") or set()
-            catalog_changes = {
-                "added": sorted(up_names - cur_names),
-                "removed": sorted(cur_names - up_names),
-            }
-
-    lines = ["update: current %s  upstream %s (%s)" % (cur, up, upstream_ref)]
-    if behind == 0:
-        lines.append("update: already up to date (0 commit(s) behind upstream).")
-    else:
-        lines.append("update: %d commit(s) behind upstream:" % behind)
-        for entry in changelog[:50]:
-            lines.append("  %s" % entry)
-        if len(changelog) > 50:
-            lines.append("  … (%d more)" % (len(changelog) - 50))
-    if ahead:
-        lines.append("update: %d local commit(s) ahead of upstream "
-                     "(blocks a fast-forward apply until pushed/rebased)." % ahead)
-    if catalog_changes is not None:
-        if catalog_changes["added"]:
-            lines.append("update: catalog skills added upstream: %s"
-                         % ", ".join(catalog_changes["added"]))
-        if catalog_changes["removed"]:
-            lines.append("update: catalog skills removed upstream: %s"
-                         % ", ".join(catalog_changes["removed"]))
-        if not catalog_changes["added"] and not catalog_changes["removed"]:
-            lines.append("update: no catalog skill changes in this update.")
-
-    payload = {
-        "ok": True, "current": cur, "upstream": up, "upstream_ref": upstream_ref,
-        "behind": behind, "ahead": ahead, "changelog": changelog,
-        "catalog_changes": catalog_changes, "applied": False,
-    }
-
+    # --- Signed-channel resolution (the REAL apply decision) ----------------
     if check_only:
-        payload["mode"] = "check"
+        r = _pkg_resolve_verified_tag(target)
+        payload.update(mode="check", channel=r)
+        for w in r.get("warnings", []):
+            lines.append("update: ⚠ %s" % w)
+        if r["status"] == "resolved":
+            lines.append("update: signed update AVAILABLE — %s (%s) @ %s"
+                         % (r["tag"], r["version"], r["sha"][:9]))
+        elif r["status"] == "up-to-date":
+            lines.append("update: up to date on the signed channel (%s)." % r["detail"])
+        elif r["status"] == "no-trust":
+            lines.append("update: fail-closed — %s (pin with `scripts/agentware "
+                         "trust pin`)." % r["detail"])
+        elif r["status"] == "skipped":
+            lines.append("update: channel check skipped — %s." % r["detail"])
+        else:
+            lines.append("update: no signed update available (%s)." % r["detail"])
         return emit(payload, lines, 0)
 
-    payload["mode"] = "apply"
-    if behind == 0:
-        lines.append("update: nothing to apply.")
-        return emit(payload, lines, 0)
-
-    # Apply precondition: a CLEAN tree — never fast-forward onto uncommitted
-    # package edits (R-GIT-02 non-destructive).
-    if not git_is_clean(target):
+    # --- Apply: the dedicated updater sequence (locked, fail-closed) ---------
+    result = _pkg_run_update(target)
+    payload.update(mode="apply", result=result, tag=result.get("tag"),
+                   sha=result.get("sha"), version=result.get("version"),
+                   applied=(result["status"] == "applied"))
+    for w in result.get("warnings", []):
+        lines.append("update: ⚠ %s" % w)
+    lines.append("update: %s" % result["detail"])
+    status = result["status"]
+    graceful = {"applied", "up-to-date", "none", "skipped", "no-trust", "dirty",
+                "locked", "migrate-workorder"}
+    rc = 0 if status in graceful else 1
+    if result.get("needs_manual_recovery"):
         payload["ok"] = False
-        payload["error"] = "dirty-work-tree"
-        lines.append("update: package work tree has uncommitted changes — "
-                     "commit or stash them first (never applying onto "
-                     "uncommitted edits).")
-        return emit(payload, lines, 1)
-
-    pull = git_pull_ff(target)
-    if pull.returncode != 0:
-        detail = [l for l in (pull.stderr or "").strip().splitlines() if l.strip()]
-        first = detail[0] if detail else "fast-forward refused"
+        rc = 1
+        lines.append("update: ⚠ needs_manual_recovery — inspect "
+                     "~/.agentware/update-state.json")
+    elif status in ("error", "migrate-error"):
         payload["ok"] = False
-        payload["error"] = "ff-failed"
-        lines.append("update: fast-forward apply failed — %s (diverged or "
-                     "offline; nothing applied)." % first)
-        return emit(payload, lines, 1)
-
-    payload["applied"] = True
-    lines.append("update: applied fast-forward to %s." % up)
-
-    # R-PKG-04 / R-PKG-05: the apply mutated package files, so re-run the gates.
-    gate_kdir = require_knowledge_dir() or target
-    gate_results = []
-    gate_failed = False
-    for gate in PKG_UPDATE_GATES:
-        rc, _out = _run_gate(gate, target, gate_kdir)
-        gate_results.append({"gate": gate, "rc": rc})
-        lines.append("update: gate `%s` → %s"
-                     % (gate, "PASS" if rc == 0 else "FAIL (rc %d)" % rc))
-        if rc != 0:
-            gate_failed = True
-    payload["gates"] = gate_results
-    if gate_failed:
-        payload["ok"] = False
-        payload["error"] = "gate-failed"
-        lines.append("update: applied, but a post-update package gate FAILED — "
-                     "review before relying on this package (R-PKG-04/05).")
-        return emit(payload, lines, 1)
-    lines.append("update: post-update gates passed "
-                 "(R-PKG-04 steering lint, R-PKG-05 eval gate).")
-    return emit(payload, lines, 0)
+    return emit(payload, lines, rc)
 
 
 def cmd_whereami(args):
@@ -18814,6 +20487,12 @@ def build_parser():
     p_cfg.add_argument("--knowledge-dir-only", action="store_true",
                        dest="knowledge_dir_only",
                        help="print only the bare path (for shell consumers)")
+    p_cfg.add_argument("--set-updater", dest="set_updater", metavar="on|off",
+                       help="persist the automatic signed-channel updater opt-in "
+                            "to ~/.agentware/config.env (default OFF; env "
+                            "AGENTWARE_UPDATE overrides per-run)")
+    p_cfg.add_argument("--updater-only", action="store_true", dest="updater_only",
+                       help="print only the resolved updater setting (on/off)")
     p_cfg.add_argument("--kb-autocommit-only", action="store_true",
                        dest="kb_autocommit_only",
                        help="print only the resolved KB-autocommit setting (1/0)")
@@ -19067,7 +20746,49 @@ def build_parser():
         "--catalog", action="store_true",
         help="also show which authored skill-catalog entries the pending "
              "update would add/remove (read-only)")
+    p_update.add_argument(
+        "--self-heal", action="store_true", dest="self_heal",
+        help="reconcile a crashed prior apply (re-smoke -> finalize/rollback/"
+             "strand); used by the loop reverse-guard on a stale updater lock")
+    p_update.add_argument(
+        "--staleness-check", action="store_true", dest="staleness_check",
+        help="layer-2 on-use nudge: if the last signed-channel fetch is >24h old, "
+             "read-only fetch + WARN (never applies; always exits 0)")
+    p_update.add_argument(
+        "--status-line", action="store_true", dest="status_line",
+        help="read-only, no-network one-liner for SessionStart (silent when "
+             "up-to-date; surfaces a stranded/unfinalized apply)")
     p_update.set_defaults(func=cmd_update)
+
+    # trust (publisher signing-key anchor, feature 260712) --------------------
+    p_trust = sub.add_parser(
+        "trust", parents=[fmt_parent],
+        help="manage the HOME-pinned publisher SSH signing-key trust anchor "
+             "(~/.agentware/allowed_signers)")
+    trust_sub = p_trust.add_subparsers(dest="trust_command", metavar="<subcommand>")
+    p_tr_list = trust_sub.add_parser("list", parents=[fmt_parent],
+                                     help="list pinned publisher keys")
+    p_tr_list.set_defaults(func=cmd_trust)
+    for _verb, _help in (("pin", "trust a publisher key (onboarding / first clone)"),
+                         ("rotate", "trust a NEW key during an overlap window "
+                                    "(operator-confirmed rotation)")):
+        p_tr = trust_sub.add_parser(_verb, parents=[fmt_parent], help=_help)
+        p_tr.add_argument("--principal", help="signer identity (default: %s)"
+                          % PKG_PUBLISHER_PRINCIPAL)
+        p_tr.add_argument("--key-file", help="path to the publisher SSH pubkey file")
+        p_tr.add_argument("--from-repo", action="store_true",
+                          help="pin the in-tree published key (catalog/agentware-release.pub)")
+        p_tr.add_argument("--valid-after", dest="valid_after",
+                          help="SSH valid-after (e.g. 20260101 or 20260101000000)")
+        p_tr.add_argument("--valid-before", dest="valid_before",
+                          help="SSH valid-before (overlap-window retirement)")
+        p_tr.add_argument("--comment", help="optional key comment")
+        p_tr.set_defaults(func=cmd_trust)
+    p_tr_verify = trust_sub.add_parser(
+        "verify", parents=[fmt_parent],
+        help="check trust-anchor integrity + in-tree fingerprint match")
+    p_tr_verify.set_defaults(func=cmd_trust)
+    p_trust.set_defaults(func=cmd_trust)
 
     # query ------------------------------------------------------------------
     p_query = sub.add_parser(
@@ -19432,6 +21153,38 @@ def build_parser():
         "--uninstall-schedule", action="store_true", dest="uninstall_schedule",
         help="remove an installed nightly schedule (idempotent)")
     p_dream.set_defaults(func=cmd_dream)
+
+    # tick (shared 30-min scheduler, feature 260712) -------------------------
+    p_tick = sub.add_parser(
+        "tick", parents=[fmt_parent],
+        help="shared 30-min tick: dispatch due jobs (updater now; P2c dream "
+             "cadence additive), or install/uninstall the StartInterval schedule")
+    p_tick.add_argument(
+        "--install-schedule", action="store_true", dest="install_schedule",
+        help="install the shared tick into HOME (launchd StartInterval=1800 / "
+             "cron */30) — refuses when no job is enabled")
+    p_tick.add_argument(
+        "--uninstall-schedule", action="store_true", dest="uninstall_schedule",
+        help="remove an installed tick schedule (idempotent; leaves dream alone)")
+    p_tick.add_argument(
+        "--lock-status", action="store_true", dest="lock_status",
+        help="print the updater/tick lock state (free|held|stale) and exit "
+             "(read-only; used by the loop reverse-guard)")
+    p_tick.set_defaults(func=cmd_tick)
+
+    # release (signing go-live preflight, feature 260712) --------------------
+    p_release = sub.add_parser(
+        "release", parents=[fmt_parent],
+        help="release-signing utilities (read-only preflight; key/tag actions are "
+             "operator-gated via docs/release-signing.md)")
+    release_sub = p_release.add_subparsers(dest="release_command",
+                                           metavar="<subcommand>")
+    p_pre = release_sub.add_parser(
+        "preflight", parents=[fmt_parent],
+        help="read-only go-live readiness check (hermetic verify self-test + "
+             "publisher/client readiness)")
+    p_pre.set_defaults(func=cmd_release)
+    p_release.set_defaults(func=cmd_release)
 
     # kb-git -----------------------------------------------------------------
     p_kbgit = sub.add_parser(

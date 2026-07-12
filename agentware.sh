@@ -897,6 +897,14 @@ run_pre_hooks() {
     scripts/agentware kb-git pull || true
   fi
 
+  # Layer-2 on-use package-staleness nudge (feature 260712-scheduler-updater,
+  # Task 10). Initialized-runs-only (after the INITIALIZED early-return above).
+  # If the last signed-channel fetch is >24h old, do a READ-ONLY tag fetch + WARN
+  # so a scheduler-OFF but active machine cannot stay stale. NEVER applies code;
+  # exits 0 on every path; `|| true` at the call site is belt-and-suspenders.
+  log "[pre-hook] scripts/agentware update --staleness-check (on-use package freshness)"
+  scripts/agentware update --staleness-check || true
+
   if [[ -f "$DOCS_DIR/worklog.md" ]]; then
     log "[pre-hook] scripts/agentware worklog scan (crash-recovery orphan check)"
     if ! scripts/agentware worklog scan --path "$DOCS_DIR/worklog.md"; then
@@ -1341,6 +1349,30 @@ run_phase() {
 LOOP_STARTED=true
 LOOP_OUTCOME="pre_hook_abort"
 snapshot_task_states > "$SNAPSHOT_FILE" 2>/dev/null || true
+
+# ---- REVERSE LOOP-GUARD (feature 260712-scheduler-updater, Task 9) ----
+# Refuse/defer starting a loop while a live updater/tick apply holds the lock, so a
+# loop never reads a HALF-UPDATED package mid-apply. Checks the updater/tick lock
+# SPECIFICALLY (never dream.lock — no contention/deadlock). Mirrors the plan-claim
+# refusal shape (LOOP_OUTCOME=pre_hook_abort + exit 1). On a STALE lock (crashed
+# prior apply) it neither silently allows nor permanently refuses: it runs a
+# one-shot Task-5/Task-8 self-heal (reconcile to last_good), then proceeds.
+if [[ -x scripts/agentware ]] && [[ "$INITIALIZED" == true ]] && [[ -n "${KDIR:-}" ]]; then
+  aw_lock_state="$(scripts/agentware tick --lock-status 2>/dev/null || echo free)"
+  case "$aw_lock_state" in
+    held)
+      echo "Error: [guard] a live agentware updater/tick apply holds the lock — refusing to start a loop (never read a half-updated package mid-apply). Retry in a moment."
+      LOOP_OUTCOME="pre_hook_abort"
+      exit 1
+      ;;
+    stale)
+      log "[guard] stale updater/tick lock (crashed prior apply) — running one-shot self-heal before starting."
+      scripts/agentware update --self-heal || true
+      ;;
+    *)
+      : ;;  # free — proceed
+  esac
+fi
 
 # ---- PRE-HOOK ----
 run_pre_hooks

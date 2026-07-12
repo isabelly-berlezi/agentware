@@ -565,6 +565,13 @@ eval, staleness detection, git backup). **Dream mode** moves all of that OFF the
 hot path into a scheduled, idle-gated, **deterministic** background cycle so the
 KB stays fresh/compacted/backed-up and you never feel the cost.
 
+> **Dream is KB-maintenance only — NOT the package-update channel.** An unsigned
+> tip-of-main package auto-pull (old dream "step 0") was **retired** for
+> supply-chain hardening. agentware **code/skill** updates now arrive exclusively
+> via the verified signed-tag **self-update** on the shared tick (next section) —
+> the ONLY code path that advances the package tree. Dream never mutates the
+> package, so it can never race or brick the updater.
+
 **Phase 1 is strictly deterministic + sanctioned-mutation-only — no LLM, no
 destructive deletes/merges, no auto-promotion.** It runs one cycle in fixed
 order, each step idempotent and individually skippable:
@@ -688,6 +695,66 @@ shaped this design:
 > `> LEARNED:`/`> DECISION:` markers. Phase 1 only REPORTS those (the
 > `dream-report-latest.md` enumeration is the deterministic on-ramp to that
 > curation).
+
+### Self-update — the signed-tag package updater + shared tick (opt-in)
+
+agentware updates itself through a **dedicated, hardened updater** that tracks a
+**signed SemVer tag channel only** (`vX.Y.Z`) — never `@{upstream}`/tip-of-main.
+Auto-pulled executable code is the primary supply-chain surface at scale, so the
+updater **verifies before any pulled code executes** and **auto-rolls-back** on
+failure — an update can fail but never strands the machine.
+
+**How it applies (strict, non-reorderable).** `git fetch --tags` (read-only) →
+verify the tag's SSH signature against the HOME-pinned publisher key → no-downgrade
+(refuse a version ≤ last-applied) → record last-good BEFORE advancing → ff-only
+apply the verified **concrete SHA** → assert `HEAD==SHA` → **smoke-test** →
+(pass) `migrate --apply`. A smoke failure triggers a scoped, backward-only,
+clean-tree-guarded `git reset --hard` to the recorded **last-good SHA** (the one
+authorized R-GIT-02 exception), re-smokes to confirm restoration, and
+**quarantines** the failed tag so it is not re-attempted. The client apply gate is
+**smoke only**; `eval --record --gate` is a publisher pre-tag concern
+(`gate release --full`), never re-run here.
+
+**The shared 30-min tick.** A single sleep-proof scheduler (launchd
+`StartInterval=1800` / cron `*/30`, a label distinct from dream, its own
+`logs/tick-scheduler.log`) dispatches a job-agnostic registry. The updater is the
+first job — it due-gates in-band (~6h since last check, wall-clock so a slept
+machine self-corrects), holds a single-writer lock distinct from `dream.lock`, and
+**defers while a loop session is active** so an apply never lands mid-loop.
+
+```bash
+scripts/agentware config --set-updater on      # opt-in (default OFF; a runtime kill switch)
+scripts/agentware tick --install-schedule      # install the shared tick
+scripts/agentware update --check               # read-only: is a verified update available?
+scripts/agentware update                       # apply now (manual; same lock as the tick)
+scripts/agentware config --updater-only        # prints: on/off
+scripts/agentware tick --uninstall-schedule    # remove the tick (or --set-updater off to just skip)
+```
+
+**HOME state + trust anchor (outside the tree the updater rewrites).**
+`~/.agentware/update-state.json` holds `last_good_sha`, `last_applied_version`,
+`last_check_ts`/`last_fetch_ts`, quarantined tags, and a `pending_apply`
+crash-window marker (gitignored, 0600; symlink/wrong-owner/group-writable →
+fail-closed). `~/.agentware/allowed_signers` is the pinned publisher key
+(multi-key, honoring `valid-after`/`valid-before` for zero-downtime rotation).
+Manage it with `scripts/agentware trust pin|list|rotate|verify`.
+
+**Two safety layers around it.** (1) A loop **reverse-guard** refuses/defers a
+loop start while an updater/tick apply is live (and self-heals a stale lock). (2)
+An on-use **staleness pre-hook** (`update --staleness-check`) does a read-only tag
+fetch + WARN when the last fetch is >24h old, non-blocking (exit 0 always) — so a
+scheduler-OFF but active machine cannot stay stale. A `pkg_version` heartbeat + a
+this-machine `audit` check report rollout status locally (the cross-machine fleet
+sink is team-mode-deferred).
+
+**Go-live.** Until the publisher cuts the first signed tag the updater **no-ops
+fail-closed** (verifies-and-declines). Check readiness with
+`scripts/agentware release preflight` (a hermetic sign→verify self-test with a
+throwaway key). The publisher runbook — key custody, `tag.gpgsign`, cutting the
+first `v2.0.0` after `gate release --full`, client pinning, rotation + revocation —
+is `docs/release-signing.md`. **Freeze/withholding** (a mirror that hides a newer
+signed security tag) is an accepted v1 residual; cross-machine peer-freshness
+detection is deferred to team-mode.
 
 ### Benchmark methodology & numbers (LongMemEval)
 
