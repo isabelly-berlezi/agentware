@@ -2135,6 +2135,136 @@ def cmd_init(args):
     return 0
 
 
+# --- Task 6: opt-in commit-msg co-author strip guard (operator commits) --------
+# A deterministic CODE guard for the recorded operator preference "no Claude/AI
+# co-author trailer" — injected prose loses to the harness default, so a git
+# commit-msg hook STRIPS the trailer (never blocks the commit). Installed only with
+# explicit consent (config --install-git-guards); the loop itself never commits
+# (R-GIT-01). The hook is a package file (scripts/hooks/commit-msg); installing it
+# COPIES it into a target repo's .git/hooks (allowed: .git is not a tracked file).
+GIT_GUARD_MARKER = "agentware commit-msg guard"
+
+
+def _git_guards_hook_src():
+    return os.path.join(REPO_ROOT, "scripts", "hooks", "commit-msg")
+
+
+def _resolve_git_hooks_dir(target):
+    """Absolute git hooks dir for `target`, honoring core.hooksPath + worktrees
+    (via `git rev-parse --git-path hooks`), or None if it cannot be resolved."""
+    cp = _git(target, "rev-parse", "--git-path", "hooks")
+    if cp.returncode != 0:
+        return None
+    p = (cp.stdout or "").strip()
+    if not p:
+        return None
+    return p if os.path.isabs(p) else os.path.join(target, p)
+
+
+def _install_git_guards(target, as_json=False):
+    """Install the commit-msg co-author strip guard into `target`'s git hooks.
+    Opt-in, NON-CLOBBER (a foreign commit-msg hook is backed up to
+    commit-msg.pre-agentware first), idempotent. rc 0 ok / 1 FS error / 2 not-a-repo
+    or no target."""
+    def emit(payload, lines, rc):
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            for ln in lines:
+                print(ln)
+        return rc
+    if not target:
+        return emit({"ok": False, "status": "no-target"},
+                    ["git-guards: no target repo (pass --repo or configure a "
+                     "knowledge dir)."], 2)
+    if git_toplevel(target) is None:
+        return emit({"ok": False, "status": "not-a-repo", "target": target},
+                    ["git-guards: %s is not a git work tree — nothing to install "
+                     "(the KB repo becomes one on its first commit)." % target], 2)
+    src = _git_guards_hook_src()
+    if not os.path.isfile(src):
+        return emit({"ok": False, "status": "no-source", "src": src},
+                    ["git-guards: hook source missing (%s)." % src], 1)
+    hooks_dir = _resolve_git_hooks_dir(target)
+    if not hooks_dir:
+        return emit({"ok": False, "status": "no-hooks-dir", "target": target},
+                    ["git-guards: could not resolve the git hooks dir for %s."
+                     % target], 1)
+    dest = os.path.join(hooks_dir, "commit-msg")
+    backed_up = None
+    try:
+        os.makedirs(hooks_dir, exist_ok=True)
+        if os.path.exists(dest):
+            with open(dest, "r", encoding="utf-8", errors="replace") as f:
+                existing = f.read()
+            if GIT_GUARD_MARKER not in existing:
+                backup = dest + ".pre-agentware"
+                if not os.path.exists(backup):
+                    shutil.copyfile(dest, backup)
+                    os.chmod(backup, 0o755)   # keep it executable so the guard can CHAIN to it
+                    backed_up = backup
+        shutil.copyfile(src, dest)
+        os.chmod(dest, 0o755)
+    except OSError as exc:
+        return emit({"ok": False, "status": "error", "detail": str(exc)},
+                    ["git-guards: install FAILED: %s" % exc], 1)
+    lines = ["git-guards: installed the commit-msg co-author strip guard -> %s"
+             % dest,
+             "  strips the Claude Code bot's `Co-Authored-By: … noreply@anthropic.com`"
+             " + `Generated with Claude Code` trailers (human co-authors survive);"
+             " NEVER blocks a commit."]
+    if backed_up:
+        lines.append("  backed up + CHAINED your existing commit-msg hook (it still "
+                     "runs first) -> %s" % backed_up)
+    if os.path.abspath(hooks_dir) != os.path.abspath(os.path.join(target, ".git", "hooks")):
+        lines.append("  note: this resolved to %s (core.hooksPath / a worktree) — it "
+                     "governs hooks for its repo(s)." % hooks_dir)
+    return emit({"ok": True, "status": "installed", "hook": dest,
+                 "backed_up": backed_up, "hooks_dir": hooks_dir}, lines, 0)
+
+
+def _uninstall_git_guards(target, as_json=False):
+    """Remove the agentware commit-msg guard from `target` (restoring a backed-up
+    foreign hook if present). Idempotent: a clean no-op when absent, and a foreign
+    (non-agentware) hook is LEFT untouched. rc 0 ok / 1 FS error / 2 not-a-repo."""
+    def emit(payload, lines, rc):
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            for ln in lines:
+                print(ln)
+        return rc
+    if not target or git_toplevel(target) is None:
+        return emit({"ok": False, "status": "not-a-repo", "target": target},
+                    ["git-guards: %s is not a git work tree." % target], 2)
+    hooks_dir = _resolve_git_hooks_dir(target)
+    dest = os.path.join(hooks_dir, "commit-msg") if hooks_dir else None
+    if not dest or not os.path.exists(dest):
+        return emit({"ok": True, "status": "absent"},
+                    ["git-guards: no commit-msg guard installed — nothing to remove."], 0)
+    try:
+        with open(dest, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        if GIT_GUARD_MARKER not in content:
+            return emit({"ok": True, "status": "foreign-kept", "hook": dest},
+                        ["git-guards: the commit-msg hook is not agentware's — "
+                         "left untouched."], 0)
+        os.remove(dest)
+        backup = dest + ".pre-agentware"
+        restored = None
+        if os.path.exists(backup):
+            shutil.move(backup, dest)
+            os.chmod(dest, 0o755)
+            restored = dest
+    except OSError as exc:
+        return emit({"ok": False, "status": "error", "detail": str(exc)},
+                    ["git-guards: uninstall FAILED: %s" % exc], 1)
+    lines = ["git-guards: removed the commit-msg co-author strip guard."]
+    if restored:
+        lines.append("  restored your previous commit-msg hook.")
+    return emit({"ok": True, "status": "removed", "restored": restored}, lines, 0)
+
+
 def cmd_config(args):
     """Show resolved config; optionally set/print the KB-autocommit setting.
 
@@ -2545,6 +2675,18 @@ def cmd_config(args):
             print("Recorded onboarding event (mode=%s, user_handle=%s) -> "
                   "%s/logs/metrics.jsonl" % (mode, handle or "<unset>", kdir))
         return 0
+
+    # --install-git-guards / --uninstall-git-guards: (un)install the commit-msg
+    # co-author strip guard into a git repo's hooks (default target: the knowledge-
+    # dir KB repo agentware auto-commits to; --repo overrides). Opt-in, non-clobber,
+    # never silent (Task 6). The loop never commits (R-GIT-01) — this guards the
+    # operator's own commits.
+    if getattr(args, "install_git_guards", False):
+        repo = getattr(args, "git_guards_repo", None) or resolve_knowledge_dir()
+        return _install_git_guards(repo, as_json=as_json)
+    if getattr(args, "uninstall_git_guards", False):
+        repo = getattr(args, "git_guards_repo", None) or resolve_knowledge_dir()
+        return _uninstall_git_guards(repo, as_json=as_json)
 
     # --retrieval-mode-only: bare EFFECTIVE mode for shell consumers (the loop /
     # Phase 7 wiring). Any fallback notice goes to stderr so stdout stays a clean
@@ -16610,30 +16752,117 @@ def _dream_pid_alive(pid):
     return True
 
 
-def dream_lock_is_stale(rec, now=None, ttl=DREAM_LOCK_TTL_SEC):
+def dream_lock_is_stale(rec, now=None, ttl=DREAM_LOCK_TTL_SEC,
+                        pid_alive_never_stale=False):
     """A lock is STALE (reclaimable) when its pid is dead OR its mtime is older
-    than `ttl`. Pure given `rec`; `now` overridable for tests."""
+    than `ttl`. Pure given `rec`; `now` overridable for tests.
+
+    `pid_alive_never_stale=True` (the updater/self-heal path) makes a LIVE-pid lock
+    NEVER stale regardless of mtime: the updater does not heartbeat its lock during
+    an apply, and a legitimate apply (smoke + migrate) can run longer than `ttl`, so
+    an age-only TTL would let self-heal reclaim a LIVE apply's lock straight into a
+    concurrent `git reset --hard` (audit C16). Dream keeps the default (it heartbeats
+    its own lock, so an age-expired dream lock is genuinely hung)."""
     now = now if now is not None else time.time()
     if not isinstance(rec, dict):
         return True
     if not _dream_pid_alive(rec.get("pid")):
         return True
+    if pid_alive_never_stale:
+        return False   # a LIVE holder is never stale (an apply may run > ttl)
     ts = rec.get("mtime")
     if not isinstance(ts, (int, float)) or (now - ts) > ttl:
         return True
     return False
 
 
+def _dream_atomic_steal_lock(path, pid):
+    """Atomically claim the right to reclaim a STALE lock at `path` via rename:
+    only ONE racer's `os.rename(path -> unique)` can succeed — the source vanishes
+    for every other racer, who then get FileNotFoundError. The winner removes the
+    stolen file and returns True (to recreate the lock via O_CREAT|O_EXCL); losers
+    return False. This replaces a remove-then-recreate reclaim, whose window let two
+    racers both `os.remove` — the second deleting the FIRST's freshly-recreated lock
+    (a double-grant TOCTOU, audit B11). O_EXCL still arbitrates the recreate, so even
+    a fresh acquirer that slips in between the steal and the recreate is honored."""
+    steal = "%s.stealing.%d" % (path, pid)
+    try:
+        os.rename(path, steal)
+    except OSError:
+        return False   # another racer already stole it (gone) — we lost
+    try:
+        os.remove(steal)
+    except OSError:
+        pass
+    return True
+
+
+_DREAM_ACQ_GUARD = threading.RLock()
+_DREAM_ACQ_LOCKS = {}  # abs "<lock>.acq" path -> threading.Lock
+
+
+@contextlib.contextmanager
+def _dream_acquire_critsec(lock_path):
+    """Serialize the WHOLE acquire-or-reclaim critical section of dream_acquire_lock
+    across PROCESSES (an fcntl.flock on a sibling `<lock>.acq` meta-file) AND threads
+    (a per-path threading.Lock), so two reclaimers can never both steal-and-recreate a
+    stale lock. A rename/remove reclaim is racy by PATH, not inode: without this the
+    loser can steal the WINNER's freshly-created lock and both believe they hold the
+    single-writer lock (audit B11 follow-up — the rename-steal alone does NOT close
+    it). Distinct locks (dream vs updater) use distinct `.acq` files, so they never
+    contend. Best-effort: if fcntl is unavailable or the meta-file cannot be opened,
+    the thread lock still serializes same-process callers and we NEVER crash (degrades
+    to the prior sub-µs residual window on non-POSIX/rare-FS)."""
+    acq_path = lock_path + ".acq"
+    with _DREAM_ACQ_GUARD:
+        tl = _DREAM_ACQ_LOCKS.get(acq_path)
+        if tl is None:
+            tl = threading.Lock()
+            _DREAM_ACQ_LOCKS[acq_path] = tl
+    tl.acquire()
+    f = None
+    try:
+        if _fcntl is not None:
+            try:
+                os.makedirs(os.path.dirname(acq_path) or ".", exist_ok=True)
+                f = open(acq_path, "a+")
+                _fcntl.flock(f.fileno(), _fcntl.LOCK_EX)
+            except OSError:
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+                f = None
+        yield
+    finally:
+        if f is not None:
+            try:
+                _fcntl.flock(f.fileno(), _fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                f.close()
+            except OSError:
+                pass
+        tl.release()
+
+
 def dream_acquire_lock(kdir, now=None, pid=None, ttl=DREAM_LOCK_TTL_SEC,
-                       lock_rel=None):
+                       lock_rel=None, pid_alive_never_stale=False):
     """Acquire a single-writer lock under .cache/ (gitignored). `lock_rel` selects
     WHICH lock (default: dream.lock; the updater/tick pass UPDATER_LOCK_REL).
 
     Returns True on success, False when a FRESH lock is held by another owner.
-    Reclaims a STALE lock (dead pid / expired mtime). ATOMIC: the lockfile is
-    created with O_CREAT|O_EXCL so two concurrent acquirers can never both win
-    (a read-then-write would let both observe "no lock" and both write). A
-    held-lock refusal mutates NOTHING. `now`/`pid` are injectable for tests.
+    Reclaims a STALE lock (dead pid / expired mtime). ATOMIC on both edges: the
+    lockfile is created with O_CREAT|O_EXCL (two acquirers can never both win the
+    create), its pid+mtime are fsync'd BEFORE the fd is released (so a racer never
+    sees a durable empty file to steal), and a stale-lock reclaim is an atomic
+    rename-steal (never remove-then-recreate). An EMPTY/unparseable existing lock is
+    treated as freshly-held unless its file mtime is itself older than ttl — closing
+    the create/write double-grant window (audit B9). `pid_alive_never_stale=True`
+    (the updater/self-heal path) makes a pid-alive lock NEVER stale regardless of
+    mtime (an apply may legitimately run > ttl, audit C16). `now`/`pid` injectable.
     """
     now = now if now is not None else time.time()
     pid = pid if pid is not None else os.getpid()
@@ -16644,28 +16873,45 @@ def dream_acquire_lock(kdir, now=None, pid=None, ttl=DREAM_LOCK_TTL_SEC,
         _ensure_kb_gitignore(kdir)
     except OSError:
         return False
-    for _attempt in (0, 1):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            existing = _dream_read_lock(path)
-            if existing is not None and not dream_lock_is_stale(existing, now=now, ttl=ttl):
-                return False   # a FRESH lock is held by another owner
-            # Stale (dead pid / expired mtime / unparseable) -> reclaim atomically:
-            # remove it and retry the exclusive create exactly once.
+    # Serialize the read-stale -> steal -> recreate sequence cross-process + cross-
+    # thread so two reclaimers cannot both win (audit B11 follow-up).
+    with _dream_acquire_critsec(path):
+        for _attempt in (0, 1):
             try:
-                os.remove(path)
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                existing = _dream_read_lock(path)
+                if existing is None:
+                    # Empty/unparseable: EITHER a concurrent O_EXCL acquirer that has
+                    # created the file but not yet written its pid (a LIVE racer we
+                    # must NOT steal from — the double-grant, audit B9), OR a crashed
+                    # mid-write / corrupt file. Reclaim ONLY when its FILE mtime is
+                    # itself older than ttl; a fresh empty file is treated as held.
+                    try:
+                        file_age = now - os.path.getmtime(path)
+                    except OSError:
+                        return False
+                    if file_age <= ttl:
+                        return False
+                elif not dream_lock_is_stale(existing, now=now, ttl=ttl,
+                                             pid_alive_never_stale=pid_alive_never_stale):
+                    return False   # a FRESH lock is held by another owner
+                # Stale (dead pid / expired mtime / stale-empty) -> steal ATOMICALLY
+                # (rename) then retry the O_EXCL create once. Safe under the critsec:
+                # no concurrent reclaimer can recreate a lock we would then steal.
+                if not _dream_atomic_steal_lock(path, pid):
+                    return False   # nothing to steal (already reclaimed) — we lost
+                continue
             except OSError:
                 return False
-            continue
-        except OSError:
-            return False
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(rec)
-            return True
-        except OSError:
-            return False
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(rec)
+                    f.flush()
+                    os.fsync(f.fileno())
+                return True
+            except OSError:
+                return False
     return False
 
 
@@ -18061,6 +18307,7 @@ def _dream_uninstall_schedule(as_json):
 # HOME_CONFIG's directory so a test that patches HOME_CONFIG isolates them
 # hermetically (R-LOC-03) and they never land in the KB or the package tree.
 UPDATE_STATE_NAME = "update-state.json"
+UPDATE_STATE_LOCK_NAME = "update-state.lock"   # sidecar RMW flock (audit B2)
 ALLOWED_SIGNERS_NAME = "allowed_signers"
 # Single-writer updater lock — DISTINCT from DREAM_LOCK_REL so the updater and a
 # nightly dream can never interleave git mutations on the same work tree.
@@ -18087,6 +18334,77 @@ def _pkg_home_dir():
 
 def _pkg_state_path():
     return os.path.join(_pkg_home_dir(), UPDATE_STATE_NAME)
+
+
+# --- update-state sidecar single-writer lock (cross-process flock + RLock) -----
+# _pkg_secure_atomic_write is atomic PER WRITE, but atomicity is NOT mutual
+# exclusion: two writers that each read -> merge -> write LOSE an update (the second
+# clobbers the first). The updater lock (.cache/updater.lock) serializes apply-vs-
+# apply, but genuinely-UNLOCKED writers also touch the sidecar — `update --check`
+# via _pkg_resolve_verified_tag, the tick's last_check_ts stamp written BEFORE the
+# lock is acquired, and the layer-2 staleness pre-hook — and could clobber a locked
+# apply's pending_apply / last_good_sha (a narrow but real first-apply stranding,
+# audit B2). So EVERY sidecar read-modify-write takes THIS HOME-scoped lock,
+# independent of the updater lock. Reentrant + thread-safe + cross-process,
+# degrading BEST-EFFORT (never raises for a lock problem) exactly like _index_lock.
+_PKG_STATE_LOCK_GUARD = threading.RLock()
+_PKG_STATE_LOCK_STATE = {}  # abs lockpath -> {"file": <fileobj|None>, "depth": int}
+
+
+def _pkg_state_lock_path():
+    return os.path.join(_pkg_home_dir(), UPDATE_STATE_LOCK_NAME)
+
+
+@contextlib.contextmanager
+def _pkg_state_lock():
+    """Serialize a _pkg_state_read -> modify -> _pkg_state_write critical section
+    across processes (flock) AND threads (RLock), reentrantly. The flock is taken
+    only on the OUTERMOST acquisition; nested acquisitions bump a depth counter so a
+    lock holder (e.g. an apply-path block that calls the already-locked
+    _pkg_state_update) never self-deadlocks. NEVER raises for a lock-acquisition
+    problem (best-effort degrade: the RLock still serializes same-process threads).
+    Modeled byte-for-byte on _index_lock (the P1.7 index write lock)."""
+    lockpath = _pkg_state_lock_path()
+    _PKG_STATE_LOCK_GUARD.acquire()
+    try:
+        st = _PKG_STATE_LOCK_STATE.get(lockpath)
+        if st is None:
+            st = {"file": None, "depth": 0}
+            _PKG_STATE_LOCK_STATE[lockpath] = st
+        if st["depth"] == 0 and _fcntl is not None:
+            f = None
+            try:
+                d = os.path.dirname(lockpath) or "."
+                os.makedirs(d, exist_ok=True)
+                f = open(lockpath, "a+")
+                _fcntl.flock(f.fileno(), _fcntl.LOCK_EX)
+            except OSError:
+                if f is not None:
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+                f = None  # best-effort: RLock still serializes same-process threads
+            st["file"] = f
+        st["depth"] += 1
+        try:
+            yield
+        finally:
+            st["depth"] -= 1
+            if st["depth"] == 0:
+                f = st.get("file")
+                if f is not None:
+                    try:
+                        _fcntl.flock(f.fileno(), _fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                    try:
+                        f.close()
+                    except OSError:
+                        pass
+                st["file"] = None
+    finally:
+        _PKG_STATE_LOCK_GUARD.release()
 
 
 def _pkg_assert_secure_path(path, is_dir):
@@ -18183,28 +18501,33 @@ def _pkg_state_write(state):
 
 def _pkg_state_update(**fields):
     """Read-modify-write convenience: merge `fields` into the sidecar and persist.
-    Raises _PkgStateError / OSError on write failure (fail-closed by design)."""
-    state = _pkg_state_read()
-    state.update(fields)
-    _pkg_state_write(state)
-    return state
+    Raises _PkgStateError / OSError on write failure (fail-closed by design). The
+    whole RMW runs under _pkg_state_lock so a concurrent (possibly unlocked) writer
+    cannot clobber a locked apply's fields (audit B2)."""
+    with _pkg_state_lock():
+        state = _pkg_state_read()
+        state.update(fields)
+        _pkg_state_write(state)
+        return state
 
 
 def _pkg_quarantine_tag(tag, reason=None):
     """Append `tag` to the bounded quarantined_tags ledger (dedup, capped).
-    Persisted so a broken release is not re-attempted every tick (anti-thrash)."""
-    state = _pkg_state_read()
-    q = state.get("quarantined_tags")
-    if not isinstance(q, list):
-        q = []
-    entry = {"tag": tag, "reason": (reason or "")[:200], "ts": _now_iso()}
-    q = [e for e in q if not (isinstance(e, dict) and e.get("tag") == tag)]
-    q.append(entry)
-    if len(q) > MAX_QUARANTINED_TAGS:
-        q = q[-MAX_QUARANTINED_TAGS:]
-    state["quarantined_tags"] = q
-    _pkg_state_write(state)
-    return state
+    Persisted so a broken release is not re-attempted every tick (anti-thrash).
+    RMW under _pkg_state_lock so a concurrent writer cannot lose the ledger append."""
+    with _pkg_state_lock():
+        state = _pkg_state_read()
+        q = state.get("quarantined_tags")
+        if not isinstance(q, list):
+            q = []
+        entry = {"tag": tag, "reason": (reason or "")[:200], "ts": _now_iso()}
+        q = [e for e in q if not (isinstance(e, dict) and e.get("tag") == tag)]
+        q.append(entry)
+        if len(q) > MAX_QUARANTINED_TAGS:
+            q = q[-MAX_QUARANTINED_TAGS:]
+        state["quarantined_tags"] = q
+        _pkg_state_write(state)
+        return state
 
 
 def _pkg_is_quarantined(tag):
@@ -18919,8 +19242,11 @@ def _pkg_run_update(target=None, kdir=None, now_iso=None):
         res.update(status="none", detail="package is not a git work tree")
         return res
     # Single-writer lock (SAME lock as the tick). The dirty-tree check is done
-    # INSIDE the lock (TOCTOU-safe) by _pkg_run_update_locked.
-    if not dream_acquire_lock(kdir, lock_rel=UPDATER_LOCK_REL):
+    # INSIDE the lock (TOCTOU-safe) by _pkg_run_update_locked. A LIVE apply's lock is
+    # NEVER reclaimed as stale (pid_alive_never_stale) so two applies can never run
+    # concurrently even when the first legitimately exceeds the ttl (audit C16).
+    if not dream_acquire_lock(kdir, lock_rel=UPDATER_LOCK_REL,
+                              pid_alive_never_stale=True):
         res.update(status="locked",
                    detail="another updater/tick apply holds the lock — skipping")
         return res
@@ -18963,13 +19289,13 @@ def _pkg_run_update_locked(target, kdir, now_iso, res):
     if not cur_head:
         res.update(status="error", detail="cannot resolve current HEAD")
         return res
-    prior = _pkg_state_read()
     try:
-        _pkg_state_write(dict(prior,
-                              last_good_sha=cur_head,
-                              pending_apply={"applying_tag": tag,
-                                             "applying_sha": sha,
-                                             "migrated": False}))
+        with _pkg_state_lock():   # atomic RMW: no unlocked writer clobbers this
+            _pkg_state_write(dict(_pkg_state_read(),
+                                  last_good_sha=cur_head,
+                                  pending_apply={"applying_tag": tag,
+                                                 "applying_sha": sha,
+                                                 "migrated": False}))
     except (OSError, _PkgStateError) as exc:
         try:
             _pkg_state_update(last_check_ts=now_iso)
@@ -18992,6 +19318,22 @@ def _pkg_run_update_locked(target, kdir, now_iso, res):
     # 6. assert HEAD == verified SHA (re-assert; TOCTOU).
     new_head = _git_head(target)
     if new_head != sha:
+        # An ff-only that left HEAD unchanged because `sha` is already an ANCESTOR of
+        # HEAD (a version-newer tag whose COMMIT HEAD already contains — git reports
+        # "Already up to date") is a BENIGN idempotent no-op, NOT a rollback. Treat it
+        # as success: record last_applied so the resolver's no-downgrade stops the
+        # per-tick thrash, WITHOUT re-smoking/migrating (the tree never moved) and
+        # WITHOUT a false "rolled-back"/quarantine (audit D8).
+        if new_head and _is_ancestor(target, sha, new_head):
+            with _pkg_state_lock():
+                _pkg_state_write(dict(_pkg_state_read(), last_good_sha=new_head,
+                                      last_good_tag=tag, last_applied_version=version,
+                                      pending_apply=None))
+            res.update(status="up-to-date", tag=tag, version=version,
+                       detail="signed tag %s (%s) is already contained in HEAD %s — "
+                              "idempotent no-op (recorded last_applied; no rollback)"
+                              % (tag, version, new_head[:9]))
+            return res
         rb = _pkg_rollback(tag, target=target, kdir=kdir,
                            reason="HEAD != verified SHA after apply")
         res.update(status="rolled-back",
@@ -19015,8 +19357,10 @@ def _pkg_run_update_locked(target, kdir, now_iso, res):
     mstatus, mpayload = _pkg_migrate_after_apply(target, kdir)
     if mstatus == "refused":
         # restructuring-refused: emit workorder, KEEP package, do NOT rollback.
-        _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha, last_good_tag=tag,
-                              last_applied_version=version, pending_apply=None))
+        with _pkg_state_lock():
+            _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha,
+                                  last_good_tag=tag, last_applied_version=version,
+                                  pending_apply=None))
         ref = mpayload.get("refused") or {}
         res.update(status="migrate-workorder",
                    detail="applied signed tag %s (%s); migrate REFUSED a "
@@ -19028,8 +19372,10 @@ def _pkg_run_update_locked(target, kdir, now_iso, res):
         # older-CLI / exec error: a real anomaly. Package is applied + smoke-passed;
         # keep it (rollback is not warranted — smoke passed), surface LOUDLY. The
         # loop pre-hook re-runs migrate each run, so a transient issue self-heals.
-        _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha, last_good_tag=tag,
-                              last_applied_version=version, pending_apply=None))
+        with _pkg_state_lock():
+            _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha,
+                                  last_good_tag=tag, last_applied_version=version,
+                                  pending_apply=None))
         res.update(status="migrate-error",
                    detail="applied signed tag %s (%s); smoke PASS but migrate "
                           "--apply errored: %s (package KEPT; surfaced)"
@@ -19039,8 +19385,9 @@ def _pkg_run_update_locked(target, kdir, now_iso, res):
     # migrate ok -> set migrated=true (crash-window marker), then FINALIZE.
     _pkg_state_update(pending_apply={"applying_tag": tag, "applying_sha": sha,
                                      "migrated": True})
-    _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha, last_good_tag=tag,
-                          last_applied_version=version))
+    with _pkg_state_lock():
+        _pkg_state_write(dict(_pkg_state_read(), last_good_sha=sha, last_good_tag=tag,
+                              last_applied_version=version))
     _pkg_state_update(pending_apply=None)        # clear marker LAST
     res.update(status="applied",
                detail="applied signed tag %s (%s) -> %s; smoke PASS; migrate ok"
@@ -19374,7 +19721,14 @@ def _pkg_tag_at_head_if_newer(target, applied):
     head = _git_head(target)
     if not head:
         return None, None
-    signers = _pkg_allowed_signers_path()
+    # Integrity-guard the trust anchor BEFORE consulting it, exactly like the main
+    # resolver (18558): the crash-window reconcile must FAIL-CLOSED on a symlinked/
+    # wrong-owner/group-writable anchor, never TRUST a tampered one to finalize an
+    # apply the main path would refuse (audit A1). Fail-closed here == (None, None).
+    try:
+        signers = _pkg_assert_signers_secure()
+    except _PkgStateError:
+        return None, None
     for tag in _pkg_channel_tags(target):
         if _pkg_tag_sha(target, tag) != head:
             continue
@@ -19447,13 +19801,55 @@ def _pkg_reconcile_pending(target, kdir):
     smoke = _pkg_smoke(kdir, target=target)
     if smoke["ok"]:
         ver = _pkg_version_tuple(applying_tag) if applying_tag else head_tag_ver
-        _pkg_state_write(dict(_pkg_state_read(), last_good_sha=head,
-                              last_good_tag=applying_tag,
-                              last_applied_version=_pkg_ver_str(ver),
-                              pending_apply=None))
-        return {"status": "reconciled-finalized", "tag": applying_tag,
-                "detail": "reconciled a crashed apply: re-smoke PASS -> finalized "
-                          "%s (migrate runs via the loop pre-hook)" % applying_tag}
+        ver_str = _pkg_ver_str(ver)
+
+        def _finalize(detail):
+            with _pkg_state_lock():
+                _pkg_state_write(dict(_pkg_state_read(), last_good_sha=head,
+                                      last_good_tag=applying_tag,
+                                      last_applied_version=ver_str,
+                                      pending_apply=None))
+            return {"status": "reconciled-finalized", "tag": applying_tag,
+                    "detail": detail}
+
+        # Run the SAME migrate triage as the normal apply path (do NOT defer it to the
+        # loop pre-hook only): a reconciled release must get its migrations applied
+        # consistently — refused emits a workorder + keeps the package, error surfaces
+        # loudly + keeps the package, ok proceeds (audit D13). migrate --apply is
+        # idempotent, so re-running it when `migrated` was already set is a no-op.
+        #
+        # BEFORE migrate can advance the KB .schema, persist the crash-window marker
+        # with migrated=True (mirrors the apply path's own pre-finalize stamp). If the
+        # process is killed during or after migrate but before _finalize lands, the
+        # persisted marker stays migrated=True, so a LATER reconcile takes the
+        # `if not migrated:` = False branch and STRANDS loudly (needs_manual_recovery)
+        # instead of performing a FORBIDDEN post-migrate `git reset --hard` that would
+        # restore the OLD package under a HIGHER schema (brick). _finalize clears it on
+        # every success path. Stamping conservatively (even before a possible refusal)
+        # fails toward a loud strand, never a silent brick.
+        try:
+            _pkg_state_update(pending_apply={"applying_tag": applying_tag,
+                                             "applying_sha": applying_sha,
+                                             "migrated": True})
+        except (OSError, _PkgStateError):
+            pass
+        mstatus, mpayload = _pkg_migrate_after_apply(target, kdir)
+        if mstatus == "refused":
+            ref = mpayload.get("refused") or {}
+            r = _finalize("reconciled a crashed apply: re-smoke PASS -> finalized %s; "
+                          "migrate REFUSED a restructuring migration (%s) — create a "
+                          "migration workorder (package KEPT, not rolled back)"
+                          % (applying_tag, ref.get("name", "?")))
+            r["status"] = "reconciled-migrate-workorder"
+            return r
+        if mstatus == "error":
+            r = _finalize("reconciled a crashed apply: re-smoke PASS -> finalized %s; "
+                          "migrate --apply errored: %s (package KEPT; surfaced)"
+                          % (applying_tag, mpayload.get("detail", "see logs")))
+            r["status"] = "reconciled-migrate-error"
+            return r
+        return _finalize("reconciled a crashed apply: re-smoke PASS -> finalized %s; "
+                         "migrate ok" % applying_tag)
     if not migrated:
         rb = _pkg_rollback(applying_tag, target=target, kdir=kdir,
                            reason="reconcile: unfinalized apply fails smoke")
@@ -19506,26 +19902,27 @@ _TICK_JOB_REGISTRY.append({
 
 def _pkg_lock_status_word(kdir):
     """Read-only updater/tick lock state: 'free' | 'held' | 'stale'. Modeled on
-    dream_acquire_lock's read-before-write — mutates NOTHING."""
+    dream_acquire_lock's read-before-write — mutates NOTHING. A LIVE-pid lock is
+    NEVER 'stale' regardless of mtime (an apply may run > ttl; audit C16), so the
+    reverse-guard never self-heals a live apply out from under itself."""
     rec = _dream_read_lock(_dream_lock_path(kdir, UPDATER_LOCK_REL))
     if rec is None:
         return "free"
-    return "stale" if dream_lock_is_stale(rec) else "held"
+    return "stale" if dream_lock_is_stale(rec, pid_alive_never_stale=True) else "held"
 
 
 def _pkg_self_heal(kdir, target=None):
-    """One-shot self-heal for a crashed prior apply (stale updater lock): clear the
-    stale lock, then reconcile (re-smoke -> finalize / rollback / strand) under the
-    updater lock. Mirrors Task 8's loop-start reconcile."""
+    """One-shot self-heal for a crashed prior apply (stale updater lock): reclaim the
+    stale lock and reconcile (re-smoke -> finalize / rollback / strand) under the
+    updater lock. Mirrors Task 8's loop-start reconcile.
+
+    Reclaim is delegated to dream_acquire_lock's ATOMIC rename-steal (no pre-remove
+    TOCTOU, audit B11) with `pid_alive_never_stale=True` so a LIVE apply's lock is
+    NEVER reclaimed into a concurrent `git reset --hard` (audit C16). A lock held by
+    a live process returns status 'locked' WITHOUT reconciling."""
     target = target or REPO_ROOT
-    lock_path = _dream_lock_path(kdir, UPDATER_LOCK_REL)
-    rec = _dream_read_lock(lock_path)
-    if rec is not None and dream_lock_is_stale(rec):
-        try:
-            os.remove(lock_path)
-        except OSError:
-            pass
-    if not dream_acquire_lock(kdir, lock_rel=UPDATER_LOCK_REL):
+    if not dream_acquire_lock(kdir, lock_rel=UPDATER_LOCK_REL,
+                              pid_alive_never_stale=True):
         return {"status": "locked",
                 "detail": "updater lock held by a LIVE process — not healing"}
     try:
@@ -19597,7 +19994,10 @@ def _pkg_emit_heartbeat(kdir):
         os.makedirs(logs, exist_ok=True)
         with open(os.path.join(logs, "metrics.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
-    except OSError:
+    except (OSError, _PkgStateError):
+        # _pkg_version() falls back to _pkg_state_read().get("last_applied_version"),
+        # so a tampered HOME sidecar raises _PkgStateError here — honor the
+        # never-raises contract (a scheduled tick must not crash), audit A4.
         pass
 
 
@@ -19605,50 +20005,60 @@ def _audit_pkg_version_check(kdir):
     """Rule-7 rollout visibility: flag THIS machine as BEHIND the newest VERIFIED
     stable tag in the local channel. INERT when the updater is OFF (opt-in default)
     or pre-go-live (no signed channel / no pinned key). Read-only (no network
-    fetch). The cross-machine fleet-coverage sink is DEFERRED to team-mode."""
+    fetch). The cross-machine fleet-coverage sink is DEFERRED to team-mode.
+
+    A tampered HOME state sidecar or trust anchor is reported as a clean FAIL check,
+    NEVER an unhandled traceback that crashes the whole `audit` command: EVERY
+    sidecar/anchor read here (_pkg_state_read directly AND _pkg_version, which falls
+    back to the sidecar's last_applied_version) can raise _PkgStateError, so the
+    whole body fails closed to ok=False (audit A5)."""
     name = "pkg_version"
-    if resolve_updater() != "1":
-        return {"name": name, "ok": True, "pkg_version": _pkg_version(),
-                "details": ["inert: automatic updates OFF (opt-in; enable with "
-                            "`scripts/agentware config --set-updater on`)"]}
     try:
-        signers_present = bool(_pkg_list_signers())
+        if resolve_updater() != "1":
+            return {"name": name, "ok": True, "pkg_version": _pkg_version(),
+                    "details": ["inert: automatic updates OFF (opt-in; enable with "
+                                "`scripts/agentware config --set-updater on`)"]}
+        try:
+            signers_present = bool(_pkg_list_signers())
+        except _PkgStateError as exc:
+            return {"name": name, "ok": False,
+                    "details": ["trust anchor tampered — %s" % exc]}
+        if not signers_present:
+            return {"name": name, "ok": True, "pkg_version": _pkg_version(),
+                    "details": ["inert: no publisher key pinned (pre-go-live)"]}
+        state = _pkg_state_read()
+        if state.get("needs_manual_recovery"):
+            return {"name": name, "ok": False, "pkg_version": _pkg_version(),
+                    "details": ["needs_manual_recovery is set — a prior apply is "
+                                "stranded (see ~/.agentware/update-state.json)"]}
+        target = REPO_ROOT
+        signers = _pkg_allowed_signers_path()
+        newest_verified = None
+        for tag in _pkg_channel_tags(target):
+            ok, _d = _pkg_verify_tag(target, tag, signers)
+            if ok:
+                newest_verified = tag
+                break
+        applied_str = _pkg_version(target)
+        base = {"name": name, "pkg_version": applied_str,
+                "newest_verified_tag": newest_verified}
+        if not newest_verified:
+            return dict(base, ok=True,
+                        details=["no verified stable tag in the local channel yet"])
+        nv = _pkg_version_tuple(newest_verified)
+        applied = _pkg_version_tuple(applied_str)
+        if applied is None or (nv is not None and nv > applied):
+            return dict(base, ok=False,
+                        details=["BEHIND: newest verified stable tag %s > applied %s"
+                                 " — the updater has not applied it yet (check the "
+                                 "tick / run `scripts/agentware update`)"
+                                 % (newest_verified, applied_str or "none")])
+        return dict(base, ok=True,
+                    details=["up to date: applied %s (newest verified %s)"
+                             % (applied_str, newest_verified)])
     except _PkgStateError as exc:
         return {"name": name, "ok": False,
-                "details": ["trust anchor tampered — %s" % exc]}
-    if not signers_present:
-        return {"name": name, "ok": True, "pkg_version": _pkg_version(),
-                "details": ["inert: no publisher key pinned (pre-go-live)"]}
-    state = _pkg_state_read()
-    if state.get("needs_manual_recovery"):
-        return {"name": name, "ok": False, "pkg_version": _pkg_version(),
-                "details": ["needs_manual_recovery is set — a prior apply is "
-                            "stranded (see ~/.agentware/update-state.json)"]}
-    target = REPO_ROOT
-    signers = _pkg_allowed_signers_path()
-    newest_verified = None
-    for tag in _pkg_channel_tags(target):
-        ok, _d = _pkg_verify_tag(target, tag, signers)
-        if ok:
-            newest_verified = tag
-            break
-    applied_str = _pkg_version(target)
-    base = {"name": name, "pkg_version": applied_str,
-            "newest_verified_tag": newest_verified}
-    if not newest_verified:
-        return dict(base, ok=True,
-                    details=["no verified stable tag in the local channel yet"])
-    nv = _pkg_version_tuple(newest_verified)
-    applied = _pkg_version_tuple(applied_str)
-    if applied is None or (nv is not None and nv > applied):
-        return dict(base, ok=False,
-                    details=["BEHIND: newest verified stable tag %s > applied %s — "
-                             "the updater has not applied it yet (check the tick / "
-                             "run `scripts/agentware update`)"
-                             % (newest_verified, applied_str or "none")])
-    return dict(base, ok=True,
-                details=["up to date: applied %s (newest verified %s)"
-                         % (applied_str, newest_verified)])
+                "details": ["update-state sidecar tampered — %s" % exc]}
 
 
 # --- Task 12: release-signing go-live preflight (OPERATOR-GATED handoff) -------
@@ -20227,16 +20637,6 @@ def cmd_skill_remove(args):
     return 0
 
 
-# Package self-update gates (R-PKG-04 + R-PKG-05). Re-run AFTER a fast-forward
-# apply because `update` mutates package files exactly like any other package
-# edit. Trusted operator-default commands run with cwd = REPO_ROOT, so the
-# relative `scripts/agentware` resolves to this toolkit.
-PKG_UPDATE_GATES = (
-    "scripts/agentware steering lint",
-    "scripts/agentware eval --record --gate",
-)
-
-
 def _catalog_skill_names_at_ref(ref):
     """Set of skill names in catalog/skills.json at a git ref, or None.
 
@@ -20268,9 +20668,12 @@ def cmd_update(args):
     (`eval --record --gate` is a publisher pre-tag concern via `gate release --full`,
     never re-run here — it would write reliability rows into the operator KB).
 
-    `--check` is READ-ONLY (safe for a SessionStart nudge) and reports the verified-
-    tag resolution. The @{upstream} behind/ahead + `--catalog` diff is kept purely
-    INFORMATIONAL (never the apply decision)."""
+    `--check` is read-only w.r.t. the WORK TREE (executes no pulled code, applies
+    nothing) but DOES fetch from the remote (a network op: `git fetch` for the
+    @{upstream} view + a `fetch --tags` in the resolver), so it is NOT for a
+    SessionStart nudge; the no-network SessionStart mode is `--status-line`. `--check`
+    reports the verified-tag resolution; the @{upstream} behind/ahead + `--catalog`
+    diff is kept purely INFORMATIONAL (never the apply decision)."""
     target = REPO_ROOT
     check_only = getattr(args, "check", False)
     show_catalog = getattr(args, "catalog", False)
@@ -20312,10 +20715,15 @@ def cmd_update(args):
             return emit({"ok": True, "status": "no-kb"},
                         ["update: no knowledge dir — nothing to heal."], 0)
         r = _pkg_self_heal(kdir, target)
-        return emit({"ok": not r.get("needs_manual_recovery"), "self_heal": r},
+        # A migrate ERROR during self-heal is a real anomaly (package kept but migrate
+        # --apply failed); surface it as a failure even though it does not set
+        # needs_manual_recovery, mirroring the normal apply path's migrate-error.
+        heal_failed = (bool(r.get("needs_manual_recovery"))
+                       or str(r.get("status", "")).endswith("migrate-error"))
+        return emit({"ok": not heal_failed, "self_heal": r},
                     ["update: self-heal -> %s (%s)"
                      % (r["status"], r.get("detail", ""))],
-                    1 if r.get("needs_manual_recovery") else 0)
+                    1 if heal_failed else 0)
 
     if not git_is_work_tree(target):
         return emit(
@@ -20374,6 +20782,20 @@ def cmd_update(args):
         return emit(payload, lines, 0)
 
     # --- Apply: the dedicated updater sequence (locked, fail-closed) ---------
+    # Serialize the manual foreground apply against a LIVE loop session exactly like
+    # the tick job (_pkg_updater_run): never land an apply mid-loop, so a running
+    # loop can never read a half-updated package (audit C16). --check/--status-line
+    # above are read-only and unaffected; --format json still returns cleanly.
+    _sess_kdir = require_knowledge_dir()
+    _active = is_session_active(_sess_kdir) if _sess_kdir else None
+    if _active:
+        payload.update(mode="apply", applied=False,
+                       result={"status": "deferred",
+                               "detail": "loop session active (%s)" % _active})
+        return emit(payload,
+                    lines + ["update: DEFERRED — a loop session is active (%s); not "
+                             "applying mid-loop (retry after it finishes, or let the "
+                             "scheduled tick apply it)." % _active], 0)
     result = _pkg_run_update(target)
     payload.update(mode="apply", result=result, tag=result.get("tag"),
                    sha=result.get("sha"), version=result.get("version"),
@@ -20382,15 +20804,21 @@ def cmd_update(args):
         lines.append("update: ⚠ %s" % w)
     lines.append("update: %s" % result["detail"])
     status = result["status"]
+    # A crash-window reconcile returns the SAME outcomes as a normal apply but
+    # prefixed `reconciled-` (finalized / migrate-workorder / migrate-error / cleared
+    # / rolledback). Normalize the prefix so a reconcile SUCCESS exits 0 and a
+    # reconcile ERROR fails loudly, identical to the non-reconcile path — otherwise a
+    # successful self-heal would exit 1 and a migrate-error would exit 0 (audit).
+    norm = status[len("reconciled-"):] if status.startswith("reconciled-") else status
     graceful = {"applied", "up-to-date", "none", "skipped", "no-trust", "dirty",
-                "locked", "migrate-workorder"}
-    rc = 0 if status in graceful else 1
+                "locked", "migrate-workorder", "finalized", "cleared"}
+    rc = 0 if norm in graceful else 1
     if result.get("needs_manual_recovery"):
         payload["ok"] = False
         rc = 1
         lines.append("update: ⚠ needs_manual_recovery — inspect "
                      "~/.agentware/update-state.json")
-    elif status in ("error", "migrate-error"):
+    elif norm in ("error", "migrate-error"):
         payload["ok"] = False
     return emit(payload, lines, rc)
 
@@ -20589,6 +21017,20 @@ def build_parser():
                        dest="record_onboarding",
                        help="append one onboarding event {mode,user_handle} to "
                             "<kdir>/logs/metrics.jsonl (gitignored observability)")
+    # --- git co-author guard (260712-p2b-hardening-followups, Task 6) -----
+    p_cfg.add_argument("--install-git-guards", action="store_true",
+                       dest="install_git_guards",
+                       help="install the commit-msg co-author strip guard into a "
+                            "git repo (default: the knowledge-dir KB repo). Opt-in, "
+                            "non-clobber; strips Claude/AI co-author trailers from "
+                            "operator commits without ever blocking a commit")
+    p_cfg.add_argument("--uninstall-git-guards", action="store_true",
+                       dest="uninstall_git_guards",
+                       help="remove the agentware commit-msg guard (restoring a "
+                            "backed-up foreign hook if present)")
+    p_cfg.add_argument("--repo", dest="git_guards_repo", metavar="PATH",
+                       help="target repo for --install/--uninstall-git-guards "
+                            "(default: the configured knowledge dir)")
     # --- dream mode (260627-dream-mode) ----------------------------------
     p_cfg.add_argument("--dream-only", action="store_true", dest="dream_only",
                        help="print only the resolved dream setting (on|off) for "

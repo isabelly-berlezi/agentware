@@ -149,6 +149,13 @@ class ReconcileTests(_Base):
         self.smoke = mock.patch.object(
             self.mod, "_pkg_smoke",
             return_value={"ok": True, "steps": [], "detail": "PASS"}).start()
+        # The crash-window reconcile now runs the SAME migrate triage as the normal
+        # apply path (feature 260712-p2b-hardening-followups, audit D13), so mock
+        # migrate to ok here — these tests isolate the smoke->finalize/rollback/strand
+        # control flow; the migrate-refused/error reconcile triage is covered in
+        # tests/test_pkg_apply_edges.py.
+        self.migrate = mock.patch.object(
+            self.mod, "_pkg_migrate_after_apply", return_value=("ok", {})).start()
         self.addCleanup(mock.patch.stopall)
 
     def _g(self, *a):

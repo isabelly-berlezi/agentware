@@ -1350,15 +1350,36 @@ LOOP_STARTED=true
 LOOP_OUTCOME="pre_hook_abort"
 snapshot_task_states > "$SNAPSHOT_FILE" 2>/dev/null || true
 
-# ---- REVERSE LOOP-GUARD (feature 260712-scheduler-updater, Task 9) ----
+# ---- REVERSE LOOP-GUARD (feature 260712-scheduler-updater, Task 9;
+#      hardened by 260712-p2b-hardening-followups, Task 3 / audit C3+C7) ----
 # Refuse/defer starting a loop while a live updater/tick apply holds the lock, so a
 # loop never reads a HALF-UPDATED package mid-apply. Checks the updater/tick lock
 # SPECIFICALLY (never dream.lock — no contention/deadlock). Mirrors the plan-claim
 # refusal shape (LOOP_OUTCOME=pre_hook_abort + exit 1). On a STALE lock (crashed
 # prior apply) it neither silently allows nor permanently refuses: it runs a
-# one-shot Task-5/Task-8 self-heal (reconcile to last_good), then proceeds.
+# one-shot self-heal (reconcile to last_good), then RE-CHECKS the lock — a live
+# apply that acquired the lock during the self-heal window makes self-heal return
+# `locked` WITHOUT reconciling, so the loop must refuse rather than proceed onto a
+# half-updated tree (C3).
+
+# Read the updater/tick lock word, retrying a TRANSIENT CLI error up to 3 times
+# before defaulting to `free`. A single transient error must NOT fail the loop open
+# blindly, and a persistent error must NOT blanket-refuse every loop start (that
+# would DoS the loop) — bounded retry then fail-open is the balance (C7).
+_aw_lock_status() {
+  local _w _i
+  for _i in 1 2 3; do
+    if _w="$(scripts/agentware tick --lock-status 2>/dev/null)" && [[ -n "$_w" ]]; then
+      printf '%s\n' "$_w"
+      return 0
+    fi
+  done
+  printf 'free\n'
+  return 0
+}
+
 if [[ -x scripts/agentware ]] && [[ "$INITIALIZED" == true ]] && [[ -n "${KDIR:-}" ]]; then
-  aw_lock_state="$(scripts/agentware tick --lock-status 2>/dev/null || echo free)"
+  aw_lock_state="$(_aw_lock_status)"
   case "$aw_lock_state" in
     held)
       echo "Error: [guard] a live agentware updater/tick apply holds the lock — refusing to start a loop (never read a half-updated package mid-apply). Retry in a moment."
@@ -1367,7 +1388,24 @@ if [[ -x scripts/agentware ]] && [[ "$INITIALIZED" == true ]] && [[ -n "${KDIR:-
       ;;
     stale)
       log "[guard] stale updater/tick lock (crashed prior apply) — running one-shot self-heal before starting."
-      scripts/agentware update --self-heal || true
+      # A non-zero self-heal means it could NOT reconcile: the package is STRANDED
+      # (needs_manual_recovery) or migrate errored — refuse rather than start a loop
+      # onto a half-updated tree (audit follow-up: a bare `|| true` swallowed this and
+      # let the loop proceed onto the stranded package).
+      if ! scripts/agentware update --self-heal; then
+        echo "Error: [guard] self-heal could NOT reconcile a crashed apply (package STRANDED / needs_manual_recovery) — refusing to start a loop. Inspect ~/.agentware/update-state.json, then re-run \`scripts/agentware update --self-heal\`."
+        LOOP_OUTCOME="pre_hook_abort"
+        exit 1
+      fi
+      # RE-CHECK: proceed ONLY when the lock is now fully FREE. Anything else — a LIVE
+      # apply re-acquired it (held), or a fresh crash left another stale lock — means
+      # the tree is not safe to read yet (C3, broadened from held-only).
+      aw_lock_state="$(_aw_lock_status)"
+      if [[ "$aw_lock_state" != "free" ]]; then
+        echo "Error: [guard] updater lock is still '$aw_lock_state' after self-heal — refusing to start a loop (never read a half-updated package mid-apply). Retry in a moment."
+        LOOP_OUTCOME="pre_hook_abort"
+        exit 1
+      fi
       ;;
     *)
       : ;;  # free — proceed

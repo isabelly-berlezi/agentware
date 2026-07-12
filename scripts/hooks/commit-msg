@@ -1,0 +1,52 @@
+#!/bin/bash
+# agentware commit-msg guard
+#
+# Strips AI co-author / Claude-Code attribution trailers from an operator commit
+# message BEFORE the commit is written. STRIP, do NOT block: this hook ALWAYS
+# exits 0 (except to PROPAGATE a chained hook's abort) so the operator's commit
+# still succeeds. Installed only with explicit consent via
+# `scripts/agentware config --install-git-guards` — never silently. The agentware
+# loop itself never commits (R-GIT-01); this guards the OPERATOR's own commits,
+# where an injected co-author trailer otherwise recurs.
+set -u
+
+msg="${1:-}"
+# Git calls: commit-msg <path-to-COMMIT_EDITMSG>. Missing/unreadable -> no-op.
+[ -n "$msg" ] && [ -f "$msg" ] || exit 0
+
+# CHAIN: if installing REPLACED a pre-existing foreign commit-msg hook, it was
+# backed up alongside us as `commit-msg.pre-agentware`. Run it FIRST so its
+# behavior (validation/linting, and its own abort semantics) is preserved — a
+# non-zero from it aborts the commit exactly as it would have on its own.
+_self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+if [ -n "${_self_dir:-}" ] && [ -x "$_self_dir/commit-msg.pre-agentware" ]; then
+  "$_self_dir/commit-msg.pre-agentware" "$@" || exit $?
+fi
+
+tmp="$msg.agentware.$$"
+
+# Whole-line, case-insensitive removals (BOTH anchored at line start so body prose
+# that merely mentions Claude — "…generated with Claude Code assistance" — survives):
+#   Co-Authored-By: <... noreply@anthropic.com>  the Claude Code BOT trailer only —
+#      a genuine HUMAN co-author (even one named Claude, or an Anthropic employee at
+#      their real @anthropic.com address) is NOT the noreply bot, so it survives.
+#   [🤖 ]Generated with ...Claude Code           incl. the markdown-link PR-body variant.
+grep -viE '^[[:space:]]*Co-Authored-By:.*noreply@anthropic\.com|^[[:space:]]*(🤖[[:space:]]*)?Generated with .*Claude Code' "$msg" > "$tmp" 2>/dev/null
+if [ "$?" -ge 2 ]; then
+  rm -f "$tmp" 2>/dev/null
+  exit 0                       # grep errored — leave the message untouched
+fi
+
+# Drop any trailing run of blank lines the removal left behind (no dangling gap).
+awk '{ln[NR]=$0} END{last=NR; while(last>0 && ln[last]~/^[[:space:]]*$/) last--; for(i=1;i<=last;i++) print ln[i]}' "$tmp" > "$tmp.sq" 2>/dev/null \
+  && mv "$tmp.sq" "$tmp" 2>/dev/null
+
+# Never replace the message with an EMPTY result (a message that was ONLY trailer
+# lines): an empty COMMIT_EDITMSG makes git ABORT the commit, which would be
+# block-not-strip. Leave the original untouched so git's normal handling applies.
+if [ -s "$tmp" ]; then
+  mv "$tmp" "$msg" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+else
+  rm -f "$tmp" 2>/dev/null
+fi
+exit 0
