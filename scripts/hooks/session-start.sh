@@ -12,6 +12,23 @@ cat >/dev/null 2>&1 || true   # consume stdin
 
 KDIR="$("$REPO_ROOT/scripts/aw-knowledge-dir" 2>/dev/null || true)"
 
+# Resolve the invocation checkout ONCE (feature invocation-cwd-context): reused
+# by BOTH the per-session preference digest (feature 260712, Task 3) and the
+# AGENTWARE_INVOKED_FROM banner below, so the (~15s-budgeted) whereami resolver
+# runs at most once. Byte-identical no-op when the var is unset or nothing
+# resolves: _proj_name stays empty.
+_proj_name=""; _proj_dir=""; _repo_root=""
+if [[ -n "${AGENTWARE_INVOKED_FROM:-}" ]]; then
+  _whereami_json="$("$REPO_ROOT/scripts/agentware" whereami --dir "$AGENTWARE_INVOKED_FROM" --format json 2>/dev/null || true)"
+  if [[ -n "$_whereami_json" ]]; then
+    _proj_name="$(printf '%s' "$_whereami_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("project_name",""))' 2>/dev/null || true)"
+    if [[ -n "$_proj_name" ]]; then
+      _proj_dir="$(printf '%s' "$_whereami_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("project_dir",""))' 2>/dev/null || true)"
+      _repo_root="$(printf '%s' "$_whereami_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("repo_root",""))' 2>/dev/null || true)"
+    fi
+  fi
+fi
+
 if [[ -z "$KDIR" ]] || [[ ! -f "$KDIR/.initialized" ]]; then
   CTX="AGENTWARE_STATUS: FIRST_RUN — this workspace is not yet initialized. Before any other work, run the onboarding skill in .claude/skills/onboarding/SKILL.md: it asks where to store your EXTERNAL knowledge base, runs 'scripts/agentware init', and writes the .initialized sentinel."
 else
@@ -55,23 +72,29 @@ EXECUTOR: ${USER_HANDLE} — your environment/paths come from profiles/${USER_HA
 ----- knowledge/skills/index.md (operator skills roster) -----
 $(cat "$KDIR/skills/index.md")"
   fi
+  # Active steering preferences (feature 260712, Task 3): render a compact,
+  # capped, scope-filtered digest of the operator's `prefer`-captured settings so
+  # a preference stated once is in force EVERY future session. Global prefs
+  # always inject; project-scoped prefs inject only in their resolved checkout
+  # (the canonical-slug normalizer maps $_proj_name -> KB slug); global-only when
+  # there is no project signal (never leak another project's prefs). A DERIVED
+  # artifact regenerated each session from the index — no MAIN.md bloat. Clean
+  # no-op (empty output) when there are no active captures.
+  _pref_digest="$("$REPO_ROOT/scripts/agentware" prefer digest --project "$_proj_name" 2>/dev/null || true)"
+  if [[ -n "$_pref_digest" ]]; then
+    CTX="$CTX
+$_pref_digest"
+  fi
 fi
 
 # Invocation-CWD context (feature invocation-cwd-context): when the operator
-# launched via an alias that sets AGENTWARE_INVOKED_FROM, resolve the enclosing
-# project/repo and inject it so agents know WHICH checkout the operator was
-# working in. Byte-identical no-op when the var is unset or nothing resolves.
-if [[ -n "${AGENTWARE_INVOKED_FROM:-}" ]]; then
-  _whereami_json="$("$REPO_ROOT/scripts/agentware" whereami --dir "$AGENTWARE_INVOKED_FROM" --format json 2>/dev/null || true)"
-  if [[ -n "$_whereami_json" ]]; then
-    _proj_name="$(printf '%s' "$_whereami_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("project_name",""))' 2>/dev/null || true)"
-    if [[ -n "$_proj_name" ]]; then
-      _proj_dir="$(printf '%s' "$_whereami_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("project_dir",""))' 2>/dev/null || true)"
-      _repo_root="$(printf '%s' "$_whereami_json" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("repo_root",""))' 2>/dev/null || true)"
-      CTX="$CTX
+# launched via an alias that sets AGENTWARE_INVOKED_FROM, inject the enclosing
+# project/repo (resolved once above) so agents know WHICH checkout the operator
+# was working in. Byte-identical no-op when the var is unset or nothing resolves
+# (_proj_name stays empty).
+if [[ -n "${AGENTWARE_INVOKED_FROM:-}" ]] && [[ -n "$_proj_name" ]]; then
+  CTX="$CTX
 AGENTWARE_INVOKED_FROM: project_name=$_proj_name project_dir=$_proj_dir repo_root=$_repo_root invoked_from=$AGENTWARE_INVOKED_FROM"
-    fi
-  fi
 fi
 
 if command -v jq >/dev/null 2>&1; then

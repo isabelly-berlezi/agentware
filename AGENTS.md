@@ -151,6 +151,13 @@ Every task runs this loop. Do not skip steps; do not stop until all subtasks are
 - ALWAYS follow the self-improvement skill (.claude/skills/self-improvement/SKILL.md) at end of task to promote learnings into durable knowledge. [R-SI-02]
 - NEVER emit a task-completion promise while any `> LEARNED:` marker in the worklog is unpromoted; promote each via scripts/agentware learn first, then confirm scripts/agentware worklog scan passes. [R-SI-03]
 
+## Steering capture
+
+- ALWAYS recognize a durable operator preference, correction, or design decision stated in conversation and RUN the steering-capture verb IMMEDIATELY, applying the bar "would a future session behave differently knowing this?"; NEVER capture silently and NEVER capture conversational noise. [R-CAP-01]
+- MUST capture through the steering-capture verb as a `source=user`, `preference`-tagged knowledge entry scoped to the canonical project key (global when there is no project signal), and acknowledge in exactly one line of the form `captured: <what> -> <where>`. [R-CAP-02]
+- NEVER let a capture touch a kernel path (`scripts/agentware`, `.claude/**`, `steering/**`, `AGENTS.md`, `agentware.sh`, hooks) or weaken a governance gate; the verb REFUSES such a capture in code (nonzero exit, no write) and routes the operator to the human-authored self-extension path. [R-CAP-03]
+- ALWAYS supersede a contradicting prior capture by exact key instead of appending a duplicate; captured preferences inject into every future session, scoped to their resolved project. [R-CAP-04]
+
 ## Autonomous decisions
 
 - IF new info surfaces mid-task bearing on a choice within the plan's goal and criteria THEN weigh options and decide; NEVER stop for it. [R-AUTO-01]

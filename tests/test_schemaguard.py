@@ -57,6 +57,13 @@ _GROUND_TRUTH_WRITERS = {
     "cmd_index_add", "cmd_index_remove", "cmd_index_sync", "cmd_index_rebuild",
     "cmd_index_migrate",
     "cmd_learn", "cmd_decide", "cmd_ingest",
+    # steering-capture verb (260712-steering-capture, Task 2): sugar over
+    # cmd_learn(--source user) + cmd_index_remove, but the predispatch gate keys
+    # on the dispatched args.func, so it MUST be registered by func name.
+    "cmd_prefer",
+    # steering-capture approve (260712, Task 7): a distinct dispatched func that
+    # mutates prefer-queue state (proposed -> approved) — registered by func name.
+    "cmd_prefer_approve",
     "cmd_plan_new", "cmd_plan_add_task", "cmd_plan_set_state",
     "cmd_plan_set_status", "cmd_plan_claim", "cmd_plan_state_backfill",
     "cmd_features", "cmd_skill_add", "cmd_skill_remove",
@@ -199,11 +206,13 @@ class SchemaGuardTest(unittest.TestCase):
 
     def test_schemaguard_autoapply_excludes_dualmode_and_runner(self):
         # Auto-apply excludes the migration-runner verb (double-run) AND the
-        # dual-mode dream (its --dry-run must not write .schema).
+        # dual-mode verbs whose read-only path must never write .schema: cmd_dream
+        # (--dry-run) and cmd_prefer (digest/list/scan-queue run at session-start /
+        # Stop-hook time). All three still carry version-refusal via the superset.
         superset = self.m._kb_writer_funcs()
         autoapply = self.m._kb_autoapply_funcs()
         self.assertEqual({f.__name__ for f in (superset - autoapply)},
-                         {"cmd_plan_state_backfill", "cmd_dream"})
+                         {"cmd_plan_state_backfill", "cmd_dream", "cmd_prefer"})
 
     def test_schemaguard_dream_registered_but_not_autoapply(self):
         reg = {f.__name__ for f in self.m._kb_writer_funcs()}

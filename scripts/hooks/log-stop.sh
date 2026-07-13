@@ -20,13 +20,25 @@ KDIR="$("$REPO_ROOT/scripts/aw-knowledge-dir" 2>/dev/null || true)"
 if [[ -n "$KDIR" ]]; then LOG_DIR="$KDIR/logs"; else LOG_DIR="$REPO_ROOT/.agentware-logs"; fi
 
 input="$(cat)"
-sid="unknown"; tpath=""
+sid="unknown"; tpath=""; cwd=""
 if command -v jq >/dev/null 2>&1; then
   sid="$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null)"
   tpath="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null)"
+  cwd="$(printf '%s' "$input" | jq -r '.cwd // empty' 2>/dev/null)"
 fi
 
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Layer-2 steering-capture producer (feature 260712-steering-capture, Task 5):
+# a CHEAP regex scan of this session's NEW origin=human turns in prompts.log,
+# appending inert candidates to logs/steering/prefer-queue.jsonl for the OFFLINE
+# dream drain to classify. Watermark-idempotent; best-effort so it can NEVER
+# fail the Stop hook (no stdout, errors swallowed). Skipped pre-onboarding
+# (no external KB).
+if [[ -n "$KDIR" && "$sid" != "unknown" ]]; then
+  "$REPO_ROOT/scripts/agentware" prefer scan-queue \
+    --sid "$sid" --cwd "$cwd" >/dev/null 2>&1 || true
+fi
 
 render() {  # render() <src.jsonl> <dst.md>  (best-effort; jsonl is source of truth)
   if command -v python3 >/dev/null 2>&1; then

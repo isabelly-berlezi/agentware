@@ -33,7 +33,8 @@ class DreamPkgRetireTests(unittest.TestCase):
         labels = [l for _s, l, _f in self.mod.DREAM_STEP_FUNCS]
         self.assertNotIn("0", steps)
         self.assertNotIn("pkg-pull", labels)
-        self.assertEqual(steps, ["1", "2", "a", "b", "c", "d", "e", "f"])
+        # "g" (prefer-classify, 260712 Task 7) runs before the final kb-git-commit.
+        self.assertEqual(steps, ["1", "2", "a", "b", "c", "d", "e", "g", "f"])
 
     def test_retired_functions_removed(self):
         for name in ("_dream_step_pkg_pull", "_dream_pkg_syntax_check",

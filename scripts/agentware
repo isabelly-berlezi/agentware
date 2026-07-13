@@ -4309,6 +4309,869 @@ def cmd_decide(args):
     return 0
 
 
+# --- Steering capture: the `prefer` verb (feature 260712-steering-capture) ----
+# Say a durable preference ONCE; it is captured as ONE `source: user`,
+# `preference`-tagged learning (scoped by the canonical project key from
+# `_canonical_project_key`, Task 1) and is in force every future session (the
+# session-start injection, Task 3). This is LAYER 1 of the 3-layer capture spine
+# (decide-self-correction-governance-tiers): every governance boundary is a CODE
+# check enforced BEFORE any write.
+#
+# Offline-first: exactly ONE write + one exact-key supersede — no mid-task
+# recall/learn churn, no semantic dedup (that heavy work is the OFFLINE dream
+# miner, P2c). The verb is pure sugar over `cmd_learn(--source user)` +
+# `cmd_index_remove`; it writes ONLY through those already-index-guarded paths and
+# NEVER mutates a package/kernel path. It is still registered in
+# `_kb_writer_funcs()` REGARDLESS of "pure sugar" — the predispatch gate keys on
+# the DISPATCHED `args.func`, so a `cmd_prefer` that delegates in-process to
+# `cmd_learn` would otherwise be UNGUARDED on a newer/migrated KB.
+
+_PREF_MIN_TOKENS = 3
+
+# (a) Noise bar — a deterministic admission predicate answering "would a future
+# session behave differently knowing this?". Reject empties, pure interrogatives,
+# greetings/acks, and anything with no preference/imperative cue.
+_PREF_NOISE_PHRASES = frozenset((
+    "hi", "hello", "hey", "yo", "thanks", "thank you", "ty", "ok", "okay", "k",
+    "cool", "nice", "great", "got it", "sounds good", "yes", "no", "yep", "nope",
+    "sure", "please", "done", "good", "np", "lol",
+))
+_PREF_CUE_RE = re.compile(
+    r"\b(always|never|prefer(?:s|red|ence)?|by default|default to|from now on|"
+    r"going forward|make sure|do not|don'?t|dont|should|must|avoid|ensure|use|"
+    r"keep|no longer|i (?:want|like|prefer|need)|we (?:want|use|prefer))\b",
+    re.I)
+
+# (c) Tighten-not-loosen — a pinned denylist of gate-WEAKENING intents. A capture
+# may TIGHTEN but NEVER LOOSEN a governance gate; a match is REFUSED (no write)
+# and routed to the human-authored self-extension path. Deterministic NL: require
+# BOTH a loosen verb AND a gate noun (a plain tightening pref like "always run the
+# verify gate" has no loosen verb, so it is admitted).
+_PREF_LOOSEN_VERB_RE = re.compile(
+    r"\b(skip|skips|skipping|disabl\w*|bypass\w*|ignor\w*|optional|turn off|"
+    r"no longer run|stop running|don'?t run|do not run|without running|relax\w*|"
+    r"weaken\w*|loosen\w*)\b", re.I)
+_PREF_GATE_NOUN_RE = re.compile(
+    r"\b(verif\w*|gate|gates|lint|linter|eval\w*|acceptance|"
+    r"R-[A-Z]+-\d+)\b", re.I)
+
+
+def _pref_is_capturable(text):
+    """(a) noise bar — True iff `text` is a durable, future-affecting preference."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    if low.rstrip("!.").strip() in _PREF_NOISE_PHRASES:
+        return False
+    if low.endswith("?"):                        # pure interrogative
+        return False
+    if len(low.split()) < _PREF_MIN_TOKENS:
+        return False
+    return bool(_PREF_CUE_RE.search(low))
+
+
+def _pref_hits_kernel(text):
+    """(b) kernel-path refusal — True iff `text` names any kernel/package path,
+    INCLUDING a bare kernel basename (AGENTS.md, steering, agentware.sh) that the
+    '/'-filtered `_text_hits_kernel_path` is deliberately blind to. Tokenize the
+    text (strip wrapping quotes/brackets + trailing punctuation) and run the
+    per-token `_has_kernel_path_segment` in ADDITION to the path-shaped scan."""
+    if not text:
+        return False
+    if _text_hits_kernel_path(text):
+        return True
+    for raw_tok in text.split():
+        tok = raw_tok.strip("\"'`()[]{}<>|").rstrip(".,;:!?")
+        if tok and _has_kernel_path_segment(tok):
+            return True
+    return False
+
+
+def _pref_loosens_gate(text):
+    """(c) tighten-not-loosen — True iff `text` reads as WEAKENING a gate."""
+    if not text:
+        return False
+    return bool(_PREF_LOOSEN_VERB_RE.search(text)
+                and _PREF_GATE_NOUN_RE.search(text))
+
+
+def _current_project_signal():
+    """The checkout's project_name (for the Task-1 normalizer), or None. Uses the
+    SAME resolution as `whereami`: AGENTWARE_INVOKED_FROM if set, else CWD."""
+    start = os.environ.get("AGENTWARE_INVOKED_FROM") or os.getcwd()
+    return _resolve_context(start).get("project_name") or None
+
+
+def _prefer_delete_entry(kdir, eid):
+    """Drop a captured preference: remove it from the index via the guarded
+    `cmd_index_remove` AND unlink its orphaned `.md`. Returns
+    (removed_entry_or_None, err_or_None); a MISSING id is (None, None) — not an
+    error — so the exact-key supersede is a no-op on the first capture."""
+    data, err = load_index(kdir)
+    if err is not None:
+        return None, err
+    match = next((e for e in (data.get("entries") or [])
+                  if isinstance(e, dict) and e.get("id") == eid), None)
+    if match is None:
+        return None, None
+    ns = argparse.Namespace(id=eid, format="json")
+    with open(os.devnull, "w", encoding="utf-8") as _dn, \
+            contextlib.redirect_stdout(_dn):
+        rc = cmd_index_remove(ns)
+    if rc != 0:
+        return None, "failed to remove index entry '%s'" % eid
+    path = match.get("path")
+    if path:
+        try:
+            os.remove(os.path.join(kdir, path))
+        except OSError:
+            pass
+    return match, None
+
+
+def _prefer_capture(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    text = (getattr(args, "text", None) or "").strip()
+
+    # The REFUSALS run BEFORE the noise bar: a capture naming a kernel/package
+    # path or weakening a gate is REFUSED with a nonzero exit even if it lacks a
+    # preference cue (never silently swallowed as "noise").
+    # (b) kernel-path refusal — nonzero, NO write.
+    if _pref_hits_kernel(text):
+        sys.stderr.write(
+            "agentware: refusing to capture — this names a kernel/package path "
+            "(%s). Package changes go through the human-authored self-extension "
+            "plan path, never a captured preference.\n"
+            % ", ".join(_KERNEL_PATH_TOKENS))
+        return 1
+    # (c) tighten-not-loosen — nonzero, NO write.
+    if _pref_loosens_gate(text):
+        sys.stderr.write(
+            "agentware: refusing to capture — a preference may TIGHTEN but never "
+            "LOOSEN a governance gate. Route a gate change through the human-"
+            "authored self-extension path.\n")
+        return 1
+    # (a) noise bar — nothing-captured, exit 0, ZERO writes.
+    if not _pref_is_capturable(text):
+        print("nothing captured: not a durable preference — say what a future "
+              "session should always/never do (e.g. \"always pin dependency "
+              "versions\").")
+        return 0
+
+    # Scope: --global forces global; --project <slug> scopes explicitly; else
+    # auto-resolve the checkout via the Task-1 normalizer, else GLOBAL (Q4).
+    if getattr(args, "scope_global", False):
+        proj = None
+    elif getattr(args, "project", None):
+        proj = _slugify(args.project) or None
+        # Never silently mis-scope (Q4): the session-start injection filter resolves
+        # a project scope ONLY to an existing projects/<slug>/ dir, so an explicit
+        # --project with no matching KB project would be captured yet NEVER injected
+        # (a silently-dead pref). Warn instead of accepting the dead scope; still
+        # capture so an operator MAY pre-scope a project they are about to register.
+        if proj and _canonical_project_key(kdir, proj) is None:
+            sys.stderr.write(
+                "agentware: warning — no KB project 'projects/%s/' exists; this "
+                "preference is captured but will NOT inject until that project is "
+                "registered (or re-capture with --global).\n" % proj)
+    else:
+        proj = _canonical_project_key(kdir, _current_project_signal())
+
+    # Exact supersede key: explicit --key, else the slugified preference text.
+    # Disambiguate on TRUNCATION: a bare 60-char cap lets two DISTINCT long
+    # preferences that merely share a 60-char slug prefix collapse to the SAME eid,
+    # so the exact-key supersede below would silently DELETE the unrelated prior
+    # capture (data loss). Append a stable short digest of the FULL key whenever the
+    # slug is actually truncated, so distinct texts never collide while short prefs
+    # keep their clean, human-readable id (and identical text/--key still supersede).
+    raw_key = getattr(args, "key", None) or text
+    _full_slug = _slugify(raw_key)
+    keyslug = (_full_slug[:60]).strip("-") or "pref"
+    if len(_full_slug) > 60:
+        _kh = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:8]
+        keyslug = ("%s-%s" % (keyslug, _kh)).strip("-")
+    scope_slug = proj or "global"
+    topic = "pref-%s-%s" % (scope_slug, keyslug)
+    eid = "learn-%s" % topic
+
+    # One exact-key supersede: drop a prior capture under the SAME key so a
+    # contradicting re-capture REPLACES rather than stacks (offline-first).
+    _removed, err = _prefer_delete_entry(kdir, eid)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    tags = ["preference"]
+    if proj:
+        tags.append("project-%s" % proj)
+    for t in (parse_tags(getattr(args, "tags", None)) or []):
+        if t not in tags:
+            tags.append(t)
+
+    body = ("%s\n\nOperator steering preference (source: user, scope: %s). "
+            "Captured once via the steering-capture verb; in force every future "
+            "session.\n" % (text, scope_slug))
+    ns = argparse.Namespace(
+        topic=topic, summary=text, tags=",".join(tags), content=body,
+        source="user", author=None, title=None, force=True, format="json")
+    with open(os.devnull, "w", encoding="utf-8") as _dn, \
+            contextlib.redirect_stdout(_dn):
+        rc = cmd_learn(ns)
+    if rc != 0:
+        return rc
+    # Ack contract: exactly `captured: <what> -> <where>` (the resolved KB id).
+    print("captured: %s -> %s" % (text, eid))
+    return 0
+
+
+def _prefer_list(args):
+    """Audit surface: the captured preferences (wraps `query --tag preference`)."""
+    ns = argparse.Namespace(
+        id=None, path=None, tag="preference", category=None,
+        depends_on=None, impact=None, relates=None, depth=1,
+        format=getattr(args, "format", "text"))
+    return cmd_query(ns)
+
+
+def _prefer_forget(args):
+    """Reversible revoke: remove a captured preference by id + unlink its file."""
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    eid = args.id
+    removed, err = _prefer_delete_entry(kdir, eid)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+    if removed is None:
+        sys.stderr.write(
+            "agentware: no captured preference with id '%s'\n" % eid)
+        return 1
+    path = removed.get("path") or "(no file)"
+    print("forgot: %s (unlinked %s) — reversible: re-capture to restore."
+          % (eid, path))
+    return 0
+
+
+# Layer-2 PRODUCER (Task 5): a CHEAP Stop-hook regex scan over origin=human turns
+# in logs/prompts.log that appends INERT preference-shaped CANDIDATES to a
+# producer-agnostic queue (logs/steering/prefer-queue.jsonl). Constraints:
+#   * regex APPEND only — NO recall / learn / embedding / classify (offline-first
+#     + the ~30s Stop budget). All heavy work is the OFFLINE dream drain (Task 7).
+#   * records are DATA-ONLY: never auto-applied, never interpolated into a Verify
+#     or any executable line (R-SEC-02 applies to our OWN logs, not just the web).
+#   * atomic, flock-serialized append (concurrent sessions + the dream drain share
+#     the file) + a per-session byte-offset WATERMARK so each human turn is queued
+#     AT MOST ONCE and each Stop scans only NEW bytes, never re-walking the whole
+#     cross-session prompts.log.
+# The schema below is the SHARED CONTRACT: the P2c transcript miner drops in as a
+# SECOND producer writing the same record shape, with zero drain rework (Q5).
+PREFER_QUEUE_REL = "logs/steering/prefer-queue.jsonl"
+PREFER_QUEUE_CURSOR_REL = "logs/steering/.prefer-queue.cursor.json"
+PREFER_QUEUE_PRODUCER = "stop-hook-regex"
+
+# The layer-2 producer cue — DELIBERATELY broader/cheaper than the capture-time
+# `_PREF_CUE_RE`: a human turn matching any of these phrases is a CANDIDATE for
+# offline classification, never an auto-capture. Case-insensitive, anchored.
+_PREFER_QUEUE_RE = re.compile(
+    r"\b(always|never|from now on|going forward|prefer|"
+    r"do not ever|make sure to|by default)\b", re.IGNORECASE)
+
+# prompts.log record header (see scripts/hooks/log-prompt.sh):
+#   [ts] [session SID] [cwd CWD] [origin=O] [turn=T]
+_PROMPTS_HEADER_RE = re.compile(
+    r"^\[(?P<ts>[^\]]*)\] \[session (?P<sid>[^\]]*)\] \[cwd (?P<cwd>.*)\] "
+    r"\[origin=(?P<origin>[^\]]*)\] \[turn=(?P<turn>[^\]]*)\]\s*$")
+
+
+def _parse_prompts_records(text):
+    """Yield (header_dict, body_text) records from a prompts.log chunk.
+
+    A record STARTS at a header line; its body is every following line up to (not
+    including) the NEXT header line — robust to blank lines INSIDE a prompt body
+    (the log writes `prompt\n\n`, but a prompt may itself contain blank lines).
+    """
+    cur = None
+    body = []
+    for ln in (text or "").split("\n"):
+        m = _PROMPTS_HEADER_RE.match(ln)
+        if m:
+            if cur is not None:
+                yield cur, "\n".join(body).strip("\n")
+            cur = m.groupdict()
+            body = []
+        elif cur is not None:
+            body.append(ln)
+    if cur is not None:
+        yield cur, "\n".join(body).strip("\n")
+
+
+def _prefer_cand_fp(sid, turn_id, text):
+    """Stable candidate fingerprint for the dedup safety net (belt to the
+    watermark's braces): session + turn id + a hash of the normalized text."""
+    import hashlib
+    h = hashlib.sha1(((text or "").strip()).encode("utf-8")).hexdigest()[:12]
+    return "%s\x1f%s\x1f%s" % (sid or "", turn_id or "", h)
+
+
+def _prefer_queue_scan(kdir, sid, cwd, prompts_path=None):
+    """Layer-2 producer core. Append inert preference-shaped candidates for NEW
+    origin=human turns of session `sid` from prompts.log to the queue. Returns the
+    number of candidates appended. Best-effort and side-effect-safe: any error
+    leaves the queue + cursor untouched and returns 0 (a Stop hook must never
+    fail because of steering capture)."""
+    if not kdir or not sid:
+        return 0
+    logp = prompts_path or os.path.join(kdir, "logs", "prompts.log")
+    if not os.path.isfile(logp):
+        return 0
+    qpath = os.path.join(kdir, PREFER_QUEUE_REL)
+    cpath = os.path.join(kdir, PREFER_QUEUE_CURSOR_REL)
+    try:
+        os.makedirs(os.path.dirname(qpath), exist_ok=True)
+    except OSError:
+        return 0
+
+    import fcntl
+    lockp = qpath + ".lock"
+    try:
+        lf = open(lockp, "a+")
+    except OSError:
+        return 0
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        lf.close()
+        return 0
+    try:
+        # Per-session byte-offset watermark: scan only [cursor, EOF).
+        cursors = {}
+        try:
+            with open(cpath, encoding="utf-8") as cf:
+                cursors = json.load(cf) or {}
+        except (OSError, ValueError):
+            cursors = {}
+        if not isinstance(cursors, dict):
+            cursors = {}
+        start = 0
+        try:
+            start = int(cursors.get(sid, 0) or 0)
+        except (TypeError, ValueError):
+            start = 0
+        fsize = os.path.getsize(logp)
+        if start < 0 or start > fsize:
+            start = 0   # log rotated/truncated -> rescan from the top
+        with open(logp, "rb") as lf2:
+            lf2.seek(start)
+            raw = lf2.read()
+        end = start + len(raw)
+        chunk = raw.decode("utf-8", "replace")
+
+        # Dedup safety net: fingerprints already queued (any producer).
+        seen = set()
+        if os.path.isfile(qpath):
+            try:
+                with open(qpath, encoding="utf-8") as qf:
+                    for line in qf:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except ValueError:
+                            continue
+                        seen.add(_prefer_cand_fp(
+                            rec.get("sid"), rec.get("turn_id"), rec.get("text")))
+            except OSError:
+                seen = set()
+
+        out_lines = []
+        for hdr, bodytext in _parse_prompts_records(chunk):
+            if hdr.get("sid") != sid:
+                continue
+            if hdr.get("origin") != "human":
+                continue
+            body = (bodytext or "").strip()
+            if not body:
+                continue
+            m = _PREFER_QUEUE_RE.search(body)
+            if not m:
+                continue
+            turn_id = hdr.get("turn") or ""
+            fp = _prefer_cand_fp(sid, turn_id, body)
+            if fp in seen:
+                continue
+            seen.add(fp)
+            cwd_val = hdr.get("cwd") or cwd or ""
+            sig = None
+            if cwd_val:
+                try:
+                    sig = _resolve_context(cwd_val).get("project_name") or None
+                except Exception:
+                    sig = None
+            proj = _canonical_project_key(kdir, sig)
+            rec = {
+                "ts": _now_iso(),
+                "sid": sid,
+                "cwd": cwd_val,
+                "project": proj,          # canonical KB slug (Task 1) or None
+                "turn_id": turn_id,
+                "text": body,             # INERT data — never executed/interpolated
+                "matched_pattern": m.group(0).lower(),
+                "status": "queued",
+                "producer": PREFER_QUEUE_PRODUCER,
+            }
+            out_lines.append(json.dumps(rec, ensure_ascii=False))
+
+        if out_lines:
+            with open(qpath, "a", encoding="utf-8") as qf:
+                qf.write("\n".join(out_lines) + "\n")
+        # Advance the watermark to EOF unconditionally so scanned-but-unmatched
+        # turns are never re-walked (idempotent across consecutive Stops).
+        cursors[sid] = end
+        _atomic_write(cpath, json.dumps(cursors, ensure_ascii=False))
+        return len(out_lines)
+    except Exception:
+        return 0
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lf.close()
+
+
+def _prefer_scan_queue(args):
+    """CLI wrapper for the layer-2 producer (invoked by the Stop hook). Prints a
+    one-line summary; ALWAYS exits 0 (the Stop hook must not fail on capture)."""
+    kdir = resolve_knowledge_dir()
+    if not kdir or not os.path.isdir(kdir):
+        return 0
+    n = _prefer_queue_scan(
+        kdir,
+        getattr(args, "sid", None) or "",
+        getattr(args, "cwd", None) or "",
+        prompts_path=getattr(args, "prompts", None) or None)
+    print("prefer scan-queue: %d candidate(s) queued" % n)
+    return 0
+
+
+# Layer-3 CONSUMER (Task 7): the OFFLINE dream drain of the producer-agnostic
+# prefer-queue. Deterministic governance-tier classification (NO LLM, NO network,
+# NO clock in the decision) routes each queued candidate:
+#   * tier 3 — a kernel-path OR gate-loosening candidate (reusing the Task-2
+#     `_pref_hits_kernel` combined scan, incl. BARE basenames, + `_pref_loosens_
+#     gate`) is REJECTED, prose-report only, NEVER emitted;
+#   * tier 2 — a genuine behavioral preference EMITS a suggested workorder via the
+#     EXISTING `plan new --auto` emitter (never a parallel emitter), the candidate
+#     text quoted through the Task-6 `--context` seam (fenced in Context ONLY);
+#     the candidate goes `status: proposed` pending explicit `prefer approve`;
+#   * tier 0/1 — a structurally-inert candidate (matched the broad queue cue but
+#     is below the capture noise bar) is auto-journaled (no workorder, no capture).
+# Idempotent: only `status: queued` records are processed, so re-runs NEVER
+# double-emit. g3 draft-cap aware: a tier-2 candidate that would exceed
+# WORKORDER_DRAFT_CAP is DEFERRED (left queued, not dropped). Mined text is NEVER
+# auto-activated as a source=user preference — that stays an explicit operator
+# `prefer approve` -> run of the reviewed workorder (Q3).
+PREFER_CLASSIFY_REPORT_REL = "logs/steering/prefer-classify-latest.md"
+
+
+def _prefer_classify_tier(text):
+    """Deterministic governance tier for a queue candidate: 3 (reject), 2
+    (suggested workorder), or 1 (journal-only). tier-3 mirrors the Task-2 verb
+    refusals — the combined `_pref_hits_kernel` (path-shaped AND bare-basename)
+    scan plus `_pref_loosens_gate` — so a bare kernel/gate candidate can NEVER be
+    emitted tier-2; tier-2 requires passing the same capture noise bar the verb
+    uses; everything else is inert (tier 1)."""
+    if _pref_hits_kernel(text) or _pref_loosens_gate(text):
+        return 3
+    if _pref_is_capturable(text):
+        return 2
+    return 1
+
+
+def _prefer_emit_workorder(kdir, text, fp):
+    """Emit a suggested workorder for a tier-2 candidate through the EXISTING
+    `plan new --auto` emitter (never a parallel emitter). The candidate text is
+    quoted via the Task-6 `--context` seam (g1 kernel refusal + sanitize + fenced
+    in Context, never a Verify/executable line). Returns (feature, None) on
+    success or (None, reason) on a nonzero emitter exit (e.g. the g3 draft cap) so
+    the caller DEFERS the candidate (leaves it queued). The slug embeds the
+    candidate fingerprint so re-processing the SAME candidate is a stable no-op."""
+    import hashlib
+    keyslug = (_slugify(text or "")[:40]).strip("-") or "pref"
+    h = hashlib.sha1((fp or text or "").encode("utf-8")).hexdigest()[:10]
+    slug = "pref-%s-%s" % (keyslug, h)
+    ns = argparse.Namespace(
+        feature=slug, title="Review captured steering preference candidate",
+        auto=True, self_extension=False,
+        generated_by="dream-prefer-classify",
+        trigger=("steering candidate drained from the prefer-queue "
+                 "(tier-2 behavioral preference)"),
+        evidence="prefer-queue candidate fingerprint %s" % h,
+        target=None, context=text, force=False,
+        max_iterations=30, author=None, format="json")
+    rc, out = _dream_capture(cmd_plan_new, ns)
+    if rc != 0:
+        return None, "emitter refused (rc=%d)" % rc
+    try:
+        feature = json.loads(out).get("feature") or ("auto/" + slug)
+    except ValueError:
+        feature = "auto/" + slug
+    return feature, None
+
+
+def _render_prefer_classify_report(recs, proposed_now, rejected_now,
+                                   journaled_now, deferred_now):
+    """Deterministic, report-only surface for the drain. FINAL-state sections
+    (byte-stable across idempotent re-runs) plus the this-run action counts. No
+    clocks / run-ids in the body (INV-1)."""
+    proposed = [r for r in recs if r.get("status") == "proposed"]
+    rejected = [r for r in recs if r.get("status") == "rejected"]
+    journaled = [r for r in recs if r.get("status") == "journaled"]
+    queued = [r for r in recs if r.get("status") == "queued"]
+
+    def _first(t):
+        t = (t or "").strip()
+        return t.splitlines()[0] if t else ""
+
+    lines = [
+        "# Prefer-queue classify report (latest)",
+        "",
+        "> Deterministic OFFLINE drain of logs/steering/prefer-queue.jsonl by",
+        "> governance tier. Report-only; mined candidates are NEVER auto-activated",
+        "> as source=user preferences — a tier-2 proposal becomes active only when",
+        "> the operator runs its workorder after `prefer approve`.",
+        "",
+        "> this run: proposed=%d rejected=%d journaled=%d deferred=%d"
+        % (proposed_now, rejected_now, journaled_now, deferred_now),
+        "",
+        "## Proposed steering prefs awaiting approve (%d)" % len(proposed),
+        "",
+    ]
+    if proposed:
+        for r in sorted(proposed, key=lambda r: r.get("workorder") or ""):
+            wo = r.get("workorder") or "(unknown)"
+            lines.append("- %s — %s" % (wo, _first(r.get("text"))))
+            lines.append("  approve: `scripts/agentware prefer approve %s`" % wo)
+    else:
+        lines.append("_none_")
+    lines.append("")
+    lines.append("## Rejected — tier-3 kernel-path / gate-loosening (%d)"
+                 % len(rejected))
+    lines.append("")
+    if rejected:
+        for r in sorted(rejected, key=lambda r: _first(r.get("text"))):
+            lines.append("- %s" % _first(r.get("text")))
+    else:
+        lines.append("_none_")
+    lines.append("")
+    lines.append("## Journaled — tier-0/1 inert (%d)" % len(journaled))
+    lines.append("")
+    if journaled:
+        for r in sorted(journaled, key=lambda r: _first(r.get("text"))):
+            lines.append("- %s" % _first(r.get("text")))
+    else:
+        lines.append("_none_")
+    lines.append("")
+    lines.append("## Deferred — still queued (draft cap) (%d)" % len(queued))
+    lines.append("")
+    if queued:
+        for r in sorted(queued, key=lambda r: _first(r.get("text"))):
+            lines.append("- %s" % _first(r.get("text")))
+    else:
+        lines.append("_none_")
+    lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _prefer_classify_drain(kdir):
+    """Drain the prefer-queue by governance tier (see the block comment above).
+    Best-effort + flock-serialized (shares the producer's `.lock`); returns the
+    this-run action counts. Any error leaves the queue untouched and reports the
+    error status (the offline dream cycle must never hard-fail on capture)."""
+    base = {"status": "ok", "proposed": 0, "rejected": 0,
+            "journaled": 0, "deferred": 0}
+    if not kdir:
+        return dict(base, status="error", errors=["no knowledge dir"])
+    qpath = os.path.join(kdir, PREFER_QUEUE_REL)
+    if not os.path.isfile(qpath):
+        return base
+    import fcntl
+    lockp = qpath + ".lock"
+    try:
+        lf = open(lockp, "a+")
+    except OSError:
+        return dict(base, status="error", errors=["cannot lock queue"])
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        lf.close()
+        return dict(base, status="error", errors=["cannot lock queue"])
+    try:
+        recs = []
+        with open(qpath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    continue
+        proposed_n = rejected_n = journaled_n = deferred_n = 0
+        changed = False
+        for rec in recs:
+            if not isinstance(rec, dict) or rec.get("status") != "queued":
+                continue
+            text = rec.get("text")
+            tier = _prefer_classify_tier(text)
+            if tier == 3:
+                rec["status"] = "rejected"
+                rec["tier"] = 3
+                rejected_n += 1
+                changed = True
+            elif tier == 1:
+                rec["status"] = "journaled"
+                rec["tier"] = 1
+                journaled_n += 1
+                changed = True
+            else:  # tier 2 — emit a suggested workorder (cap-aware, defer-not-drop)
+                if _count_auto_open_workorders(kdir) >= WORKORDER_DRAFT_CAP:
+                    deferred_n += 1               # leave queued; retry next cycle
+                    continue
+                fp = _prefer_cand_fp(rec.get("sid"), rec.get("turn_id"), text)
+                feature, err = _prefer_emit_workorder(kdir, text, fp)
+                if err is not None:
+                    deferred_n += 1               # emitter refused -> stay queued
+                    continue
+                rec["status"] = "proposed"
+                rec["tier"] = 2
+                rec["workorder"] = feature
+                proposed_n += 1
+                changed = True
+        if changed:
+            _atomic_write(qpath, "\n".join(
+                json.dumps(r, ensure_ascii=False) for r in recs) + "\n")
+        body = _render_prefer_classify_report(
+            recs, proposed_n, rejected_n, journaled_n, deferred_n)
+        rpath = os.path.join(kdir, PREFER_CLASSIFY_REPORT_REL)
+        try:
+            os.makedirs(os.path.dirname(rpath), exist_ok=True)
+            with open(rpath, "w", encoding="utf-8") as rf:
+                rf.write(body)
+            report_rel = PREFER_CLASSIFY_REPORT_REL
+        except OSError:
+            report_rel = None
+        result = dict(base, proposed=proposed_n, rejected=rejected_n,
+                      journaled=journaled_n, deferred=deferred_n)
+        if report_rel:
+            result["report"] = report_rel
+        return result
+    except Exception as exc:
+        return dict(base, status="error", errors=[str(exc)])
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lf.close()
+
+
+def cmd_prefer_approve(args):
+    """`prefer approve <workorder>` — record the operator's approval of a
+    dream-proposed steering candidate by flipping its queue record proposed ->
+    approved. Approval = operator-run the emitted workorder through the normal
+    loop (Q3); this verb is the thin sugar that marks it approved (it never
+    auto-activates a source=user pref, and never claims/advances the plan state
+    for the loop). A dispatched STATE-MUTATING writer, so it is registered in
+    `_kb_writer_funcs()` (the predispatch gate keys on the dispatched
+    args.func)."""
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    target = (getattr(args, "id", None) or "").strip()
+    if not target:
+        sys.stderr.write("agentware: prefer approve requires a workorder id\n")
+        return 1
+    qpath = os.path.join(kdir, PREFER_QUEUE_REL)
+    if not os.path.isfile(qpath):
+        sys.stderr.write("agentware: no prefer-queue to approve from\n")
+        return 1
+    import fcntl
+    lockp = qpath + ".lock"
+    try:
+        lf = open(lockp, "a+")
+    except OSError:
+        sys.stderr.write("agentware: cannot lock the prefer-queue\n")
+        return 1
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        recs = []
+        with open(qpath, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recs.append(json.loads(line))
+                except ValueError:
+                    continue
+        hit = next((r for r in recs
+                    if r.get("status") == "proposed"
+                    and r.get("workorder") == target), None)
+        if hit is None:
+            sys.stderr.write(
+                "agentware: no proposed candidate with workorder '%s' — see "
+                "`prefer list` or the classify report\n" % target)
+            return 1
+        hit["status"] = "approved"
+        _atomic_write(qpath, "\n".join(
+            json.dumps(r, ensure_ascii=False) for r in recs) + "\n")
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lf.close()
+    feat = target[len("auto/"):] if target.startswith("auto/") else target
+    print("approved: %s — run it via the loop (e.g. ./agentware.sh %s) or claim "
+          "the workorder." % (target, feat))
+    return 0
+
+
+# Layer-1 ENFORCEMENT (Task 3): a compact, capped, scope-filtered digest of the
+# active captures, rendered fresh each session by `session-start.sh` from the
+# index (a DERIVED artifact — the toolkit stays sole writer, no MAIN.md bloat).
+_PREF_DIGEST_MAX = 20          # count cap (never inject an unbounded list)
+_PREF_DIGEST_CHAR_BUDGET = 1500  # soft total-char budget (mirrors recall discipline)
+
+
+def _pref_project_tags(entry):
+    """The `project-<slug>` scope slugs carried by a captured preference."""
+    return [t[len("project-"):] for t in (entry.get("tags") or [])
+            if t.startswith("project-")]
+
+
+def _pref_entry_is_user_source(kdir, entry):
+    """True iff a `preference`-tagged entry was captured with `source=user`.
+
+    The index does NOT persist `source` (it lives only in the entry's `.md`
+    frontmatter), so fall back to reading the frontmatter when the index entry
+    carries no `source`. This restricts the digest to the operator's own
+    `prefer` captures and EXCLUDES agent/imported `preference`-tagged learnings.
+    """
+    src = entry.get("source")
+    if src is None:
+        path = entry.get("path")
+        if path:
+            src = read_entry_frontmatter(os.path.join(kdir, path)).get("source")
+    return src == "user"
+
+
+def _pref_digest_entries(kdir, data, proj_slug):
+    """Active `source=user`, `preference`-tagged entries in scope for `proj_slug`.
+
+    Global captures (no `project-` tag) ALWAYS qualify; project-scoped captures
+    qualify ONLY when the resolved `proj_slug` matches one of their scope slugs.
+    When `proj_slug` is None (no project signal) only global captures qualify —
+    another project's prefs are NEVER leaked. Recency-sorted (newest first),
+    deterministic on (created, id).
+    """
+    out = []
+    for e in data.get("entries") or []:
+        if "preference" not in (e.get("tags") or []):
+            continue
+        if not _pref_entry_is_user_source(kdir, e):
+            continue
+        proj_tags = _pref_project_tags(e)
+        if proj_tags:
+            if proj_slug is None or proj_slug not in proj_tags:
+                continue
+        out.append(e)
+    out.sort(key=lambda e: (e.get("created") or "", e.get("id") or ""),
+             reverse=True)
+    return out
+
+
+def _render_pref_digest(entries):
+    """One-line-per-pref digest block; count- and char-capped. '' if empty."""
+    lines = []
+    used = 0
+    for e in entries:
+        if len(lines) >= _PREF_DIGEST_MAX:
+            break
+        summ = (e.get("summary") or "").strip()
+        summ = summ.splitlines()[0].strip() if summ else ""
+        if not summ:
+            continue
+        proj_tags = _pref_project_tags(e)
+        scope = proj_tags[0] if proj_tags else "global"
+        line = "- [%s] %s" % (scope, summ)
+        if lines and used + len(line) > _PREF_DIGEST_CHAR_BUDGET:
+            break
+        lines.append(line)
+        used += len(line)
+    if not lines:
+        return ""
+    header = ("----- active steering preferences (captured once via the "
+              "steering-capture verb; in force this session) -----")
+    return header + "\n" + "\n".join(lines) + "\n"
+
+
+def _prefer_digest(args):
+    """Render the active-preference digest for injection (Task 3).
+
+    Read-only: never mutates the KB. Silent no-op (empty output, exit 0) when
+    the KB is unreadable or has no active captures, so it can NEVER break session
+    start. `--project` is the raw checkout signal (whereami project_name); it is
+    normalized to the canonical KB slug via the Task-1 resolver, so an unknown
+    checkout falls back to GLOBAL-only (never mis-scoped, never leaked)."""
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 0
+    data, err = load_index(kdir)
+    if err or not data:
+        return 0
+    signal = (getattr(args, "project", None) or "").strip()
+    proj = _canonical_project_key(kdir, signal) if signal else None
+    text = _render_pref_digest(_pref_digest_entries(kdir, data, proj))
+    if text:
+        sys.stdout.write(text)
+    return 0
+
+
+def cmd_prefer(args):
+    """Steering-capture verb. `prefer capture <text>` writes ONE `source: user`,
+    `preference`-tagged learning (layer 1); `prefer digest` renders the injected
+    scope-filtered digest (layer-1 enforcement); `prefer list` / `prefer forget
+    <id>` are the audit + reversible-revoke surface. Every governance boundary is
+    a CODE check enforced before any write; the verb NEVER mutates a package/
+    kernel path. Registered in `_kb_writer_funcs()` (the gate keys on the
+    dispatched func)."""
+    subcmd = getattr(args, "prefer_command", None)
+    if subcmd == "capture":
+        return _prefer_capture(args)
+    if subcmd == "digest":
+        return _prefer_digest(args)
+    if subcmd == "list":
+        return _prefer_list(args)
+    if subcmd == "forget":
+        return _prefer_forget(args)
+    if subcmd == "scan-queue":
+        return _prefer_scan_queue(args)
+    if subcmd == "approve":
+        return cmd_prefer_approve(args)
+    sys.stderr.write(
+        "agentware: usage: prefer capture <text> [--global|--project SLUG] | "
+        "prefer digest [--project SIGNAL] | prefer list | prefer forget <id> | "
+        "prefer approve <workorder> | prefer scan-queue --sid SID --cwd CWD\n")
+    return 2
+
+
 # --- Ingestion connectors (deterministic, curated capture) -------------------
 # `agentware ingest` reads a LOCAL source artifact (a docs dir, or a local
 # `gh issue list --json ...` export) and transforms it into CANDIDATE learnings
@@ -4820,6 +5683,41 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 def _slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+def _canonical_project_key(kdir, project_name):
+    """Map a checkout signal to the canonical KB project slug, or None.
+
+    Input is the `whereami` project_name / directory basename (repo_root is
+    intentionally NOT used: index.json carries no structured checkout-path field,
+    so a repo_root lookup is not deterministically implementable). The KB project
+    lives at `projects/<slug>/` with entry id `project-<slug>`; the canonical key
+    is that `<slug>`.
+
+    Predicate is EXACT equality: `_slugify(project_name)` must equal an existing
+    `projects/<slug>/` directory name (case-sensitive, iterated so a
+    case-insensitive filesystem cannot widen the match). There is deliberately NO
+    prefix / substring / fuzzy fallback — a sibling-prefix checkout (`foo` vs slug
+    `foo-bar`) does NOT match. When there is no project signal, no projects dir,
+    or no exact match, return None meaning GLOBAL / unscoped, so a capture is
+    never silently mis-scoped (e.g. never defaulted to `agentware`).
+
+    Pure read-only lookup over the KB projects registry: no writes, no
+    schema-guard impact. This is the single canonical key shared by the capture
+    verb and the session-start preference filter.
+    """
+    if not kdir or not project_name or not str(project_name).strip():
+        return None
+    slug = _slugify(project_name)
+    if not slug:
+        return None
+    projects_dir = os.path.join(kdir, "projects")
+    if not os.path.isdir(projects_dir):
+        return None
+    for name in sorted(os.listdir(projects_dir)):
+        if name == slug and os.path.isdir(os.path.join(projects_dir, name)):
+            return slug
+    return None
 
 
 def promoted_ids(marker_text):
@@ -12944,6 +13842,13 @@ _PLAN_ACCEPT_PLACEHOLDER = "TODO: define the verifiable acceptance criteria"
 _KERNEL_PATH_TOKENS = (
     "scripts/agentware", "scripts/hooks", ".claude", "steering",
     "AGENTS.md", "CLAUDE.md", "agentware.sh",
+    # Bare hook basenames: the path-form `scripts/hooks/<x>` is caught by the
+    # `scripts/hooks` segment, but a BARE basename slips the segment matcher, so a
+    # capture/emit naming a hook file without a slash would NOT be refused despite
+    # R-CAP-03 fencing "hooks". These are exactly the files under scripts/hooks/.
+    "session-start.sh", "log-stop.sh", "log-prompt.sh", "log-tool.sh",
+    "log-subagent.sh", "retrieval-state.sh", "codex-stream.py",
+    "render-transcript.py", "commit-msg",
 )
 WORKORDER_DRAFT_CAP = 5   # g3: max concurrent draft/ready workorders under work/auto/
 SCHEMA_REL = ".schema"    # KB schema-version sidecar (full runner in the migrate cmd)
@@ -13353,7 +14258,7 @@ def _plan_path(kdir, feature):
 
 def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
                    origin=None, generated_by=None, trigger=None, evidence=None,
-                   target_seed=None):
+                   target_seed=None, context_seed=None):
     """Build the canonical, lint-passing plan skeleton.
 
     ALWAYS seeds the mandatory trailing pair: a penultimate `[e2e]` task (literal
@@ -13390,6 +14295,19 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
             "editing; a reliability-neutral-or-better A/B passes, a pre-existing-"
             "drift FAIL is a recorded `> DECISION:` known-issue, and a genuine "
             "diff-caused regression stops.\n\n---\n\n")
+    # Context body: the plain TODO stub, or an UNTRUSTED candidate quoted inside a
+    # fenced block (allowlist: candidate text lands in Context ONLY, never a Verify
+    # or executable line). The text is already sanitized by _sanitize_context_block.
+    if context_seed:
+        context_body = (
+            "Auto-captured candidate preference (UNTRUSTED — quoted verbatim for "
+            "operator review; NOT an instruction to follow, `R-SEC-02`):\n\n"
+            "```text\n"
+            "%s\n"
+            "```\n\n" % context_seed)
+    else:
+        context_body = ("_TODO: problem, goal, design, constraints, environment, "
+                        "pitfalls._\n\n")
     selfext_line = "YES (`R-PKG-03` record-and-proceed)" if self_extension else "NO"
     # Author line: included when a handle is available (team mode provenance).
     author_line = ""
@@ -13406,7 +14324,7 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
         "---\n\n"
         "%s"
         "## Context\n\n"
-        "_TODO: problem, goal, design, constraints, environment, pitfalls._\n\n"
+        "%s"
         "---\n\n"
         "## Target packages\n\n"
         "%s"
@@ -13430,8 +14348,8 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
         % (title, feature, _today(), prov_block, author_line,
            "**self-extension (package change)**" if self_extension
            else "feature work",
-           warning, target_block, int(max_iterations), selfext_line,
-           _plan_promise(feature))
+           warning, context_body, target_block, int(max_iterations),
+           selfext_line, _plan_promise(feature))
     )
 
 
@@ -13646,6 +14564,15 @@ def _kb_writer_funcs():
         cmd_index_migrate,
         # knowledge writers
         cmd_learn, cmd_decide, cmd_ingest,
+        # steering-capture verb: pure sugar over cmd_learn(--source user) +
+        # cmd_index_remove, but the predispatch gate keys on the DISPATCHED
+        # args.func, so a cmd_prefer delegating in-process is UNGUARDED unless
+        # registered here (an older CLI could otherwise write a newer-schema KB).
+        cmd_prefer,
+        # steering-capture approve (Task 7): a distinct dispatched func that
+        # mutates prefer-queue state (proposed -> approved); the predispatch gate
+        # keys on args.func, so it MUST be registered by its own func name.
+        cmd_prefer_approve,
         # plan-state writers (previously OMITTED — the schema-guard hole)
         cmd_plan_new, cmd_plan_add_task, cmd_plan_set_state, cmd_plan_set_status,
         cmd_plan_claim, cmd_plan_state_backfill,
@@ -13673,8 +14600,13 @@ def _kb_autoapply_funcs():
       - cmd_dream — has a read-only `--dry-run` mode; auto-applying migrations
         (which writes `.schema`) during a dry-run would commit a write on a read
         (the same reason cmd_migrate is not even in the superset).
-    Both still carry version-refusal via superset membership."""
-    return _kb_writer_funcs() - {cmd_plan_state_backfill, cmd_dream}
+      - cmd_prefer — DUAL-MODE: `prefer capture`/`approve`/`forget` write, but
+        `prefer digest`/`list`/`scan-queue` are READ-ONLY and run at session-start /
+        Stop-hook time (output swallowed). Auto-applying a migration there would turn
+        a session-start READ into a silent `.schema`+plan.md WRITE — the exact
+        read-triggers-write failure this exclusion set exists to prevent.
+    All still carry version-refusal via superset membership."""
+    return _kb_writer_funcs() - {cmd_plan_state_backfill, cmd_dream, cmd_prefer}
 
 
 def _kb_predispatch_gate(args):
@@ -13967,6 +14899,24 @@ def cmd_plan_new(args):
                 "complete some first)\n" % (open_wo, WORKORDER_DRAFT_CAP))
             return 1
 
+    # --context: UNTRUSTED caller-supplied candidate text (the Task-6 emit seam
+    # the dream classify drain feeds). g1 — refuse any candidate naming a kernel/
+    # package path, PATH-SHAPED tokens AND bare kernel basenames (`AGENTS.md`,
+    # `steering`, `agentware.sh`) that the '/'-filtered `_text_hits_kernel_path`
+    # is blind to — reusing the Task-2 `_pref_hits_kernel` combined scan. The
+    # sanitizer then neutralizes forged headers / fence-breakouts before the text
+    # is quoted into the Context section (allowlist: never a Verify/exec line).
+    context_seed = None
+    context_raw = getattr(args, "context", None)
+    if context_raw is not None:
+        if _pref_hits_kernel(context_raw):
+            sys.stderr.write(
+                "agentware: refusing --context that references a kernel path / the "
+                "agentware package — untrusted candidate text can never seed a "
+                "self-extension (g1)\n")
+            return 1
+        context_seed = _sanitize_context_block(context_raw)
+
     path = _plan_path(kdir, feature)
     if os.path.exists(path) and not getattr(args, "force", False):
         sys.stderr.write(
@@ -13979,7 +14929,8 @@ def cmd_plan_new(args):
                           getattr(args, "max_iterations", 30),
                           self_extension, author=author, origin=origin,
                           generated_by=generated_by, trigger=trigger,
-                          evidence=evidence, target_seed=target_seed)
+                          evidence=evidence, target_seed=target_seed,
+                          context_seed=context_seed)
     _atomic_write(path, text)
     if getattr(args, "format", "text") == "json":
         json.dump({"ok": True, "path": path, "feature": feature,
@@ -14134,6 +15085,78 @@ def _sanitize_provenance(value):
     while v.startswith(">"):
         v = v[1:].strip()
     return v
+
+
+# A header-shaped line the plan state machine parses. After stripping leading
+# '>' markers a residual `Status:`/`Claimed-by:`/`Superseded-by:` line can no
+# longer forge a header (the parsers all anchor on a leading '>'), but we
+# space-prefix it anyway (defense in depth) so it can never be re-promoted.
+_CTX_FORGED_HEADER_RE = re.compile(
+    r"^(Status|Claimed-by|Superseded-by|Origin|Generated-by|Trigger|Evidence)\s*:",
+    re.I)
+
+
+# The loop's authoritative open-marker grep (agentware.sh:508, mirrored by
+# `_PLAN_OPEN_MARKER_PY`) counts a task marker with only an OPENING `**`+digit — NO
+# closing `**` required — whereas the strict `_PLAN_TASK_LINE_RE` needs the closing
+# `**`. `_sanitize_context_block` must neutralize the LOOSE form too so an untrusted
+# candidate cannot smuggle a phantom open task the loop counts but the sanitizer misses.
+_CTX_LOOSE_TASK_RE = re.compile(r"^\s*-\s*(⬜|🟡|✅)\s*\*\*\d")
+
+
+def _sanitize_context_block(value):
+    """Sanitize UNTRUSTED candidate text (a mined preference) for embedding in a
+    plan's Context section as a fenced block — the emit-side counterpart to the
+    g1/g2/g3 guards. `_read_plan_status`/`_parse_claim` scan the WHOLE file and
+    are FENCE-UNAWARE, so a code fence alone is not a boundary; every line is
+    neutralized regardless:
+
+      * normalize EVERY exotic line separator via `str.splitlines()` (the exact
+        semantics every plan.md mutator round-trips through, so no residual
+        `\\x85`/`\\u2028`/`\\v`… survives to be re-split downstream into a forged
+        header — the same wedge `_sanitize_provenance` defends);
+      * strip leading blockquote `>` markers from every line so an embedded
+        `> Status: done` / `> Claimed-by: x@h` can NEVER survive as a real
+        header (count stays 1; every state transition still succeeds);
+      * defensively space-prefix any residual header-shaped line;
+      * neutralize code-fence delimiters (``` / ~~~) so the candidate can never
+        break OUT of its fence and inject markdown tasks/headers.
+
+    Multi-line STRUCTURE is preserved (unlike `_sanitize_provenance`, which
+    collapses to one line) because the block is rendered verbatim for review.
+    Returns '' for empty/None so the caller renders the plain TODO stub."""
+    if not value:
+        return ""
+    out = []
+    for line in value.splitlines():
+        s = line
+        # Strip leading blockquote markers, repeatedly (`> > Status:`).
+        while True:
+            t = s.lstrip()
+            if t.startswith(">"):
+                s = t[1:]
+                continue
+            break
+        s = s.rstrip()
+        if _CTX_FORGED_HEADER_RE.match(s.lstrip()):
+            s = " " + s.lstrip()
+        st = s.lstrip()
+        if st.startswith("```") or st.startswith("~~~"):
+            # Break the fence delimiter so content cannot escape its fence.
+            s = s.replace("`", "'").replace("~", "-")
+        # A fence-unaware parser would still see a task marker / Verify directive
+        # smuggled INSIDE the fence, so neutralize both: break the task-status
+        # glyph and the `*Verify:*` token so the candidate can never forge an
+        # executable/task line (the allowlist: Context prose only). Match BOTH the
+        # strict form (_PLAN_TASK_LINE_RE, closing `**`) AND the LOOSE form the
+        # loop's open_markers() grep counts (opening `**`+digit, NO closing `**`,
+        # `_CTX_LOOSE_TASK_RE`) — else `- ⬜ **9 do it` survives as a phantom open
+        # task the loop never sees reach 0 (completion detection wedged).
+        if _PLAN_TASK_LINE_RE.match(s) or _CTX_LOOSE_TASK_RE.match(s):
+            s = s.replace("⬜", "[ ]").replace("🟡", "[~]").replace("✅", "[x]")
+        s = _PLAN_VERIFY_RE.sub("*Verify :*", s)
+        out.append(s)
+    return "\n".join(out).strip("\n")
 
 
 def _read_plan_status(text):
@@ -17728,6 +18751,22 @@ def _dream_step_kb_git(kdir, dry_run):
     return result
 
 
+def _dream_step_prefer_classify(kdir, dry_run):
+    """Step g — OFFLINE layer-3 consumer (Task 7): drain the prefer-queue by
+    governance tier. tier-3 (kernel-path / gate-loosening) REJECTED; tier-2 emits
+    a suggested workorder via the EXISTING `plan new --auto` emitter (candidate
+    fenced in Context); tier-0/1 journaled. Idempotent (only status=queued
+    processed), g3 draft-cap defer-not-drop, and NEVER auto-activates mined text
+    as a source=user preference (that stays an explicit operator `prefer approve`
+    -> run). Runs BEFORE kb-git-commit so its queue/workorder changes are backed
+    up in the same cycle."""
+    if dry_run:
+        return {"status": "planned",
+                "would": "classify prefer-queue candidates -> reject/journal/"
+                         "suggested-workorder (proposed; never auto-active)"}
+    return _prefer_classify_drain(kdir)
+
+
 DREAM_STEP_FUNCS = (
     # Step "0" pkg-pull RETIRED (Task 13) — package updates are delegated to the
     # dedicated verified updater; dream never mutates REPO_ROOT.
@@ -17738,6 +18777,9 @@ DREAM_STEP_FUNCS = (
     ("c", "audit", _dream_step_audit),
     ("d", "eval-record", _dream_step_eval_record),
     ("e", "detect-report", _dream_step_detect_report),
+    # Layer-3 steering-capture consumer (260712, Task 7): drain BEFORE the nightly
+    # kb-git-commit so proposed workorders + queue transitions land in the backup.
+    ("g", "prefer-classify", _dream_step_prefer_classify),
     ("f", "kb-git-commit", _dream_step_kb_git),
 )
 
@@ -20823,9 +21865,10 @@ def cmd_update(args):
     return emit(payload, lines, rc)
 
 
-def cmd_whereami(args):
-    """Resolve the project/repo context for a directory (build-system-neutral)."""
-    start_dir = getattr(args, "dir", None) or os.environ.get("AGENTWARE_INVOKED_FROM") or os.getcwd()
+def _resolve_context(start_dir):
+    """Pure project/repo-context resolver (build-system-neutral). Walks up from
+    `start_dir` and returns {invoked_from, repo_root, project_name, project_dir}.
+    Shared by `cmd_whereami` and the steering-capture verb's auto-scope."""
     start_dir = os.path.abspath(os.path.expanduser(start_dir))
 
     result = {
@@ -20871,6 +21914,14 @@ def cmd_whereami(args):
         result["project_name"] = os.path.basename(result["repo_root"])
     if result["project_dir"] and not result["repo_root"]:
         result["repo_root"] = result["project_dir"]
+
+    return result
+
+
+def cmd_whereami(args):
+    """Resolve the project/repo context for a directory (build-system-neutral)."""
+    start_dir = getattr(args, "dir", None) or os.environ.get("AGENTWARE_INVOKED_FROM") or os.getcwd()
+    result = _resolve_context(start_dir)
 
     fmt = getattr(args, "format", "json")
     if fmt == "json":
@@ -21293,6 +22344,90 @@ def build_parser():
                           help="provenance author handle (default: the per-user "
                                "handle if set, else the operator handle)")
     p_decide.set_defaults(func=cmd_decide)
+
+    # prefer -----------------------------------------------------------------
+    # The steering-capture verb: say a durable preference ONCE. (The CLI
+    # subcommand is literally named `prefer`; the DSF steering lint bans that
+    # token only inside the always-loaded steering corpus — AGENTS.md / steering/
+    # / CLAUDE.md — not here, so the literal name is fine in the CLI.)
+    p_prefer = sub.add_parser(
+        "prefer",
+        help="capture a durable steering preference (say it once, it's in force "
+             "every future session)")
+    p_prefer.set_defaults(func=cmd_prefer)
+    prefer_sub = p_prefer.add_subparsers(dest="prefer_command",
+                                         metavar="<subcommand>")
+    p_pref_cap = prefer_sub.add_parser(
+        "capture", parents=[fmt_parent],
+        help="capture a preference as a source=user, preference-tagged entry")
+    p_pref_cap.add_argument("text", help="the preference, one line")
+    pref_scope = p_pref_cap.add_mutually_exclusive_group()
+    pref_scope.add_argument("--global", dest="scope_global", action="store_true",
+                            help="capture as a GLOBAL preference (all projects)")
+    pref_scope.add_argument("--project", default=None,
+                            help="scope to a KB project slug (default: auto-"
+                                 "resolve the checkout via the canonical "
+                                 "normalizer, else global)")
+    p_pref_cap.add_argument("--key", default=None,
+                            help="explicit supersede key (default: derived from "
+                                 "the text); a re-capture under the same key "
+                                 "supersedes rather than stacks")
+    p_pref_cap.add_argument("--tags", default=None,
+                            help="extra comma-separated tags ('preference' "
+                                 "auto-added)")
+    p_pref_cap.add_argument("--force", action="store_true",
+                            help="capture even if a near-duplicate exists")
+    p_pref_cap.set_defaults(func=cmd_prefer, prefer_command="capture")
+
+    p_pref_digest = prefer_sub.add_parser(
+        "digest",
+        help="render the scope-filtered active-preference digest that "
+             "session-start injects (read-only; global + resolved-project prefs)")
+    p_pref_digest.add_argument(
+        "--project", default=None,
+        help="the checkout signal (whereami project_name); normalized to the "
+             "canonical KB slug (unknown -> GLOBAL-only, never mis-scoped)")
+    p_pref_digest.set_defaults(func=cmd_prefer, prefer_command="digest")
+
+    p_pref_list = prefer_sub.add_parser(
+        "list", parents=[fmt_parent],
+        help="list captured preferences (the injection audit surface)")
+    p_pref_list.set_defaults(func=cmd_prefer, prefer_command="list")
+
+    p_pref_forget = prefer_sub.add_parser(
+        "forget", parents=[fmt_parent],
+        help="remove a captured preference by id (reversible: re-capture)")
+    p_pref_forget.add_argument("id", help="the preference entry id (learn-pref-…)")
+    p_pref_forget.set_defaults(func=cmd_prefer, prefer_command="forget")
+
+    # Layer-3 consumer (Task 7): approve a dream-proposed steering candidate —
+    # flip its queue record proposed -> approved (approval = operator-run the
+    # emitted workorder through the loop, Q3). Its own dispatched func so the
+    # schema-guard covers this state-mutating write.
+    p_pref_approve = prefer_sub.add_parser(
+        "approve",
+        help="approve a dream-proposed steering candidate by its workorder id "
+             "(operator-run the workorder to activate the preference)")
+    p_pref_approve.add_argument(
+        "id", help="the emitted workorder feature (auto/pref-…)")
+    p_pref_approve.set_defaults(func=cmd_prefer_approve, prefer_command="approve")
+
+    # Layer-2 producer (Task 5): the Stop hook invokes this to append inert
+    # preference-shaped candidates from origin=human turns in logs/prompts.log to
+    # logs/steering/prefer-queue.jsonl (watermark-idempotent, no auto-apply).
+    p_pref_scanq = prefer_sub.add_parser(
+        "scan-queue",
+        help="Stop-hook producer: queue preference-shaped human turns from "
+             "prompts.log (inert candidates; watermark-idempotent)")
+    p_pref_scanq.add_argument("--sid", default="",
+                              help="the current session id (queue is scoped/"
+                                   "watermarked per session)")
+    p_pref_scanq.add_argument("--cwd", default="",
+                              help="fallback checkout dir when a record omits cwd")
+    p_pref_scanq.add_argument("--prompts", default=None,
+                              help="prompts.log path (default: <kdir>/logs/"
+                                   "prompts.log; overridable for tests)")
+    p_pref_scanq.set_defaults(func=cmd_prefer, prefer_command="scan-queue")
 
     # ingest -----------------------------------------------------------------
     p_ingest = sub.add_parser(
@@ -21779,6 +22914,13 @@ def build_parser():
     p_plan_new.add_argument("--target", action="append", default=None,
                             help="[--auto] target directory (repeatable; default: "
                                  "the knowledge dir). Kernel paths are refused (g1).")
+    p_plan_new.add_argument(
+        "--context", default=None,
+        help="UNTRUSTED caller-supplied candidate text, quoted verbatim inside a "
+             "fenced block in the Context section ONLY (never a Verify/exec line). "
+             "Forged headers and fence-breakouts are neutralized; kernel-path "
+             "candidates are refused (g1). The emit seam the dream classify drain "
+             "uses for mined preferences.")
     p_plan_new.set_defaults(func=cmd_plan_new)
 
     p_plan_add = plan_sub.add_parser(
