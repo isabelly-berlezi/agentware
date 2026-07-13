@@ -6502,6 +6502,547 @@ def _prefer_seed_cursor_cli(args):
     return 0
 
 
+# ============================================================================
+# P2c (260713): the transcript miner — a SECOND, FULLY OFFLINE prefer-queue
+# producer behind the Stop-hook regex producer above. It mines the operator's
+# OWN corpus (logs/prompts.log, logs/sessions/*/live.jsonl, logs/metrics.jsonl)
+# for two durable signals — RECURRENCE (the same ask across >=N distinct
+# sessions) and ERROR-RECOVERY (a tool call that errored then succeeded) — and
+# writes the IDENTICAL queue record schema so the producer-agnostic drain
+# (_prefer_classify_drain) consumes mined candidates with ZERO rework and the
+# EXISTING governance tiers govern them. Nothing mined ever auto-activates as a
+# source=user preference (Q4). Extraction is FULLY DETERMINISTIC: normalized-
+# text hashing + tabulation only — NO LLM, NO network, NO wall-clock in any
+# mined decision (INV-1). The miner OWNS a per-corpus watermark + per-run caps
+# (never re-walks all sessions unbounded) and a bounded persistent recurrence
+# tally so cross-window recurrence is never lost. Best-effort (Q8): any fault
+# leaves the queue + state untouched and returns 0.
+MINER_STATE_REL = "logs/steering/.transcript-miner.state.json"  # miner's OWN state
+PREFER_QUEUE_MINER_PRODUCER = "transcript-miner"          # never the stop-hook value
+MINER_RECURRENCE_N = 2        # distinct-session near-dup asks that flag a recurrence
+MINER_SESSION_CAP = 50        # sessions walked per run (incremental + --backfill)
+MINER_TALLY_CAP = 2000        # persistent recurrence-tally keys (LRU-pruned)
+MINER_SOURCE_SESSIONS_CAP = 10  # bound on a candidate's source_sessions list
+
+
+def _transcript_norm_key(text):
+    """Deterministic near-dup key: lowercase, collapse internal whitespace, strip
+    surrounding punctuation. Empty for a non-str / blank body. No clock, no
+    randomness — two bodies differing only in whitespace/case collapse to one
+    key (Q2)."""
+    if not isinstance(text, str):
+        return ""
+    t = " ".join(text.split()).lower()
+    return t.strip(" \t\r\n.,;:!?-\"'`*_()[]{}<>")
+
+
+def _transcript_is_err_status(s):
+    """The live.jsonl error signal. log-tool.sh writes 'ERR' (not 'error'); accept
+    the real vocabulary AND common synonyms so the detector is forward-compatible
+    across producers (codex-stream, a future hook)."""
+    return str(s).strip().lower() in ("err", "error", "fail", "failed")
+
+
+def _transcript_is_ok_status(s):
+    return str(s).strip().lower() == "ok"
+
+
+def _transcript_file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _transcript_list_session_ids(kdir):
+    """Session ids on disk (dirs under logs/sessions/), or [] on error."""
+    sroot = os.path.join(kdir, "logs", "sessions")
+    try:
+        return [d for d in os.listdir(sroot)
+                if os.path.isdir(os.path.join(sroot, d))]
+    except OSError:
+        return []
+
+
+def _transcript_session_settled(sdir):
+    """Deterministic 'session done being written' signal: main.jsonl present
+    (Stop completed). A live.jsonl-only dir is an ACTIVE/orphan session -> NOT
+    settled -> re-mined next cycle (fp-dedup guards double-emit), so an error/fix
+    pair whose fix lands after this mine is never split across the watermark.
+
+    NOTE (verified live, R-FAIL-08): the plan's original 'terminal event for its
+    sid' signal is impossible — metrics.jsonl `terminal` events are FEATURE-keyed
+    with no sid. main.jsonl presence is the deterministic per-session substitute."""
+    return os.path.isfile(os.path.join(sdir, "main.jsonl"))
+
+
+def _transcript_default_state():
+    return {"offsets": {"prompts": 0, "metrics": 0},
+            "processed_sessions": [], "backfill_pending": [], "tally": {}}
+
+
+def _transcript_load_state(kdir):
+    """Load the miner's OWN state (DISTINCT from the Stop-hook cursor), or SEED a
+    fresh one on first run: offsets -> current tail, existing sessions marked
+    processed-for-incremental AND backfill-pending (so incremental mines only NEW
+    material thereafter — Q3 — and an explicit `prefer mine --backfill` drains the
+    history). Returns (state, fresh_bool); never raises. The session sets are
+    pruned to on-disk sids so state stays bounded by the live corpus."""
+    path = os.path.join(kdir, MINER_STATE_REL)
+    on_disk = set(_transcript_list_session_ids(kdir))
+    try:
+        with open(path, encoding="utf-8") as f:
+            st = json.load(f)
+        if not isinstance(st, dict):
+            raise ValueError("miner state is not an object")
+        offs = st.get("offsets")
+        if not isinstance(offs, dict):
+            offs = {}
+        st["offsets"] = {"prompts": int(offs.get("prompts") or 0),
+                         "metrics": int(offs.get("metrics") or 0)}
+        st["processed_sessions"] = sorted(
+            set(st.get("processed_sessions") or []) & on_disk)
+        st["backfill_pending"] = sorted(
+            set(st.get("backfill_pending") or []) & on_disk)
+        if not isinstance(st.get("tally"), dict):
+            st["tally"] = {}
+        return st, False
+    except (OSError, ValueError, TypeError):
+        st = _transcript_default_state()
+        st["offsets"]["prompts"] = _transcript_file_size(
+            os.path.join(kdir, "logs", "prompts.log"))
+        st["offsets"]["metrics"] = _transcript_file_size(
+            os.path.join(kdir, "logs", "metrics.jsonl"))
+        st["processed_sessions"] = sorted(on_disk)
+        st["backfill_pending"] = sorted(on_disk)
+        return st, True
+
+
+def _transcript_write_state(kdir, state):
+    """Persist the miner state atomically. NOT sort_keys'd: the tally dict order
+    IS the LRU order the prune relies on (state is gitignored + machine-local, so
+    byte-determinism is not required here — only mined candidates/reports are
+    byte-stable, INV-1)."""
+    _atomic_write(os.path.join(kdir, MINER_STATE_REL),
+                  json.dumps(state, ensure_ascii=False))
+
+
+def _transcript_read_live(path):
+    """Parse a session's live.jsonl into a list of record dicts (or [])."""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except OSError:
+        return []
+    return out
+
+
+def _transcript_mine_read(kdir, state, backfill, session_cap):
+    """PURE, bounded corpus read done OUTSIDE the flock (F5 — the expensive I/O).
+    Advances NOTHING; returns what to fold under the lock:
+      prompts    : [(sid, turn_id, body, cwd)] new origin=human turns since offset
+      metrics    : [event_dict] new metrics events since offset (triage context)
+      scanned    : [(sid, [live_records], settled_bool)] bounded session selection
+      new_offsets: {'prompts': int, 'metrics': int} EOF actually read up to
+      mode       : 'backfill' | 'incremental'
+    Best-effort: any OSError degrades that ONE source to empty. No clock/network.
+    A stored offset past EOF (log rotation/truncation) resets to 0 — fp-dedup
+    guards a re-emit."""
+    logs = os.path.join(kdir, "logs")
+    offs = state.get("offsets") or {}
+    session_cap = max(0, int(session_cap or MINER_SESSION_CAP))
+
+    # --- prompts.log (recurrence source): forward byte offset, origin=human ---
+    prompts = []
+    logp = os.path.join(logs, "prompts.log")
+    p_new = int(offs.get("prompts") or 0)
+    try:
+        start = int(offs.get("prompts") or 0)
+        fsize = os.path.getsize(logp)
+        if start < 0 or start > fsize:
+            start = 0
+        with open(logp, "rb") as f:
+            f.seek(start)
+            raw = f.read()
+        p_new = start + len(raw)
+        for hdr, body in _parse_prompts_records(raw.decode("utf-8", "replace")):
+            if hdr.get("origin") != "human":
+                continue
+            b = (body or "").strip()
+            if not b:
+                continue
+            prompts.append((hdr.get("sid") or "", hdr.get("turn") or "", b,
+                            hdr.get("cwd") or ""))
+    except OSError:
+        prompts, p_new = [], int(offs.get("prompts") or 0)
+
+    # --- metrics.jsonl (triage context): forward byte offset ---
+    metrics = []
+    mpath = os.path.join(logs, "metrics.jsonl")
+    m_new = int(offs.get("metrics") or 0)
+    try:
+        start = int(offs.get("metrics") or 0)
+        fsize = os.path.getsize(mpath)
+        if start < 0 or start > fsize:
+            start = 0
+        with open(mpath, "rb") as f:
+            f.seek(start)
+            raw = f.read()
+        m_new = start + len(raw)
+        for line in raw.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict):
+                metrics.append(ev)
+    except OSError:
+        metrics, m_new = [], int(offs.get("metrics") or 0)
+
+    # --- sessions/<sid>/live.jsonl (error-recovery source): bounded selection ---
+    on_disk = set(_transcript_list_session_ids(kdir))
+    processed = set(state.get("processed_sessions") or [])
+    pending = set(state.get("backfill_pending") or [])
+    if backfill:
+        cand_sids = sorted(pending & on_disk)          # historical drain
+    else:
+        cand_sids = sorted(on_disk - processed - pending)  # only NEW sessions
+    cand_sids = cand_sids[:session_cap]
+    scanned = []
+    for sid in cand_sids:
+        sdir = os.path.join(logs, "sessions", sid)
+        scanned.append((sid,
+                        _transcript_read_live(os.path.join(sdir, "live.jsonl")),
+                        _transcript_session_settled(sdir)))
+    return {"prompts": prompts, "metrics": metrics, "scanned": scanned,
+            "new_offsets": {"prompts": p_new, "metrics": m_new},
+            "mode": "backfill" if backfill else "incremental"}
+
+
+def _transcript_build_record(kdir, sid, turn_id, text, signal, cwd="",
+                             recurrence_count=None, source_sessions=None):
+    """Build a queue record with the IDENTICAL shared schema as the Stop-hook
+    producer (ts/sid/cwd/project/turn_id/text/matched_pattern/status/producer)
+    plus ADDITIVE fields (signal, recurrence_count, source_sessions). `text` is
+    stored VERBATIM as inert data (R-SEC-02) — never interpolated/executed. `ts`
+    is append-time (_now_iso, like the producer) — NOT a mined clock-in-a-decision;
+    determinism (INV-1) is scoped to the fp / text / tally, never ts."""
+    proj = None
+    if cwd:
+        try:
+            sig = _resolve_context(cwd).get("project_name") or None
+        except Exception:
+            sig = None
+        proj = _canonical_project_key(kdir, sig)
+    rec = {
+        "ts": _now_iso(),
+        "sid": sid or "",
+        "cwd": cwd or "",
+        "project": proj,
+        "turn_id": turn_id or "",
+        "text": text if isinstance(text, str) else "",
+        "matched_pattern": signal,
+        "status": "queued",
+        "producer": PREFER_QUEUE_MINER_PRODUCER,
+        "signal": signal,
+    }
+    if recurrence_count is not None:
+        rec["recurrence_count"] = int(recurrence_count)
+    if source_sessions is not None:
+        rec["source_sessions"] = sorted(set(source_sessions))[:MINER_SOURCE_SESSIONS_CAP]
+    return rec
+
+
+def _transcript_mine_recurrence(prompts, tally, kdir):
+    """Recurrence detector (Q2). FOLD this window's origin=human bodies INTO the
+    persistent tally (CUMULATIVE across mine windows, F1): normalize each body to
+    a deterministic key and add its SESSION id to that key's DISTINCT-session set
+    (a body asked twice in ONE session counts once, F4). Emit a candidate the
+    FIRST time a key reaches MINER_RECURRENCE_N distinct sessions AND is not yet
+    emitted; flip `emitted` so it fires EXACTLY ONCE even as the count climbs.
+    Pure tabulation (sets + counts, order-independent). FOLDS the WHOLE window
+    first, THEN emits with the FINAL distinct-session count — so N sessions asking
+    in ONE window yield recurrence_count==N (not N stopping at the threshold).
+    Mutates `tally` in place; LRU-moves each touched key to the end. Returns the
+    new candidate records (identity = the most-recent occurrence, so a re-mine of
+    the SAME window yields the same fp; emitted-once via the flag)."""
+    touched = []          # keys folded this window, first-touch order (dedup)
+    for sid, turn_id, body, cwd in prompts:
+        key = _transcript_norm_key(body)
+        if not key:
+            continue
+        entry = tally.get(key)
+        if not isinstance(entry, dict):
+            entry = {"sessions": [], "latest": {}, "emitted": False}
+        sids = set(entry.get("sessions") or [])
+        sids.add(sid)
+        entry["sessions"] = sorted(sids)
+        entry["latest"] = {"sid": sid, "turn_id": turn_id, "text": body,
+                           "cwd": cwd}
+        tally.pop(key, None)          # LRU: re-insert at the end (most-recent)
+        tally[key] = entry
+        if key not in touched:
+            touched.append(key)
+    out = []
+    for key in touched:
+        entry = tally[key]
+        count = len(entry.get("sessions") or [])
+        if count >= MINER_RECURRENCE_N and not entry.get("emitted"):
+            entry["emitted"] = True   # fires EXACTLY once, even as count climbs
+            latest = entry.get("latest") or {}
+            out.append(_transcript_build_record(
+                kdir, sid=latest.get("sid") or "",
+                turn_id=latest.get("turn_id") or "",
+                text=latest.get("text") or "", signal="recurrence",
+                cwd=latest.get("cwd") or "", recurrence_count=count,
+                source_sessions=entry.get("sessions") or []))
+    return out
+
+
+def _transcript_tool_target(rec):
+    """Deterministic 'primary target' of a tool call from its input, so an
+    error->ok pair on the SAME target can be matched. Prefers a precise path/url
+    target; falls back to a normalized command/pattern signature; '' if none."""
+    raw = rec.get("input")
+    data = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            data = raw
+    if isinstance(data, dict):
+        for k in ("file_path", "path", "notebook_path", "url"):
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for k in ("command", "cmd", "pattern", "query"):
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                return _transcript_norm_key(v)
+        return ""
+    if isinstance(data, str) and data.strip():
+        return _transcript_norm_key(data)
+    return ""
+
+
+def _transcript_err_signature(rec):
+    """First non-blank line of a failed call's response, whitespace-collapsed and
+    bounded — a factual, deterministic error signature. Inert data (R-SEC-02)."""
+    resp = rec.get("response")
+    if not isinstance(resp, str):
+        resp = "" if resp is None else str(resp)
+    for ln in resp.splitlines():
+        ln = " ".join(ln.split())
+        if ln:
+            return ln[:120]
+    return ""
+
+
+def _transcript_error_recovery_text(tool, target, sig):
+    """Deterministic, FACTUAL, single-line derivation stored VERBATIM as inert
+    data (R-SEC-02) — byte-stable given (tool, target, signature). Rarely matches
+    the capturable preference cue, so it journals (tier-1) — the conservative v1."""
+    tgt = " ".join(str(target).split())[:80]
+    s = (" (%s)" % sig) if sig else ""
+    return ("error-recovery: '%s' failed then succeeded on %s%s"
+            % (tool, tgt, s))[:200]
+
+
+def _transcript_mine_error_recovery(scanned, metrics, kdir):
+    """Error-recovery detector (Task 3). Within each scanned session's live.jsonl,
+    find a tool call with an ERR status FOLLOWED by a later ok call of the SAME
+    tool AND primary target — a hit-and-fixed pair — and emit ONE candidate per
+    (session, tool, target). A BARE error with no later success yields nothing
+    (conservative). `metrics` is optional triage context (terminal events are
+    feature-keyed, so corroboration is best-effort). No LLM/clock; deterministic
+    string derivation only."""
+    out = []
+    for sid, records, _settled in scanned:
+        err_sig = {}          # (tool, target) -> first error signature seen
+        recovered = set()     # (tool, target) already paired (emit once)
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            tool = str(r.get("tool") or "")
+            target = _transcript_tool_target(r)
+            keyt = (tool, target)
+            st = r.get("status")
+            if _transcript_is_err_status(st):
+                if target and keyt not in err_sig:
+                    err_sig[keyt] = _transcript_err_signature(r)
+            elif (_transcript_is_ok_status(st) and target
+                  and keyt in err_sig and keyt not in recovered):
+                recovered.add(keyt)
+                out.append(_transcript_build_record(
+                    kdir, sid=sid, turn_id="",
+                    text=_transcript_error_recovery_text(tool, target,
+                                                         err_sig[keyt]),
+                    signal="error-recovery", cwd="", source_sessions=[sid]))
+    return out
+
+
+def _transcript_queue_fps(qpath):
+    """Fingerprints already in the LIVE queue (any producer) — the dedup belt so
+    a mined candidate matching an existing Stop-hook fp is suppressed."""
+    fps = set()
+    if not os.path.isfile(qpath):
+        return fps
+    try:
+        with open(qpath, encoding="utf-8") as qf:
+            for line in qf:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict):
+                    fps.add(_prefer_cand_fp(rec.get("sid"), rec.get("turn_id"),
+                                            rec.get("text")))
+    except OSError:
+        return set()
+    return fps
+
+
+def _transcript_prune_tally(tally):
+    """Bound the persistent tally (LRU): the dict's activity order (folded keys
+    moved to the end) means the FRONT is least-recently-active — drop it. A pruned
+    never-emitted key simply restarts its count next time (conservative, Q2)."""
+    over = len(tally) - MINER_TALLY_CAP
+    if over <= 0:
+        return
+    for k in list(tally)[:over]:
+        del tally[k]
+
+
+def _transcript_mine(kdir, backfill=False, session_cap=None):
+    """Compose the miner as a SECOND prefer-queue producer. The corpus READ +
+    tabulation happens BEFORE taking the lock (F5); then, under the shared
+    `qpath + '.lock'` (mirroring _prefer_queue_scan), the BRIEF critical section
+    re-reads the AUTHORITATIVE state, folds recurrence + detects error-recovery,
+    dedups every candidate's _prefer_cand_fp against BOTH the live queue AND the
+    archive tail, appends new candidates with the identical record schema, and
+    atomically persists the watermark + tally (emitted flags) + session sets — all
+    under the ONE lock hold. Append happens BEFORE the state write (crash-safe: a
+    crash re-mines and re-dedups, never double-emits). Best-effort + always returns
+    an int; any fault returns 0 and leaves the queue + state untouched (Q8).
+
+    Concurrency-safe WITHOUT an abort: the tally is set-based (idempotent re-fold),
+    `emitted` fires once, offsets advance monotonically (max), and every append is
+    fp-deduped — so even a re-read of overlapping bytes cannot double-emit."""
+    if not kdir:
+        return 0
+    try:
+        peek = _transcript_load_state(kdir)[0]     # offsets hint (seeds if absent)
+        read = _transcript_mine_read(kdir, peek, backfill, session_cap)
+    except Exception:
+        return 0
+    qpath = os.path.join(kdir, PREFER_QUEUE_REL)
+    try:
+        os.makedirs(os.path.dirname(qpath), exist_ok=True)
+    except OSError:
+        return 0
+    import fcntl
+    lockp = qpath + ".lock"
+    try:
+        lf = open(lockp, "a+")
+    except OSError:
+        return 0
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        lf.close()
+        return 0
+    try:
+        state = _transcript_load_state(kdir)[0]    # AUTHORITATIVE (sole writer)
+        tally = state["tally"]
+        cands = _transcript_mine_recurrence(read["prompts"], tally, kdir)
+        cands += _transcript_mine_error_recovery(read["scanned"],
+                                                 read["metrics"], kdir)
+        seen = _transcript_queue_fps(qpath)
+        seen |= _prefer_archive_fingerprints(
+            os.path.join(kdir, PREFER_QUEUE_ARCHIVE_REL))
+        out_lines = []
+        for rec in cands:
+            fp = _prefer_cand_fp(rec.get("sid"), rec.get("turn_id"),
+                                 rec.get("text"))
+            if fp in seen:
+                continue
+            seen.add(fp)
+            out_lines.append(json.dumps(rec, ensure_ascii=False))
+        if out_lines:                              # APPEND before the state write
+            with open(qpath, "a", encoding="utf-8") as qf:
+                qf.write("\n".join(out_lines) + "\n")
+        state["offsets"]["prompts"] = max(
+            int(state["offsets"].get("prompts") or 0),
+            int(read["new_offsets"]["prompts"]))
+        state["offsets"]["metrics"] = max(
+            int(state["offsets"].get("metrics") or 0),
+            int(read["new_offsets"]["metrics"]))
+        processed = set(state.get("processed_sessions") or [])
+        pending = set(state.get("backfill_pending") or [])
+        for sid, _recs, settled in read["scanned"]:
+            if settled:                            # permanent skip once settled
+                processed.add(sid)
+                pending.discard(sid)
+        state["processed_sessions"] = sorted(processed)
+        state["backfill_pending"] = sorted(pending)
+        _transcript_prune_tally(tally)
+        _transcript_write_state(kdir, state)
+        return len(out_lines)
+    except Exception:
+        return 0
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lf.close()
+
+
+def cmd_prefer_mine(args):
+    """`prefer mine [--backfill] [--max-sessions N]` — the OFFLINE transcript
+    miner: a SECOND prefer-queue producer that mines the operator's own corpus for
+    recurrence + error-recovery candidates (QUARANTINED status:queued,
+    producer='transcript-miner'). Never auto-activates a source=user pref — that
+    stays an explicit `prefer approve` -> run (Q3). A dispatched STATE-MUTATING
+    writer, so it is registered in _kb_writer_funcs() (the predispatch schema-guard
+    keys on args.func)."""
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    backfill = bool(getattr(args, "backfill", False))
+    cap = getattr(args, "max_sessions", None)
+    try:
+        cap = int(cap) if cap else None
+    except (TypeError, ValueError):
+        cap = None
+    n = _transcript_mine(kdir, backfill=backfill, session_cap=cap)
+    if getattr(args, "format", "text") == "json":
+        json.dump({"ok": True,
+                   "mode": "backfill" if backfill else "incremental",
+                   "candidates": n}, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("prefer mine (%s): %d candidate(s) queued"
+              % ("backfill" if backfill else "incremental", n))
+    return 0
+
+
 # Layer-3 CONSUMER (Task 7): the OFFLINE dream drain of the producer-agnostic
 # prefer-queue. Deterministic governance-tier classification (NO LLM, NO network,
 # NO clock in the decision) routes each queued candidate:
@@ -16399,6 +16940,11 @@ def _kb_writer_funcs():
         # mutates prefer-queue state (proposed -> approved); the predispatch gate
         # keys on args.func, so it MUST be registered by its own func name.
         cmd_prefer_approve,
+        # P2c transcript miner (260713): the SECOND prefer-queue producer. A
+        # dispatched WRITER (appends candidates + persists its own state); the
+        # predispatch schema-guard keys on args.func, so register it by name. NOT
+        # dual-mode (no read-only path), so it is NOT excluded from _kb_autoapply.
+        cmd_prefer_mine,
         # plan-state writers (previously OMITTED — the schema-guard hole)
         cmd_plan_new, cmd_plan_add_task, cmd_plan_set_state, cmd_plan_set_status,
         cmd_plan_claim, cmd_plan_state_backfill,
@@ -20397,6 +20943,12 @@ def _dream_step_audit(kdir, dry_run):
     if dry_run:
         return {"status": "planned",
                 "would": "audit%s" % (" --with-tests" if with_tests else "")}
+    # Change-gate (Task 8): SKIP the ~150s audit on a CLEAN tree unchanged since
+    # the last cycle; a DIRTY tree or any doubt RUNS (fail-open). Computed AFTER
+    # step a so its fp agrees with the metric-recorded value.
+    gate = _dream_change_gate_skip(kdir)
+    if gate:
+        return {"status": "skipped", "reason": gate}
     ns = argparse.Namespace(format="json", with_tests=with_tests, stale=False,
                             max_age_days=120)
     rc, out = _dream_capture(cmd_audit, ns)
@@ -20450,6 +21002,12 @@ def _dream_step_eval_record(kdir, dry_run):
     if dry_run:
         return {"status": "planned",
                 "would": "eval --strategy bm25 --record, then bench redact"}
+    # Change-gate (Task 8): SKIP the ~76s eval-record on a CLEAN unchanged tree;
+    # a DIRTY tree or any doubt RUNS (fail-open). Same fp as step c (both AFTER
+    # step a) so they agree with the metric-recorded value.
+    gate = _dream_change_gate_skip(kdir)
+    if gate:
+        return {"status": "skipped", "reason": gate}
     if not os.path.isfile(gold):
         return {"status": "skipped", "reason": "no gold set"}
     ledger = os.path.join(kdir, HISTORY_REL)
@@ -20750,6 +21308,19 @@ def _dream_step_prefer_classify(kdir, dry_run):
     return _prefer_classify_drain(kdir)
 
 
+def _dream_step_transcript_mine(kdir, dry_run):
+    """Step m — OFFLINE transcript miner (260713, Task 5): a SECOND prefer-queue
+    producer ordered BEFORE step g so a mine-then-drain completes in ONE cycle (m
+    enqueues quarantined candidates, g classifies them). Incremental mode.
+    Best-effort: the _run_cycle per-step try/except (`:20972`) is the outer belt;
+    any fault leaves the queue + watermark untouched and NEVER aborts the cycle."""
+    if dry_run:
+        return {"status": "planned",
+                "would": "mine prompts.log/sessions/metrics -> recurrence + "
+                         "error-recovery candidates (quarantined; never auto-active)"}
+    return {"status": "ok", "candidates": _transcript_mine(kdir, backfill=False)}
+
+
 DREAM_STEP_FUNCS = (
     # Step "0" pkg-pull RETIRED (Task 13) — package updates are delegated to the
     # dedicated verified updater; dream never mutates REPO_ROOT.
@@ -20760,6 +21331,10 @@ DREAM_STEP_FUNCS = (
     ("c", "audit", _dream_step_audit),
     ("d", "eval-record", _dream_step_eval_record),
     ("e", "detect-report", _dream_step_detect_report),
+    # P2c transcript miner (260713, Task 5): mine the corpus into the prefer-queue
+    # BEFORE step g drains it, so a mine-then-drain completes in ONE cycle. Ordered
+    # ...e, m, g, f. _dream_parse_steps auto-validates 'm' from this tuple.
+    ("m", "transcript-mine", _dream_step_transcript_mine),
     # Layer-3 steering-capture consumer (260712, Task 7): drain BEFORE the nightly
     # kb-git-commit so proposed workorders + queue transitions land in the backup.
     ("g", "prefer-classify", _dream_step_prefer_classify),
@@ -20876,6 +21451,12 @@ def _dream_emit_metric(kdir, cycle):
         if cycle.get("timed_out"):
             rec["timed_out"] = True
             rec["timeout_reason"] = cycle["timeout_reason"]
+        # Stamp the committed-state change fingerprint (Task 8) so the NEXT
+        # cycle's change-gate (steps c/d) can compare. Stamped EVEN on a dirty
+        # run (records the committed fp). Best-effort: only when computable.
+        fp = _dream_change_fp(kdir)
+        if fp:
+            rec["change_fp"] = fp
         logs = os.path.join(kdir, "logs")
         os.makedirs(logs, exist_ok=True)
         with open(os.path.join(logs, "metrics.jsonl"), "a",
@@ -21002,6 +21583,13 @@ def cmd_dream(args):
     if skip:
         return _dream_skip_output("idle-gate", skip, as_json)
 
+    # Min-interval floor (Task 7): a too-soon cycle skips, mutating NOTHING (no
+    # lock, no journal, no metric) — this makes the 30-min tick a ~6h effective
+    # cadence. --force bypasses it (parity with the idle-gate).
+    min_skip = _dream_min_interval_skip(kdir, time.time(), force)
+    if min_skip:
+        return _dream_skip_output("min-interval", min_skip, as_json)
+
     # Single-writer concurrency lock (honored even with --force).
     if not dream_acquire_lock(kdir):
         return _dream_skip_output(
@@ -21049,6 +21637,88 @@ def _dream_last_cycle_ts(kdir):
     None. Read-only; tolerant of a missing/garbled log."""
     rec = _dream_last_cycle(kdir)
     return rec.get("ts") if rec else None
+
+
+# --- P2c (260713): dream cadence + affordability guards ---------------------
+# A shared 6h floor: the min-interval gate (Task 7) makes the 30-min tick express
+# a ~6h EFFECTIVE cadence, and the dream-cadence tick job (Task 9) is due on the
+# same interval. These are TIME-based control-plane gates (a cadence is inherently
+# clock-driven) — the INV-1 "no clock in a decision" constraint is scoped to the
+# MINER's mined decisions, never these gates.
+DREAM_CADENCE_INTERVAL_SEC = 6 * 3600
+
+
+def _dream_min_interval_skip(kdir, now, force):
+    """Task 7 (affordability guard #1). Return a SKIP reason when the last recorded
+    dream cycle is YOUNGER than the 6h floor, else None. `force` bypasses it
+    (parity with the idle-gate) so manual debugging is unaffected. FAIL-OPEN: a
+    missing / garbled last-cycle ts proceeds (returns None). Read-only — a caller
+    that skips on this mutates NOTHING (no lock, no journal, no metric)."""
+    if force:
+        return None
+    last = _pkg_iso_to_epoch(_dream_last_cycle_ts(kdir))
+    if last is None:
+        return None
+    age = now - last
+    if age < DREAM_CADENCE_INTERVAL_SEC:
+        return ("last dream cycle was %.1fh ago (< %dh min-interval)"
+                % (age / 3600.0, DREAM_CADENCE_INTERVAL_SEC // 3600))
+    return None
+
+
+def _pkg_working_tree_dirty():
+    """True iff the package working tree has uncommitted changes (offline `git
+    status --porcelain` on REPO_ROOT). FAIL-OPEN for the change-gate: any git
+    error returns True (treated as dirty -> RUN), so a real regression is never
+    masked by a git failure."""
+    cp = _git(REPO_ROOT, "status", "--porcelain")
+    if cp.returncode != 0:
+        return True
+    return bool(cp.stdout.strip())
+
+
+def _dream_change_fp(kdir):
+    """The committed-state change fingerprint = '<pkg HEAD sha>:<sha256(index.json)>'.
+    Uses the index CONTENT hash (via _dream_file_fp), NOT mtime — step a rebuilds
+    the index every cycle so mtime always moves, but the deterministic rebuild
+    leaves CONTENT byte-stable when the KB is unchanged (F2). Returns None when
+    either component cannot be computed, so the caller FAILS-OPEN (runs)."""
+    head = _git_head(REPO_ROOT)
+    if not head:
+        return None
+    idxfp = _dream_file_fp(os.path.join(kdir, "index.json"))
+    if not idxfp:
+        return None
+    return "%s:%s" % (head, idxfp)
+
+
+def _dream_change_gate_skip(kdir):
+    """Task 8 (affordability guard #2 — the ~98% cost). Shared decision for the
+    audit (step c) + eval-record (step d) change-gate: return a SKIP reason when a
+    CLEAN tree has NOT changed since the last cycle, else None (RUN).
+
+    A DIRTY working tree ALWAYS runs (checked FIRST, before any fp compare): a 0/1
+    dirty bit folded into the fp would collapse two DISTINCT dirty states and skip
+    the second, masking a mid-development regression (F2) — so dirtiness gates the
+    DECISION, never the fp VALUE. FAIL-OPEN: a dirty tree, no prior cycle, a prior
+    cycle with no stored fp, or any error computing the fp all RUN."""
+    try:
+        if _pkg_working_tree_dirty():
+            return None                       # dirty -> always run
+        last = _dream_last_cycle(kdir)
+        if not last:
+            return None                       # no prior cycle -> run
+        prev = last.get("change_fp")
+        if not prev:
+            return None                       # prior cycle predates the fp -> run
+        cur = _dream_change_fp(kdir)
+        if cur is None:
+            return None                       # cannot compute -> run (fail-open)
+        if cur == prev:
+            return "clean tree, no pkg/kb change since last cycle"
+        return None
+    except Exception:
+        return None                           # any error -> run (fail-open)
 
 
 def _dream_cycle_outcome(rec):
@@ -22920,6 +23590,46 @@ _TICK_JOB_REGISTRY.append({
 })
 
 
+# --- P2c (260713, Task 9): the ADDITIVE dream-cadence tick job ---------------
+# Purely additive: _tick_dispatch makes NO per-job assumptions and isolates a
+# raising job; _tick_any_job_enabled already gates the installer on ANY enabled
+# job. Inert-until-enabled — dream defaults OFF (resolve_dream), so the job
+# reports 'disabled' until `config --set-dream on` (Q5), mirroring the updater's
+# runtime kill switch. run() dispatches cmd_dream(force=False), so the idle-gate
+# + min-interval floor + single-writer lock ALL still apply (defence in depth).
+
+def _dream_cadence_due(kdir, now):
+    """Due when >= DREAM_CADENCE_INTERVAL_SEC (~6h) since the last dream cycle.
+    Always-due when never run — sleep-proof: keyed off the last-cycle WALL-CLOCK,
+    NOT the tick cadence, so a scheduler that slept through several ticks
+    self-corrects (still due) on the next wake (mirrors _pkg_updater_due)."""
+    last = _pkg_iso_to_epoch(_dream_last_cycle_ts(kdir))
+    if last is None:
+        return True
+    return (now - last) >= DREAM_CADENCE_INTERVAL_SEC
+
+
+def _dream_cadence_run(kdir, now):
+    """Dispatch ONE dream cycle at force=False (the in-CLI idle-gate + min-interval
+    floor + concurrency lock decide whether it actually runs). Output captured via
+    _dream_capture; returns a compact status dict for the tick result list."""
+    ns = argparse.Namespace(format="json", dry_run=False, force=False, steps=None,
+                            install_schedule=False, uninstall_schedule=False)
+    rc, _out = _dream_capture(cmd_dream, ns)
+    return {"status": "ok" if rc == 0 else "error", "rc": rc,
+            "detail": "dream-cadence dispatched cmd_dream(force=False) rc=%d" % rc}
+
+
+# Register the dream-cadence job SECOND (additive). Gated on resolve_dream()==1 so
+# it is INERT until the operator enables dream (config --set-dream on).
+_TICK_JOB_REGISTRY.append({
+    "key": "dream-cadence",
+    "enabled": lambda: resolve_dream() == "1",
+    "due": _dream_cadence_due,
+    "run": _dream_cadence_run,
+})
+
+
 # --- Task 9: reverse loop-guard support (read-only lock-status + self-heal) ---
 # The agentware.sh RUN-BEGINS block queries the updater/tick lock so a loop never
 # starts while an apply is live (reading a half-updated package). Checks the
@@ -24496,6 +25206,24 @@ def build_parser():
                              help="prompts.log path (default: <kdir>/logs/"
                                   "prompts.log; overridable for tests)")
     p_pref_seed.set_defaults(func=cmd_prefer, prefer_command="seed-cursor")
+
+    # P2c transcript miner (260713): the OFFLINE second producer. Mines the
+    # operator's own corpus (prompts.log/sessions/metrics) for recurrence +
+    # error-recovery candidates into the SAME queue (producer=transcript-miner),
+    # quarantined (status:queued) and governed by the EXISTING drain tiers. Its
+    # own dispatched writer func so the schema-guard covers this state mutation.
+    p_pref_mine = prefer_sub.add_parser(
+        "mine", parents=[fmt_parent],
+        help="OFFLINE transcript miner: queue recurrence + error-recovery "
+             "candidates from the corpus (quarantined; never auto-activated)")
+    p_pref_mine.add_argument(
+        "--backfill", action="store_true",
+        help="one-shot historical mining of seeded sessions (bounded by "
+             "--max-sessions; run repeatedly to catch up). Default: incremental.")
+    p_pref_mine.add_argument(
+        "--max-sessions", dest="max_sessions", type=int, default=None,
+        help="cap sessions walked this run (default: %d)" % MINER_SESSION_CAP)
+    p_pref_mine.set_defaults(func=cmd_prefer_mine, prefer_command="mine")
 
     # ingest -----------------------------------------------------------------
     p_ingest = sub.add_parser(

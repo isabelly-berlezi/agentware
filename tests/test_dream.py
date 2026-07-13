@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from tests._fixtures import load_cli, build_synthetic_kb, run_cli
 
@@ -271,7 +272,7 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
         payload = json.loads(out)
         self.assertTrue(payload["dry_run"])
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["1", "2", "a", "b", "c", "d", "e", "g", "f"])
+                         ["1", "2", "a", "b", "c", "d", "e", "m", "g", "f"])
         for s in payload["steps"]:
             self.assertEqual(s["status"], "planned")
 
@@ -316,12 +317,21 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
         idx = os.path.join(self.kdir, "index.json")
         ledger = os.path.join(self.kdir, "benchmarks", "history.jsonl")
         journal = os.path.join(self.kdir, mod.DREAM_JOURNAL_REL)
-        self._run(["--format", "json"])
-        fp1, j1 = mod._dream_file_fp(idx), open(journal).read().count("## dream ")
-        r1 = len(mod._read_ledger(ledger))
-        self._run(["--format", "json"])
-        fp2, j2 = mod._dream_file_fp(idx), open(journal).read().count("## dream ")
-        r2 = len(mod._read_ledger(ledger))
+        # P2c (260713): --force bypasses the NEW min-interval floor (the 2nd cycle
+        # is <6h after the 1st) so both cycles run fully; and the change-gate on
+        # steps c/d must ALWAYS-RUN here regardless of the PACKAGE tree's git
+        # state (a clean checkout in CI would otherwise skip the 2nd audit/eval as
+        # 'unchanged') — force it by mocking the package-dirty probe to True. This
+        # preserves the idempotence assertion (one row/journal per cycle).
+        with mock.patch.object(mod, "_pkg_working_tree_dirty", return_value=True):
+            self._run(["--force", "--format", "json"])
+            fp1 = mod._dream_file_fp(idx)
+            j1 = open(journal).read().count("## dream ")
+            r1 = len(mod._read_ledger(ledger))
+            self._run(["--force", "--format", "json"])
+            fp2 = mod._dream_file_fp(idx)
+            j2 = open(journal).read().count("## dream ")
+            r2 = len(mod._read_ledger(ledger))
         self.assertEqual(fp1, fp2, "index rebuild must be byte-stable (idempotent)")
         self.assertEqual(j2 - j1, 1, "exactly one new journal entry per cycle")
         self.assertEqual(r2 - r1, 1, "exactly one new reliability row per cycle")
@@ -366,8 +376,10 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
         self.assertIn("steps", dreams[0])
 
     def test_journal_well_formed(self):
-        self._run(["--steps", "a", "--format", "json"])
-        self._run(["--steps", "a", "--format", "json"])
+        # --force both cycles: P2c's min-interval floor would otherwise skip the
+        # 2nd (it is <6h after the 1st), leaving only one journal entry.
+        self._run(["--force", "--steps", "a", "--format", "json"])
+        self._run(["--force", "--steps", "a", "--format", "json"])
         mod = load_cli()
         text = open(os.path.join(self.kdir, mod.DREAM_JOURNAL_REL)).read()
         self.assertEqual(text.count("## dream "), 2)
@@ -1211,7 +1223,7 @@ class DreamObservabilityE2ETests(unittest.TestCase, _GuardedEnv):
         steps = {s["step"]: s for s in payload["steps"]}
         # The full a-f cycle ran (c failed but never aborted the rest).
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["1", "2", "a", "b", "c", "d", "e", "g", "f"])
+                         ["1", "2", "a", "b", "c", "d", "e", "m", "g", "f"])
         self.assertEqual(steps["c"]["status"], "fail")
         self.assertEqual(steps["e"]["status"], "ok")
 

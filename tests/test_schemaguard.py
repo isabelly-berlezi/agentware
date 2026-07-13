@@ -65,6 +65,11 @@ _GROUND_TRUTH_WRITERS = {
     # steering-capture approve (260712, Task 7): a distinct dispatched func that
     # mutates prefer-queue state (proposed -> approved) — registered by func name.
     "cmd_prefer_approve",
+    # P2c transcript miner (260713): the SECOND prefer-queue producer — a
+    # dispatched WRITER (appends candidates + persists its own state), registered
+    # by func name so the predispatch schema-guard covers it. Not an index writer
+    # (no save_index/rebuild_kb), so it is absent from _EXPECTED_INDEX_WRITER_DEFS.
+    "cmd_prefer_mine",
     "cmd_plan_new", "cmd_plan_add_task", "cmd_plan_set_state",
     "cmd_plan_set_status", "cmd_plan_claim", "cmd_plan_state_backfill",
     "cmd_features", "cmd_skill_add", "cmd_skill_remove",
