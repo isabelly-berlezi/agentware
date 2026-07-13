@@ -138,6 +138,10 @@ class WorklogGateLoopTest(unittest.TestCase):
             "AGENTWARE_NO_STREAM": "1",
             "AGENTWARE_METRICS_EMIT": "0",
             "AGENTWARE_DISABLE_RELEASE_GATE": "1",   # our own edits show dirty
+            # Same reason for the self-healing review gate (same self-extension
+            # predicate): a temp-KB-only loop run is NOT a package self-extension, so
+            # declare a non-package changed-file list -> the review gate skips cleanly.
+            "AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE": "work/x/plan.md docs/readme.md",
             "AGENTWARE_DISABLE_TARGET_GATE": "1",    # target path need not exist
             "FAKE_PLAN": self.plan,
             "FAKE_WORKLOG": self.worklog,

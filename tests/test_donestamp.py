@@ -142,6 +142,11 @@ class DoneStampTest(unittest.TestCase):
             # orthogonal to the gate, and running from the repo makes the post-hook
             # gate fire on this working tree's diff.
             "AGENTWARE_DISABLE_RELEASE_GATE": "1",
+            # The self-healing review gate fires on the SAME self-extension predicate
+            # (which sees THIS repo's own dirty tree). A loop test that only mutates
+            # the temp KB is NOT a package self-extension, so declare a non-package
+            # changed-file list and the review gate skips cleanly (no reviewer spawn).
+            "AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE": "work/x/plan.md docs/readme.md",
             "FAKE_PLAN": self.plan,
             "PATH": self.bin_dir + os.pathsep + os.environ.get("PATH", ""),
         })

@@ -131,6 +131,11 @@ class ReverseGuardTest(unittest.TestCase):
             "AGENTWARE_KB_PUSH": "0",
             "AGENTWARE_NO_STREAM": "1",
             "AGENTWARE_DISABLE_RELEASE_GATE": "1",
+            # The self-healing review gate fires on the SAME self-extension predicate
+            # (which sees THIS repo's own dirty tree). A loop test that only mutates
+            # the temp KB is NOT a package self-extension, so declare a non-package
+            # changed-file list and the review gate skips cleanly (no reviewer spawn).
+            "AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE": "work/x/plan.md docs/readme.md",
             "AGENTWARE_UPDATE": "0",           # keep the tick/updater inert
             "FAKE_PLAN": self.plan,
             "PATH": self.bin_dir + os.pathsep + os.environ.get("PATH", ""),

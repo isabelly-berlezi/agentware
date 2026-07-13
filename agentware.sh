@@ -981,6 +981,144 @@ run_post_hooks() {
   fi
 }
 
+# run_selfheal_review — the SELF-HEALING ADVERSARIAL-REVIEW GATE (feature
+# 260713-adversarial-review-gate, Task 5). Fires at the END of a SELF-EXTENSION run
+# — AFTER the post-phase assessment, BEFORE the done-stamp + kb-sync — and runs the
+# bounded AUDIT -> CALL-OUT -> FIX -> RE-AUDIT loop the operator ran by hand this
+# session. Returns 0 to PROCEED (a clean audit round, a non-self-extension diff, or a
+# recorded escape-hatch skip) and NONZERO to BLOCK (a confirmed high/medium finding
+# survives all rounds — the caller then SKIPS the done-stamp + kb-commit and escalates
+# per R-EXEC-06). All Opus fan-out + fixing happens inside `scripts/agentware review`/
+# `remediate`, which spawn the persona subprocesses (Q3) — this bash only orchestrates
+# the round loop + the STOP/escalate branch. Hermetically testable: the review/
+# remediate commands resolve `claude` via AGENTWARE_CLI, so a fake agent binary drives
+# their exit codes with no real Opus (tests/test_loop_selfheal_gate.py).
+run_selfheal_review() {
+  # Toolkit / init guards — a no-op (PROCEED) when the gate cannot run, mirroring
+  # run_post_hooks' early returns so an uninitialized or non-KB run is unaffected.
+  [[ -x scripts/agentware ]] || return 0
+  [[ "$INITIALIZED" == true ]] || return 0
+  [[ -n "$KDIR" ]] || return 0
+  [[ "$DOCS_DIR" == "$KDIR/work/$FEATURE" ]] || return 0
+  [[ -f "$DOCS_DIR/plan.md" ]] || return 0
+  # Only a run that actually executed a task can have shipped a diff to audit.
+  [[ "${LOOP_ITERATIONS_USED:-0}" -ge 1 ]] || return 0
+
+  local plan="$DOCS_DIR/plan.md"
+  local worklog="$DOCS_DIR/worklog.md"
+
+  # Self-extension detection — the SAME "package files changed" predicate as
+  # run_post_hooks' release gate (agentware.sh ~949-954). Non-self-extension diffs
+  # skip the gate entirely (byte-identical to today). AGENTWARE_REVIEW_DIFF_FILES_
+  # OVERRIDE injects the changed-file list for hermetic tests (same input the
+  # predicate consumes from git), never used in production.
+  local _pkg_diff=""
+  if [[ -n "${AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE:-}" ]]; then
+    _pkg_diff="$AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE"
+  else
+    _pkg_diff="$(git diff --name-only HEAD 2>/dev/null || true)"
+    _pkg_diff="${_pkg_diff}$(git diff --name-only --cached 2>/dev/null || true)"
+    _pkg_diff="${_pkg_diff}$(git status --porcelain 2>/dev/null | grep -E '^\s*[MADRCU]' | sed 's/^...//' || true)"
+  fi
+  if ! printf '%s\n' "$_pkg_diff" | grep -qE '(^|\s)(AGENTS\.md|scripts/|\.claude/|steering/|agentware\.sh)'; then
+    log "[review] non-self-extension diff — adversarial-review gate skipped"
+    return 0
+  fi
+
+  # Q8 escape hatch — honored ONLY for a TRUTHY value, matching the Python
+  # `_review_truthy_env` ({1,true,yes,on}). An empty / false / 0 / no / off value
+  # means the operator did NOT ask to skip, so the gate RUNS — a bare `-n`
+  # (non-empty) test would BYPASS on `=false` (inverting intent) AND, because the
+  # Python side only records the DECISION for a truthy value, ship silently with a
+  # log line falsely claiming a decision was recorded. The two truthy checks MUST agree.
+  local _skip_lc _skip_raw
+  _skip_raw="${AGENTWARE_SKIP_ADVERSARIAL_REVIEW:-}"
+  # Trim ONLY leading/trailing whitespace (mirror Python str.strip()); do NOT
+  # collapse INTERNAL whitespace — `tr -d '[:space:]'` would fold "o n" -> "on"
+  # (bash-truthy) while Python keeps "o n" (non-truthy), re-opening a bypass with
+  # no recorded DECISION. The two truthy checks MUST see the same normalized token.
+  _skip_raw="${_skip_raw#"${_skip_raw%%[![:space:]]*}"}"
+  _skip_raw="${_skip_raw%"${_skip_raw##*[![:space:]]}"}"
+  _skip_lc="$(printf '%s' "$_skip_raw" | tr '[:upper:]' '[:lower:]')"
+  case "$_skip_lc" in
+    1|true|yes|on)
+      log "⚠ [review] AGENTWARE_SKIP_ADVERSARIAL_REVIEW is truthy — recording a > DECISION: skip and BYPASSING the gate (never silent)."
+      scripts/agentware review --adversarial --worklog "$worklog" >/dev/null 2>&1 || true
+      return 0 ;;
+  esac
+
+  # Resolve the bounded round count + diff range ONCE.
+  local max_rounds="${AGENTWARE_REVIEW_MAX_ROUNDS:-3}"
+  [[ "$max_rounds" =~ ^[0-9]+$ ]] && (( max_rounds >= 1 )) || max_rounds=3
+  local diff_range="${AGENTWARE_REVIEW_DIFF_RANGE:-HEAD}"
+
+  log "[review] self-extension diff — running the adversarial-review gate (max_rounds=$max_rounds, diff-range=$diff_range)"
+  local round=1
+  while (( round <= max_rounds )); do
+    local review_json="$STATE_DIR/adversarial-review-round-$round.json"
+    log "[review] round $round/$max_rounds — scripts/agentware review --adversarial (Opus/max fan-out)"
+    # review exit: 0 = CLEAN, 1 = confirmed blocking finding(s), >=3 = the audit
+    # itself could NOT run (agent runtime unreachable / a dimension produced no
+    # output). Capture the code without tripping `set -e`.
+    local _rrc=0
+    scripts/agentware review --adversarial --diff-range "$diff_range" \
+         --acceptance-file "$plan" --worklog "$worklog" --format json \
+         > "$review_json" 2>>"$STATE_DIR/adversarial-review.log" || _rrc=$?
+    if (( _rrc == 0 )); then
+      log "[review] round $round CLEAN — no confirmed high/medium findings; PROCEEDING to done-stamp"
+      # CALL OUT (task 6): consolidate the report, surface material findings in the
+      # worklog (self-closing markers), and file workorders for low findings.
+      emit_review_report "clean-round-$round"
+      return 0
+    fi
+    if (( _rrc >= 3 )); then
+      # FAIL-CLOSED: the adversarial audit could not actually RUN — do NOT waste
+      # remediation rounds (there are no findings to fix) and NEVER silently
+      # proceed. Block + escalate so the operator fixes agent access or sets the
+      # recorded skip hatch. This is the exact fail-open the gate must not have.
+      log "✖ [review] round $round: the adversarial audit COULD NOT RUN (agent runtime unreachable / a dimension produced no output). BLOCKING (fail-closed, nothing-skipped). Fix agent access or set AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1 to bypass with a recorded DECISION."
+      emit_review_report "blocked-audit-incomplete"
+      return 1
+    fi
+    # _rrc == 1: confirmed blocking finding(s) survive — CALL OUT (task 6 fleshes
+    # the report) and AUTO-REMEDIATE, then loop to RE-AUDIT with a FRESH fan-out.
+    log "⚠ [review] round $round: confirmed high/medium finding(s) — CALLING OUT + auto-remediating (see $review_json)"
+    local remediate_json="$STATE_DIR/adversarial-remediate-round-$round.json"
+    if scripts/agentware remediate --findings-file "$review_json" --diff-range "$diff_range" \
+         --acceptance-file "$plan" --format json \
+         > "$remediate_json" 2>>"$STATE_DIR/adversarial-review.log"; then
+      log "[review] round $round: remediation applied all confirmed findings (with regression tests + gate chain) — RE-AUDITING"
+    else
+      log "⚠ [review] round $round: remediation could NOT fully fix every finding — RE-AUDITING to confirm survivors"
+    fi
+    round=$((round + 1))
+  done
+
+  # Exhausted every bounded round with a confirmed high/medium still surviving.
+  log "✖ [review] adversarial-review gate BLOCKED after $max_rounds round(s): a confirmed high/medium finding survives — the fix could not self-heal."
+  # CALL OUT (task 6): write the report + worklog call-out BEFORE escalating so the
+  # operator has the full survivor list surfaced, not just a log line.
+  emit_review_report "blocked"
+  return 1
+}
+
+# emit_review_report — the CALL-OUT surface (feature 260713, Task 6). Best-effort
+# wrapper: consolidate every round's audit + remediation JSON into
+# <feature>/adversarial-review.md, append a self-closing `> DECISION:` worklog
+# call-out per material finding, and file a follow-up workorder per low finding
+# (SANITIZED `--context` seam). NEVER fails the gate (always `|| true`).
+emit_review_report() {
+  local outcome="${1:-}"
+  [[ -x scripts/agentware ]] || return 0
+  scripts/agentware review-report \
+    --state-dir "$STATE_DIR" \
+    --feature-dir "$DOCS_DIR" \
+    --worklog "$DOCS_DIR/worklog.md" \
+    --feature "$FEATURE" \
+    --outcome "$outcome" \
+    >>"$STATE_DIR/adversarial-review.log" 2>&1 || true
+}
+
 # run_kb_sync — commit + push the KB, run as the LAST step of the loop, AFTER the
 # post phase (feature 260625-autocommit-post-phase-fix, Phase 1). It was previously
 # the tail of run_post_hooks, which executes BEFORE `run_phase "post"`; the post
@@ -1633,6 +1771,23 @@ LOOP_OUTCOME="completed"
 # Post phase (1 task).
 if [[ "$SKIP_POST" != true ]]; then
   run_phase "post" "$POST_PROMPT" 1 "POST_COMPLETE"
+fi
+
+# ---- SELF-HEALING ADVERSARIAL-REVIEW GATE (feature 260713, Task 5) ----
+# Fires at the END of a SELF-EXTENSION run, AFTER the post-phase assessment and
+# BEFORE the done-stamp + kb-sync. On a self-extension diff it runs the bounded
+# AUDIT -> CALL-OUT -> FIX -> RE-AUDIT loop (Opus/max). It PROCEEDS only on a clean
+# re-audit round; if a confirmed high/medium survives every round the run is BLOCKED
+# — the done-stamp AND the KB commit are SKIPPED and the operator is escalated
+# (R-EXEC-06, never a silent ship). Non-self-extension diffs pass through untouched.
+if ! run_selfheal_review; then
+  LOOP_OUTCOME="adversarial_review_blocked"
+  echo "Error: [review] the self-healing adversarial-review gate BLOCKED this run."
+  echo "A confirmed high/medium finding survived every remediation round (AGENTWARE_REVIEW_MAX_ROUNDS)."
+  echo "The run is NOT complete: the done-stamp and the KB commit are SKIPPED (R-EXEC-06 escalation)."
+  echo "Review the report(s) under $STATE_DIR/ and the worklog call-out, then fix and re-run."
+  notify "adversarial-review gate BLOCKED — escalated"
+  exit 1
 fi
 
 # ---- PLAN STATE: DONE on success (feature 260710-plan-state-machine) ----
