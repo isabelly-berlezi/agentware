@@ -14888,8 +14888,13 @@ def cmd_plan_new(args):
                     "kernel path (%r) — machine-generated plans can never target "
                     "the agentware package (g1)\n" % (_label, _txt))
                 return 1
-        target_seed = ("\n".join("- %s" % t for t in targets) if targets
-                       else "- %s" % kdir)
+        # g2 — neutralize each target with the SAME class of defense the sibling
+        # emitted fields get (splitlines-collapse + strip-leading-`>` + forged-
+        # header + loose-task-glyph), BEFORE rendering into the Target section. A
+        # legitimate single-line path renders byte-identical. (The default kdir
+        # target is trusted config, not untrusted input, so it needs no sanitize.)
+        target_seed = ("\n".join("- %s" % _sanitize_target(t) for t in targets)
+                       if targets else "- %s" % kdir)
         # g3 — concurrent draft/ready cap under work/auto/.
         open_wo = _count_auto_open_workorders(kdir)
         if open_wo >= WORKORDER_DRAFT_CAP:
@@ -15157,6 +15162,47 @@ def _sanitize_context_block(value):
         s = _PLAN_VERIFY_RE.sub("*Verify :*", s)
         out.append(s)
     return "\n".join(out).strip("\n")
+
+
+def _sanitize_target(value):
+    """g2 guard for --target on the untrusted `plan new --auto` path. The seed
+    renders each target as `- <target>` into the plan's `## Target packages`
+    section; the ONLY prior defense was the g1 kernel-path refusal
+    (`_target_hits_kernel`), so a mined/malicious target could smuggle a phantom
+    loose task marker (`\\n- ⬜ **9 …` → the loop's LOOSE `open_markers()` grep
+    counts it forever → completion wedged → burns to MAX_ITERATIONS) or a forged
+    `> Status:`/`> Claimed-by:`/`> Superseded-by:` header (duplicate-status lint
+    → workorder permanently wedged). Extend the SAME g2-class neutralization the
+    sibling emitted fields already get, BEFORE rendering:
+
+      * `_sanitize_provenance` collapses EVERY line separator to a space (the
+        exact `str.splitlines()` semantics every plan.md mutator round-trips
+        through, so no residual `\\x85`/`\\u2028`/… survives to be re-split into a
+        forged header) and strips leading blockquote `>` markers — a multi-line
+        target becomes ONE line, so a line-anchored `> Status:` header can never
+        survive;
+      * defensively space-prefix a residual header-shaped token (`_CTX_FORGED_
+        HEADER_RE`) so it can never be re-promoted into a header;
+      * neutralize a loose task glyph against the RENDERED `- <target>` line,
+        matching BOTH the strict `_PLAN_TASK_LINE_RE` (closing `**`) AND the
+        LOOSE `_CTX_LOOSE_TASK_RE` the loop's open_markers() grep counts (opening
+        `**`+digit, NO closing `**`) — else a target of `⬜ **9 …` renders `- ⬜
+        **9 …`, a phantom open task the loop never sees reach 0.
+
+    A legitimate single-line path target (no separators, no leading `>`, no task
+    glyph, not header-shaped) renders BYTE-IDENTICAL — none of the branches fire.
+    Returns None for None (the caller falls back to the default kdir target)."""
+    if value is None:
+        return None
+    v = _sanitize_provenance(value)
+    if v is None:
+        return None
+    if _CTX_FORGED_HEADER_RE.match(v.lstrip()):
+        v = " " + v.lstrip()
+    rendered = "- " + v
+    if _PLAN_TASK_LINE_RE.match(rendered) or _CTX_LOOSE_TASK_RE.match(rendered):
+        v = v.replace("⬜", "[ ]").replace("🟡", "[~]").replace("✅", "[x]")
+    return v
 
 
 def _read_plan_status(text):
