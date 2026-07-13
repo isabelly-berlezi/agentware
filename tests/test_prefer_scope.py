@@ -92,5 +92,45 @@ class TestCanonicalProjectKey(unittest.TestCase):
         self.assertEqual(self._key("tokto.io"), self._key("tokto.io"))
 
 
+class TestCurrentProjectSignal(unittest.TestCase):
+    """Task 5 (audit LOW / Q4): capture/inject scoping symmetry.
+
+    `_current_project_signal` must resolve ONLY from AGENTWARE_INVOKED_FROM — unset
+    => None (GLOBAL), the SAME as the session-start injection resolver — with NO
+    `os.getcwd()` fallback that would project-scope a plain-session capture the
+    injection side treats as global (silent mis-scope)."""
+
+    def setUp(self):
+        self.mod = load_cli()
+        self.tmp = tempfile.mkdtemp(prefix="aw_prefer_signal_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # A real checkout whose basename resolves to a project_name.
+        self.checkout = os.path.join(self.tmp, "tokto-io")
+        os.makedirs(os.path.join(self.checkout, ".git"))
+        self.addCleanup(os.chdir, os.getcwd())
+        self._prev_env = os.environ.get("AGENTWARE_INVOKED_FROM")
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        if self._prev_env is None:
+            os.environ.pop("AGENTWARE_INVOKED_FROM", None)
+        else:
+            os.environ["AGENTWARE_INVOKED_FROM"] = self._prev_env
+
+    def test_unset_invoked_from_resolves_global_even_inside_a_checkout(self):
+        # The Q4 guarantee: chdir INTO a registered checkout, but with
+        # AGENTWARE_INVOKED_FROM UNSET -> None (global) — symmetric with injection.
+        os.environ.pop("AGENTWARE_INVOKED_FROM", None)
+        os.chdir(self.checkout)
+        self.assertIsNone(
+            self.mod._current_project_signal(),
+            "unset INVOKED_FROM must resolve GLOBAL (no os.getcwd fallback)")
+
+    def test_set_invoked_from_resolves_the_checkout(self):
+        # When the var IS set (loop invocation), it still resolves the checkout.
+        os.environ["AGENTWARE_INVOKED_FROM"] = self.checkout
+        self.assertEqual(self.mod._current_project_signal(), "tokto-io")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,6 +30,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -329,6 +330,79 @@ class SchemaGuardTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(os.path.join(self.kdir, ".schema")),
                          "migrate --list must NOT create .schema")
+
+    # --- T7 (260713-p2a-capture-hardening): prefer WRITE migration contract --
+    def test_schemaguard_cli_prefer_capture_refuses_on_newer_kb(self):
+        # The P1.6 hole stays CLOSED: an older CLI must REFUSE a `prefer capture`
+        # on a NEWER-schema KB. cmd_prefer stays in the version-refusal superset
+        # even though it is EXCLUDED from the migration auto-apply set. Real
+        # dispatch through main()+argparse.
+        self._write_schema(self.m.KB_SCHEMA_VERSION + 1)
+        code, _o, err = run_cli(
+            ["prefer", "capture", "always pin dependency versions", "--global"],
+            self.kdir)
+        self.assertEqual(code, 1)
+        self.assertIn("older CLI on a newer KB", err)
+
+    def test_schemaguard_prefer_write_refuses_pending_restructuring(self):
+        # A prefer WRITE must NOT land against a schema about to be RESTRUCTURED
+        # (the case the auto-apply exclusion would otherwise silently admit), while
+        # an additive-only pending migration STILL captures (forward-compatible).
+        # Tested directly on the gate (the CLI run uses a separate module instance,
+        # so on-disk .schema is shared but a patched _KB_MIGRATIONS is not).
+        def _noop(_k):
+            return None
+        prev = self.m._KB_MIGRATIONS
+        self.addCleanup(setattr, self.m, "_KB_MIGRATIONS", prev)
+        # Inject a restructuring migration ABOVE the current schema; .schema = the
+        # CLI's current version so version-refusal (cur > version) does NOT fire.
+        self.m._KB_MIGRATIONS = prev + (
+            (prev[-1][0] + 1, "restructuring", "big-move", _noop),)
+        self._write_schema(self.m.KB_SCHEMA_VERSION)
+        with contextlib.redirect_stderr(io.StringIO()) as errbuf:
+            rc = self.m._prefer_write_migration_gate(self.kdir)
+        self.assertEqual(rc, 1, "a pending restructuring must refuse a prefer write")
+        self.assertIn("restructuring migration", errbuf.getvalue())
+        # An additive-only pending migration (cur=0 < schema 1) must NOT refuse.
+        self.m._KB_MIGRATIONS = prev
+        os.remove(os.path.join(self.kdir, ".schema"))
+        self.assertIsNone(
+            self.m._prefer_write_migration_gate(self.kdir),
+            "an additive-only pending migration must NOT refuse a prefer write")
+
+    def test_schemaguard_prefer_capture_cli_migration_gate_e2e(self):
+        # END-TO-END via main() (audit round-2 coverage gap): the migration gate is
+        # wired into the real `prefer capture` CLI path. Patch the SAME module
+        # instance run_cli uses (load_cli()), not this test's separate _load().
+        from tests._fixtures import load_cli
+        m = load_cli()
+        prev = m._KB_MIGRATIONS
+        self.addCleanup(setattr, m, "_KB_MIGRATIONS", prev)
+
+        def _noop(_k):
+            return None
+        # restructuring-pending (one above the CLI schema) -> REFUSE, 0 writes.
+        m._KB_MIGRATIONS = prev + (
+            (prev[-1][0] + 1, "restructuring", "big-move", _noop),)
+        self._write_schema(m.KB_SCHEMA_VERSION)
+        code, _o, err = run_cli(
+            ["prefer", "capture", "always pin deps everywhere", "--global"],
+            self.kdir)
+        self.assertEqual(code, 1)
+        self.assertIn("restructuring migration", err)
+        with open(os.path.join(self.kdir, "index.json"), encoding="utf-8") as f:
+            self.assertFalse(any("preference" in (e.get("tags") or [])
+                                 for e in json.load(f)["entries"]))
+        # additive-only pending (cur=0 < schema) -> STILL captures.
+        m._KB_MIGRATIONS = prev
+        os.remove(os.path.join(self.kdir, ".schema"))
+        code, _o, err = run_cli(
+            ["prefer", "capture", "always pin deps here now", "--global"],
+            self.kdir)
+        self.assertEqual(code, 0, err)
+        with open(os.path.join(self.kdir, "index.json"), encoding="utf-8") as f:
+            self.assertTrue(any("preference" in (e.get("tags") or [])
+                                for e in json.load(f)["entries"]))
 
 
 if __name__ == "__main__":

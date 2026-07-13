@@ -217,6 +217,179 @@ class TestPreferQueue(unittest.TestCase):
                   "matched_pattern", "status", "producer"):
             self.assertIn(k, rec)
 
+    # === P2a capture-hardening (2026-07-13) — producer robustness (Task 6) ===
+    def _cursors(self):
+        cpath = os.path.join(self.kdir, self.mod.PREFER_QUEUE_CURSOR_REL)
+        with open(cpath, encoding="utf-8") as f:
+            return json.load(f)
+
+    # --- T6.1: session-start seeds a new session's watermark ----------------
+    def test_seed_cursor_sets_new_session_to_current_log_size(self):
+        # Two OTHER sessions already fill the log; seeding THIS session to the
+        # current EOF means its first Stop scans only its OWN later turns — the
+        # whole-log re-parse the plan calls out is avoided.
+        self._write_log([
+            _rec("2026-07-13T00:00:00Z", "sess-OLD", "/tmp/x", "human", "t1",
+                 "Always use spaces."),
+            _rec("2026-07-13T00:00:01Z", "sess-OLD", "/tmp/x", "human", "t2",
+                 "Always pin versions."),
+        ])
+        seeded = self.mod._prefer_seed_cursor(self.kdir, self.sid,
+                                              prompts_path=self.logp)
+        self.assertTrue(seeded)
+        self.assertEqual(self._cursors()[self.sid], os.path.getsize(self.logp))
+        # This session's OWN turn is appended AFTER the seed.
+        with open(self.logp, "a", encoding="utf-8") as f:
+            f.write(_rec("2026-07-13T00:01:00Z", self.sid, "/tmp/x", "human",
+                         "t9", "Always squash commits."))
+        self.assertEqual(self._scan(), 1)
+        q = self._queue()
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["turn_id"], "t9",
+                         "pre-seed cross-session bytes must not be re-parsed")
+
+    def test_seed_cursor_is_idempotent_never_clobbers(self):
+        self._write_log([_rec("2026-07-13T00:00:00Z", self.sid, "/tmp/x",
+                              "human", "t1", "Always pin versions.")])
+        self.assertEqual(self._scan(), 1)          # advances watermark to EOF
+        advanced = self._cursors()[self.sid]
+        with open(self.logp, "a", encoding="utf-8") as f:
+            f.write(_rec("2026-07-13T00:01:00Z", self.sid, "/tmp/x", "human",
+                         "t2", "Always run tests."))
+        self.assertFalse(
+            self.mod._prefer_seed_cursor(self.kdir, self.sid,
+                                         prompts_path=self.logp),
+            "a late seed on an existing sid is a no-op")
+        self.assertEqual(self._cursors()[self.sid], advanced,
+                         "seed must not clobber an advanced watermark")
+
+    def test_seed_cursor_empty_sid_is_noop(self):
+        self.assertFalse(self.mod._prefer_seed_cursor(self.kdir, "",
+                                                      prompts_path=self.logp))
+
+    def test_seed_cursor_cli_exits_zero_no_stdout(self):
+        code, out, _err = run_cli(
+            ["prefer", "seed-cursor", "--sid", self.sid,
+             "--prompts", self.logp], self.kdir)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "",
+                         "seed-cursor must not pollute session-start stdout")
+
+    # --- T6.2a: bounded per-session cursor dict -----------------------------
+    def test_cursor_dict_pruned_to_cap(self):
+        prev = self.mod._PREFER_CURSOR_CAP
+        self.mod._PREFER_CURSOR_CAP = 3
+        self.addCleanup(setattr, self.mod, "_PREFER_CURSOR_CAP", prev)
+        cpath = os.path.join(self.kdir, self.mod.PREFER_QUEUE_CURSOR_REL)
+        os.makedirs(os.path.dirname(cpath), exist_ok=True)
+        with open(cpath, "w", encoding="utf-8") as f:
+            json.dump({"old-%d" % i: 0 for i in range(10)}, f)
+        self._write_log([_rec("2026-07-13T00:00:00Z", self.sid, "/tmp/x",
+                              "human", "t1", "Always pin versions.")])
+        self._scan()
+        cur = self._cursors()
+        self.assertLessEqual(len(cur), 3, "cursor dict must be pruned to the cap")
+        self.assertIn(self.sid, cur, "the current session cursor is always kept")
+
+    # --- T6.2b: live-queue rotation archives terminal records ---------------
+    def test_queue_rotation_archives_terminal_records(self):
+        prev = self.mod._PREFER_QUEUE_CAP
+        self.mod._PREFER_QUEUE_CAP = 3
+        self.addCleanup(setattr, self.mod, "_PREFER_QUEUE_CAP", prev)
+        recs = [{"ts": "t", "sid": self.sid, "turn_id": str(i),
+                 "text": "candidate %d" % i, "status": "rejected", "tier": 3,
+                 "producer": "stop-hook-regex"} for i in range(6)]
+        os.makedirs(os.path.dirname(self.qpath), exist_ok=True)
+        with open(self.qpath, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r) + "\n")
+        res = self.mod._prefer_classify_drain(self.kdir)
+        self.assertEqual(res.get("status"), "ok")
+        live = self._queue()
+        self.assertLessEqual(len(live), 3, "live queue must be capped")
+        apath = os.path.join(self.kdir, self.mod.PREFER_QUEUE_ARCHIVE_REL)
+        self.assertTrue(os.path.isfile(apath), "terminal records must be archived")
+        with open(apath, encoding="utf-8") as f:
+            archived = [ln for ln in f if ln.strip()]
+        self.assertEqual(len(live) + len(archived), 6,
+                         "no records lost across the rotation")
+
+    def test_queue_below_cap_not_rotated(self):
+        rec = {"ts": "t", "sid": self.sid, "turn_id": "1", "text": "x",
+               "status": "rejected", "producer": "stop-hook-regex"}
+        os.makedirs(os.path.dirname(self.qpath), exist_ok=True)
+        with open(self.qpath, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+        self.mod._prefer_classify_drain(self.kdir)
+        apath = os.path.join(self.kdir, self.mod.PREFER_QUEUE_ARCHIVE_REL)
+        self.assertFalse(os.path.isfile(apath),
+                         "a below-cap queue must not create an archive")
+
+    # --- T6.3: crash-wedge — idempotent re-emit recovers a queued record ----
+    def test_emit_workorder_idempotent_when_workorder_exists(self):
+        # Simulate a crash: the workorder already exists on disk but the record is
+        # still status:queued. A re-emit must return the EXISTING workorder as
+        # SUCCESS (not refuse), so the re-drain marks it proposed, not wedged
+        # queued+mislabeled-draft-capped. cmd_plan_new resolves the kdir from env.
+        prev = os.environ.get("AGENTWARE_KNOWLEDGE_DIR")
+        os.environ["AGENTWARE_KNOWLEDGE_DIR"] = self.kdir
+        self.addCleanup(
+            lambda: os.environ.__setitem__("AGENTWARE_KNOWLEDGE_DIR", prev)
+            if prev is not None
+            else os.environ.pop("AGENTWARE_KNOWLEDGE_DIR", None))
+        text = "always pin dependency versions in lockfiles"
+        fp = self.mod._prefer_cand_fp(self.sid, "t1", text)
+        feat1, err1 = self.mod._prefer_emit_workorder(self.kdir, text, fp)
+        self.assertIsNone(err1, err1)
+        self.assertTrue(feat1)
+        feat2, err2 = self.mod._prefer_emit_workorder(self.kdir, text, fp)
+        self.assertIsNone(err2, "existing workorder must be idempotent success")
+        self.assertEqual(feat1, feat2, "no new/duplicate workorder on re-emit")
+
+    # === Adversarial-review round 2 (2026-07-13) — producer corners ==========
+    def test_cursor_prune_is_lru_retains_recently_active(self):
+        # A session first-SEEN early but ACTIVE recently must survive the prune —
+        # eviction is by last-activity (LRU), not first-seen, so its unscanned
+        # turns are never skipped by a later re-seed.
+        prev = self.mod._PREFER_CURSOR_CAP
+        self.mod._PREFER_CURSOR_CAP = 3
+        self.addCleanup(setattr, self.mod, "_PREFER_CURSOR_CAP", prev)
+        cpath = os.path.join(self.kdir, self.mod.PREFER_QUEUE_CURSOR_REL)
+        os.makedirs(os.path.dirname(cpath), exist_ok=True)
+        with open(cpath, "w", encoding="utf-8") as f:
+            json.dump({"early": 0, "n0": 0, "n1": 0, "n2": 0, "n3": 0}, f)
+        self._write_log([_rec("2026-07-13T00:00:00Z", "early", "/tmp/x", "human",
+                              "t1", "Always pin versions.")])
+        self.mod._prefer_queue_scan(self.kdir, "early", "", prompts_path=self.logp)
+        cur = self._cursors()
+        self.assertLessEqual(len(cur), 3)
+        self.assertIn("early", cur,
+                      "a recently-active session must be retained (LRU prune)")
+
+    def test_archived_candidate_not_requeued_after_watermark_reset(self):
+        # At-most-once across the archive boundary: a candidate drained + archived
+        # OUT of the live queue must NOT be re-queued on a watermark reset (the
+        # dedup belt folds in a bounded tail of the archive).
+        turn = _rec("2026-07-13T00:00:00Z", self.sid, "/tmp/x", "human", "t1",
+                    "always pin dependency versions")
+        self._write_log([turn])
+        self.assertEqual(self._scan(), 1)
+        # Simulate a drain rotation: move the record to the ARCHIVE, empty the live
+        # queue.
+        apath = os.path.join(self.kdir, self.mod.PREFER_QUEUE_ARCHIVE_REL)
+        with open(apath, "w", encoding="utf-8") as f:
+            for r in self._queue():
+                r["status"] = "rejected"
+                f.write(json.dumps(r) + "\n")
+        open(self.qpath, "w").close()
+        # Force a watermark reset (cursor >> EOF, as a log rotation would cause).
+        cpath = os.path.join(self.kdir, self.mod.PREFER_QUEUE_CURSOR_REL)
+        with open(cpath, "w", encoding="utf-8") as f:
+            json.dump({self.sid: 10 ** 9}, f)
+        self.assertEqual(self._scan(), 0,
+                         "an archived candidate must not be re-queued after reset")
+        self.assertEqual(self._queue(), [], "live queue stays empty")
+
 
 if __name__ == "__main__":
     unittest.main()

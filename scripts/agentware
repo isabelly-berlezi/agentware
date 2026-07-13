@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import shutil
 import stat
 import subprocess
@@ -5644,23 +5645,183 @@ _PREF_CUE_RE = re.compile(
     r"keep|no longer|i (?:want|like|prefer|need)|we (?:want|use|prefer))\b",
     re.I)
 
-# (c) Tighten-not-loosen — a pinned denylist of gate-WEAKENING intents. A capture
-# may TIGHTEN but NEVER LOOSEN a governance gate; a match is REFUSED (no write)
-# and routed to the human-authored self-extension path. Deterministic NL: require
-# BOTH a loosen verb AND a gate noun (a plain tightening pref like "always run the
-# verify gate" has no loosen verb, so it is admitted).
+# (c) Tighten-not-loosen — a capture may TIGHTEN but NEVER LOOSEN a governance
+# gate; a match is REFUSED (no write) and routed to the human-authored self-
+# extension path. Deterministic NL, balanced for PRECISION (an adversarial review
+# found the flat "loosen-verb ANYWHERE + any gate-noun" rule both under- and
+# over-fired). Governance NOUNS split by ambiguity:
+#   STRONG — unambiguous, almost never benign (verify/gate/lint/eval/acceptance/
+#            pre-commit/sign-off/R-id): a loosen verb ANYWHERE in the text refuses.
+#   WEAK   — common English words that are governance nouns only IN CONTEXT
+#            (tests/ci/cd/release/deploy/merge/review/audit/approval): refuse ONLY
+#            when the loosen intent DIRECTLY governs the noun — verb→noun adjacency,
+#            a `without <noun>` form, or a `<noun> is optional/skippable` form — so
+#            `disable telemetry in ci` (verb governs telemetry, not ci) still captures.
+_PREF_GATE_NOUN_STRONG = (
+    # NOTE: `eval` is DELIBERATELY excluded — it collides with the eval() code
+    # function, so `disable eval() in production` / `disable eval of untrusted
+    # input` (SECURITY-tightening prefs) must capture, not be mis-read as loosening
+    # an "eval gate". (The retrieval `eval` benchmark is not a gate operators loosen.)
+    r"verif\w*|gates?|lint\w*|acceptance|pre-?commit|sign-?offs?|"
+    r"R-[A-Z]+-\d+")
+_PREF_GATE_NOUN_WEAK = (
+    r"tests?|testing|ci|cd|releases?|deploy\w*|merges?|merging|reviews?|"
+    r"audits?|auditing|approvals?")
+_PREF_GATE_NOUN_RE = re.compile(r"\b(?:%s)\b" % _PREF_GATE_NOUN_STRONG, re.I)
+# POSITIVE loosen verbs (form 4, co-occurring with a STRONG noun). Only the
+# unambiguous gate-weakening verbs, incl. the audit-found synonyms
+# waive/omit/forgo/circumvent/sidestep/suppress. NEGATED forms (`never run`,
+# `no longer enforce`) live in _PREF_NEG_ENFORCE_RE below (negation INVERTS
+# polarity), NOT here — see `_pref_loosens_gate`.
 _PREF_LOOSEN_VERB_RE = re.compile(
-    r"\b(skip|skips|skipping|disabl\w*|bypass\w*|ignor\w*|optional|turn off|"
-    r"no longer run|stop running|don'?t run|do not run|without running|relax\w*|"
-    r"weaken\w*|loosen\w*)\b", re.I)
-_PREF_GATE_NOUN_RE = re.compile(
-    r"\b(verif\w*|gate|gates|lint|linter|eval\w*|acceptance|"
-    r"R-[A-Z]+-\d+)\b", re.I)
+    # NOTE: bare `optional` is NOT a form-4 loosen verb — the WAIVED (`X is
+    # optional`) and MADE_OPTIONAL (`make X optional`) forms handle it with
+    # negation-awareness, so a NEGATED `never make the gate optional` (tightening)
+    # is not mis-caught by a residual `optional` after the negation scrub.
+    r"\b(?:skip\w*|disabl\w*|bypass\w*|ignor\w*|turn off|relax\w*|"
+    r"weaken\w*|loosen\w*|waiv\w*|circumvent\w*|sidestep\w*|forgo|forego|"
+    r"omit\w*|suppress\w*)\b", re.I)
+# Form 1: a POSITIVE loosen verb DIRECTLY governs a gate noun (STRONG or WEAK):
+# `skip the tests`, `waive the review`, `omit the release`. Only UNAMBIGUOUS
+# weakening verbs (not `avoid`/`drop`/`remove`, which read as tightening with a
+# weak noun). Deliberately NO `without <noun>` form: `without <gate>` is
+# PREDOMINANTLY tightening in real prefs (`never merge without review`, `don't
+# deploy without approval`) — its polarity flips on always/never, which a
+# deterministic regex cannot read — so catching the niche `ship without ci` would
+# over-refuse the common tightening phrasings (a strictly worse defect).
+_PREF_LOOSEN_GOVERNS_RE = re.compile(
+    r"\b(?:skip\w*|disabl\w*|bypass\w*|ignor\w*|omit\w*|waiv\w*|circumvent\w*|"
+    r"sidestep\w*|suppress\w*|forgo|forego|turn\s*off|relax\w*|weaken\w*|"
+    r"loosen\w*)\s+"
+    r"(?:the\s+|a\s+|an\s+|any\s+|all\s+|our\s+|its\s+|your\s+|these\s+|"
+    r"those\s+|my\s+|their\s+)?"
+    # allow up to 2 MODIFIER words (adjective/gerund) directly qualifying the gate
+    # noun — `skip the FLAKY tests`, `skip RUNNING the tests`, `skip the SLOW e2e
+    # tests` — but STOP at a preposition/conjunction so the gate noun stays the
+    # DIRECT object: `disable telemetry IN ci` / `bypass the cache IN ci` still
+    # capture (ci is a location, not the object of the loosen verb).
+    r"(?:(?!in\b|on\b|for\b|of\b|during\b|with\b|at\b|by\b|to\b|from\b|about\b|"
+    r"and\b|but\b|or\b|so\b|because\b|while\b|when\b|via\b|per\b)\w+\s+){0,2}?"
+    r"(?:%s|%s)\b" % (_PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK), re.I)
+# Form 2: a gate noun DECLARED optional / not-required — `review is optional`, the
+# acceptance gate can be skipped`, `tests are not required`, `ci is no longer
+# mandatory`. A POSITIVE-optional word (optional/skippable/waived/unnecessary)
+# loosens on its own; a REQUIREMENT word (required/mandatory/enforced/needed)
+# loosens ONLY when NEGATED (`not`/`no longer`/`never`), else it TIGHTENS (`tests
+# are required` must capture).
+_PREF_GATE_WAIVED_RE = re.compile(
+    r"\b(?:%s|%s)\b(?:\s+\w+){0,3}?\s+(?:"
+    # (a) POSITIVE copula + a positive-optional word (`review is optional`, `is now
+    #     optional`) — one non-negator adverb allowed, but NOT a negator (`is not
+    #     optional` = TIGHTENING must not match):
+    r"(?:is|are|can be|could be|may be|be|been|being|was|were|remains?|stays?|"
+    r"becomes?|became|gets?|got)\s+(?:(?!not\b|never\b|no\b)\w+\s+){0,1}?"
+    r"(?:optional|skippable|skipped|waived|unnecessary|non-?mandatory)"
+    r"|"
+    # (b) POSITIVE copula + a NEGATED requirement (`tests are not required`, `ci is
+    #     no longer mandatory`):
+    r"(?:is|are|be|been|being|was|were|remains?|stays?|gets?|got)\s+"
+    r"(?:no longer|not|never)\s+(?:\w+\s+){0,1}?"
+    r"(?:required|mandatory|mandated|needed|necessary|enforced|run)"
+    r"|"
+    # (c) NEGATED copula + a requirement word (`review isn't required`, `lint isn't
+    #     necessary`, `reviews aren't enforced`) — the negation fused into the copula:
+    r"(?:isn'?t|aren'?t|wasn'?t|weren'?t|won'?t\s+be|no longer)\s+(?:\w+\s+){0,1}?"
+    r"(?:required|mandatory|mandated|needed|necessary|enforced)"
+    r")\b"
+    % (_PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK), re.I)
+# Form 2b: `make/treat/render/mark/consider/keep/deem <the> <gate-noun> [as]
+# optional/skippable/waived` — the transitive "make X optional" loosening the
+# copular `<noun> is optional` form misses.
+_PREF_GATE_MADE_OPTIONAL_RE = re.compile(
+    r"\b(?:make|makes|making|treat|treats|treating|render|renders|rendering|"
+    r"mark|marks|marking|consider|considers|considering|keep|keeps|keeping|"
+    r"leave|leaves|leaving|deem|deems|deeming)\s+"
+    r"(?:the\s+|a\s+|any\s+|all\s+|our\s+|your\s+)?(?:\w+\s+){0,1}?"
+    r"(?:%s|%s)\s+(?:as\s+)?"
+    r"(?:optional|skippable|waived|unnecessary|non-?mandatory)\b"
+    % (_PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK), re.I)
+# Form 2d: SEPARABLE `turn <the> <gate> off` (`turn ci off`, `turn the tests off`) —
+# GOVERNS handles the contiguous `turn off ci` unit; this catches the split object.
+_PREF_GATE_TURN_OFF_RE = re.compile(
+    r"\bturn\s+(?:the\s+|a\s+|any\s+|all\s+|our\s+|your\s+)?(?:\w+\s+){0,2}?"
+    r"(?:%s|%s)(?:\s+\w+){0,2}?\s+off\b"
+    % (_PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK), re.I)
+# Form 2e: PERMIT-FAILURE family — `allow/let the <gate> [to] fail`, `<gate> (should)
+# be non-blocking`, `non-blocking <gate>`, `<gate> [failures] should not block` — a
+# gate that may FAIL without blocking is a weakened gate.
+_PREF_GATE_PERMIT_FAIL_RE = re.compile(
+    r"\b(?:"
+    r"(?:allow|allows|allowing|let|lets|letting|permit\w*|tolerat\w*)\s+"
+    r"(?:the\s+|a\s+|any\s+|all\s+|our\s+|your\s+)?(?:\w+\s+){0,2}?"
+    r"(?:%s|%s)(?:\s+\w+){0,3}?\s+(?:to\s+)?"
+    r"(?:fail\w*|break\w*|error\w*|be\s+red)"
+    r"|(?:non-?blocking|not\s+block\w*|do(?:es)?n'?t\s+block|should(?:\s?n'?t|\s+not)\s+block)"
+    r"\s+(?:\w+\s+){0,2}?(?:%s|%s)"
+    r"|(?:%s|%s)(?:\s+failures?)?(?:\s+\w+){0,3}?\s+(?:should\s+|must\s+|will\s+)?"
+    r"(?:be\s+)?(?:non-?blocking|(?:should\s+|must\s+)?(?:not|never)\s+block\w*)"
+    r")\b" % (_PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK,
+             _PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK,
+             _PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK), re.I)
+# Form 2c: `no need to <enforce> [the] <gate>` / `no need for the <STRONG gate>` —
+# the "no need" negator (distinct from "don't need") loosening a gate. The `for`
+# branch is STRONG-noun-only so a benign `no need for the release notes` (release
+# = weak) still captures.
+_PREF_GATE_NO_NEED_RE = re.compile(
+    r"\bno\s+need\s+(?:"
+    r"to\s+(?:run|runs|running|execute\w*|perform\w*|do|have|check\w*|validat\w*|"
+    r"verif\w*|enforc\w*|require\w*|pass)\b(?:\s+\w+){0,3}?\s+"
+    r"(?:the\s+|a\s+|an\s+|any\s+|all\s+|our\s+|your\s+)?(?:%s|%s)"
+    r"|for\s+(?:the\s+|a\s+|an\s+)?(?:%s))\b"
+    % (_PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK, _PREF_GATE_NOUN_STRONG), re.I)
+# NEGATION inverts polarity (audit round-2/3). A NEGATED ENFORCE verb LOOSENS
+# (`never run the tests`, `no longer enforce lint`, `we no longer need the tests`);
+# a NEGATED LOOSEN verb TIGHTENS (`never skip the tests`, `avoid skipping tests`)
+# and must NOT refuse. `_pref_loosens_gate` scrubs negated loosen verbs before the
+# positive-loosen checks, and treats a negated enforce verb near a gate noun as
+# loosening. `avoid`/`prevent` act as negators too (they negate the following verb).
+# STRICT negators for NEG_ENFORCE (negator + enforce verb = loosening). NOTABLY
+# EXCLUDES `avoid`/`prevent`: `avoid running tests on every keystroke` /
+# `prevent running tests in the editor` are benign FREQUENCY/perf prefs, NOT gate
+# loosening — only an explicit negation (`never/don't/no need`) reliably loosens.
+_PREF_NEG = (r"never|not|no longer|don'?t|do not|dont|does\s?n'?t|didn'?t|won'?t|"
+             r"stops?(?:\s+running)?|ceased?|no need(?:\s+to)?|no longer need")
+# LOOSE negators for NEG_LOOSEN (negator + LOOSEN verb = TIGHTENING, scrubbed out):
+# here `avoid`/`prevent` DO count — `avoid skipping the tests` is tightening.
+_PREF_NEG_LOOSE = (r"%s|avoids?|avoiding|prevents?|preventing" % _PREF_NEG)
+_PREF_NEG_ENFORCE_RE = re.compile(
+    # the negator must DIRECTLY govern the enforce verb (at most one adverb between),
+    # else `never SKIP the verify gate` / `never push without RUNNING the tests`
+    # (both TIGHTENING — the negator governs skip/push, not verify/run) false-match.
+    r"\b(?:%s)\s+"
+    # the 1-word filler may be an ADVERB but NOT a LOOSEN verb — else `never SKIP
+    # running the tests` (tightening: never governs skip) mis-reads as `never …
+    # running …` (loosening).
+    r"(?:(?!skip|disabl|bypass|ignor|waiv|omit|forgo|forego|circumvent|sidestep|"
+    r"suppress|relax|weaken|loosen|turn|push|make|treat|keep)\w+\s+){0,1}?"
+    r"(?:run|runs|running|require\w*|enforc\w*|mandat\w*|check\w*|validat\w*|"
+    r"verif\w*|need\w*|have\s+to|has\s+to|had\s+to|bother\s+with)\b"
+    # bounded filler spans an infinitive object (`don't need TO RUN the tests`):
+    r"(?:\s+\w+){0,3}?\s+"
+    r"(?:the\s+|a\s+|an\s+|any\s+|all\s+|our\s+|your\s+)?"
+    r"(?:%s|%s)\b" % (_PREF_NEG, _PREF_GATE_NOUN_STRONG, _PREF_GATE_NOUN_WEAK),
+    re.I)
+_PREF_NEG_LOOSEN_RE = re.compile(
+    r"\b(?:%s)\s+(?:\w+\s+){0,1}?(?:skip\w*|disabl\w*|bypass\w*|ignor\w*|waiv\w*|"
+    r"omit\w*|forgo|forego|circumvent\w*|sidestep\w*|suppress\w*|relax\w*|"
+    r"weaken\w*|loosen\w*|turn\w*|allow\w*|lets?|letting|permit\w*|tolerat\w*|"
+    # make/treat/keep... a gate optional is ALSO loosening, so a NEGATED one
+    # (`never make review optional`, `don't keep tests optional`, `never turn ci
+    # off`, `never allow tests to fail`) is TIGHTENING:
+    r"make\w*|treat\w*|keep\w*|mark\w*|leave\w*|render\w*|consider\w*|deem\w*)\b"
+    % _PREF_NEG_LOOSE, re.I)
 
 
 def _pref_is_capturable(text):
     """(a) noise bar — True iff `text` is a durable, future-affecting preference."""
-    t = (text or "").strip()
+    if not isinstance(text, str):        # tolerate a non-str queue record text
+        return False
+    t = text.strip()
     if not t:
         return False
     low = t.lower()
@@ -5677,39 +5838,100 @@ def _pref_hits_kernel(text):
     """(b) kernel-path refusal — True iff `text` names any kernel/package path,
     INCLUDING a bare kernel basename (AGENTS.md, steering, agentware.sh) that the
     '/'-filtered `_text_hits_kernel_path` is deliberately blind to. Tokenize the
-    text (strip wrapping quotes/brackets + trailing punctuation) and run the
-    per-token `_has_kernel_path_segment` in ADDITION to the path-shaped scan."""
-    if not text:
+    text and run the per-token `_has_kernel_path_segment` in ADDITION to the
+    path-shaped scan, over BOTH the raw text AND an invisible-stripped variant."""
+    if not text or not isinstance(text, str):    # tolerate non-str queue text
         return False
-    if _text_hits_kernel_path(text):
-        return True
-    for raw_tok in text.split():
-        tok = raw_tok.strip("\"'`()[]{}<>|").rstrip(".,;:!?")
-        if tok and _has_kernel_path_segment(tok):
+    # Check TWO variants: (1) the raw text — where `str.split()` treats a unicode
+    # space (NBSP) as a SEPARATOR, so `foo<NBSP>AGENTS.md` surfaces `AGENTS.md`; and
+    # (2) an invisible-stripped variant, where an invisible space INSIDE a token
+    # (`AGENTS<NBSP>.md` / `AGENTS<ZWSP>.md`) is REMOVED so the basename re-forms.
+    # Together they close both the split-hiding and glue-hiding invisible evasions.
+    variants = [text]
+    stripped = _strip_kernel_invisibles(text)
+    if stripped != text:
+        variants.append(stripped)
+    for variant in variants:
+        if _text_hits_kernel_path(variant):
             return True
+        # `_kernel_subtokens` closes the audit's normalization-evasion shapes
+        # (markdown emphasis, tilde, possessive, comma/`=`/em-dash glue, unicode
+        # quotes/sigils/homoglyphs) per token before `_has_kernel_path_segment`.
+        for raw_tok in variant.split():
+            for tok in _kernel_subtokens(raw_tok):
+                if _has_kernel_path_segment(tok):
+                    return True
     return False
 
 
 def _pref_loosens_gate(text):
-    """(c) tighten-not-loosen — True iff `text` reads as WEAKENING a gate."""
-    if not text:
+    """(c) tighten-not-loosen — True iff `text` reads as WEAKENING a governance
+    gate. Balanced for precision AND negation polarity (no over-refusal of benign
+    or TIGHTENING prose):
+    (2) a governance noun declared optional/skippable/not-required;
+    (neg-enforce) a NEGATED enforce verb near a gate noun (`never run the tests`);
+    (4) a POSITIVE loosen verb + a STRONG noun; (1) a POSITIVE loosen verb DIRECTLY
+    governing any gate noun — both after SCRUBBING negated loosen verbs, so a
+    TIGHTENING `never skip the tests` / `don't disable lint` is admitted."""
+    if not text or not isinstance(text, str):        # tolerate non-str queue text
         return False
-    return bool(_PREF_LOOSEN_VERB_RE.search(text)
-                and _PREF_GATE_NOUN_RE.search(text))
+    # Neutralize NEGATED loosen/make-optional verbs FIRST — they read as TIGHTENING
+    # (`never skip the tests`, `never make review optional`, `avoid skipping tests`)
+    # and must NOT refuse. Run the optional/made-optional/positive-loosen forms on
+    # the SCRUBBED text; the NO_NEED + NEG_ENFORCE forms are inherently negated and
+    # run on the raw text.
+    scrubbed = _PREF_NEG_LOOSEN_RE.sub(" ", text)
+    if _PREF_GATE_WAIVED_RE.search(scrubbed):        # form 2 (`X is optional`)
+        return True
+    if _PREF_GATE_MADE_OPTIONAL_RE.search(scrubbed):  # form 2b (`make X optional`)
+        return True
+    if _PREF_GATE_TURN_OFF_RE.search(scrubbed):      # form 2d (`turn ci off`)
+        return True
+    if _PREF_GATE_PERMIT_FAIL_RE.search(scrubbed):   # form 2e (`allow tests to fail`)
+        return True
+    if _PREF_GATE_NO_NEED_RE.search(text):           # form 2c (`no need to run X`)
+        return True
+    if _PREF_NEG_ENFORCE_RE.search(text):            # negated enforcement = loosening
+        return True
+    if _PREF_LOOSEN_VERB_RE.search(scrubbed) and _PREF_GATE_NOUN_RE.search(scrubbed):
+        return True                                  # form 4
+    if _PREF_LOOSEN_GOVERNS_RE.search(scrubbed):     # form 1
+        return True
+    return False
 
 
 def _current_project_signal():
-    """The checkout's project_name (for the Task-1 normalizer), or None. Uses the
-    SAME resolution as `whereami`: AGENTWARE_INVOKED_FROM if set, else CWD."""
-    start = os.environ.get("AGENTWARE_INVOKED_FROM") or os.getcwd()
+    """The checkout's project_name for the Task-1 normalizer, or None.
+
+    SYMMETRY with injection (Task 5, audit LOW / Q4): resolve ONLY from
+    AGENTWARE_INVOKED_FROM. When it is UNSET, return None (GLOBAL) — the SAME as
+    the session-start injection resolver, which passes an empty `--project` (global)
+    when the var is unset. The old `os.getcwd()` fallback project-scoped a
+    plain-session capture while injection treated that same session as global, so
+    the pref was captured yet NEVER surfaced (silent mis-scope). Unset now means
+    GLOBAL on BOTH sides."""
+    start = os.environ.get("AGENTWARE_INVOKED_FROM")
+    if not start:
+        return None
     return _resolve_context(start).get("project_name") or None
 
 
-def _prefer_delete_entry(kdir, eid):
+def _prefer_delete_entry(kdir, eid, require_preference=False, archive_dir=None):
     """Drop a captured preference: remove it from the index via the guarded
     `cmd_index_remove` AND unlink its orphaned `.md`. Returns
     (removed_entry_or_None, err_or_None); a MISSING id is (None, None) — not an
-    error — so the exact-key supersede is a no-op on the first capture."""
+    error — so the exact-key supersede is a no-op on the first capture.
+
+    `require_preference` (used by `prefer forget`, audit MEDIUM): REFUSE to delete
+    an entry that is not a GENUINE capture — it MUST be `preference`-tagged AND
+    `source=user`. Without this, `forget <any-id>` would remove ANY KB entry by id
+    (and unlink its `.md`) with a false "reversible" promise. The `_prefer_capture`
+    supersede path passes its OWN capture id with the guard OFF, so it is
+    unaffected (that id is always a preference/source=user entry anyway).
+
+    `archive_dir` (used by `prefer forget`): copy the `.md` there BEFORE the
+    index-remove + unlink, so a forgotten capture is genuinely recoverable — the
+    honest reversibility the old unconditional message merely claimed."""
     data, err = load_index(kdir)
     if err is not None:
         return None, err
@@ -5717,13 +5939,37 @@ def _prefer_delete_entry(kdir, eid):
                   if isinstance(e, dict) and e.get("id") == eid), None)
     if match is None:
         return None, None
+    if require_preference:
+        is_pref = "preference" in (match.get("tags") or [])
+        is_user = _pref_entry_is_user_source(kdir, match)
+        # Orphan tolerance (audit LOW): a genuine capture whose `.md` is MISSING/
+        # unreadable cannot prove source=user via frontmatter, so fall back to the
+        # capture-id prefix (`learn-pref-…`) — the verb must stay able to revoke its
+        # OWN (orphaned) capture. The strong source=user check still applies whenever
+        # the `.md` exists, so a real non-capture is never newly forgettable.
+        if is_pref and not is_user:
+            mpath = match.get("path")
+            if not mpath or not os.path.isfile(os.path.join(kdir, mpath)):
+                is_user = str(eid).startswith("learn-pref-")
+        if not (is_pref and is_user):
+            return None, (
+                "refusing to forget '%s' — not a captured preference (source=user "
+                "AND tag=preference required). `prefer forget` only revokes "
+                "captures; use `index remove` for other entries." % eid)
+    path = match.get("path")
+    if archive_dir and path:
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            shutil.copy2(os.path.join(kdir, path),
+                         os.path.join(archive_dir, os.path.basename(path)))
+        except OSError:
+            pass
     ns = argparse.Namespace(id=eid, format="json")
     with open(os.devnull, "w", encoding="utf-8") as _dn, \
             contextlib.redirect_stdout(_dn):
         rc = cmd_index_remove(ns)
     if rc != 0:
         return None, "failed to remove index entry '%s'" % eid
-    path = match.get("path")
     if path:
         try:
             os.remove(os.path.join(kdir, path))
@@ -5732,10 +5978,47 @@ def _prefer_delete_entry(kdir, eid):
     return match, None
 
 
+def _prefer_write_migration_gate(kdir):
+    """Migration contract for the prefer WRITE subcommands (Task 7, 260713).
+
+    `prefer capture`/`forget` dispatch as `cmd_prefer`, which is EXCLUDED from the
+    migration auto-apply set (`_kb_autoapply_funcs`) so its READ-ONLY subcommands
+    (digest/list/scan-queue/seed-cursor) never trigger a schema WRITE inside the
+    session-start / Stop hooks. That exclusion must NOT let a WRITE proceed while a
+    RESTRUCTURING migration is pending — the same case `_kb_predispatch_gate`
+    refuses for `learn`/`decide` — so a preference never lands against a schema
+    about to be restructured. Refuse it here for the write paths (version-refusal
+    for a NEWER KB already fired at the cmd_prefer predispatch, so this only sees
+    cur <= KB_SCHEMA_VERSION). A pending ADDITIVE migration is intentionally NOT
+    auto-applied here: that schema WRITE belongs to a real writer verb, not a
+    hook-adjacent dual-mode func, and additive fields are forward-compatible — a
+    capture written before them stays valid and is migrated by the next writer or
+    an explicit `migrate --apply`. No-op for an uninitialized KB (onboarding path).
+    Returns an exit code to short-circuit, else None."""
+    if not kdir or not os.path.isdir(kdir):
+        return None
+    if not os.path.isfile(os.path.join(kdir, SENTINEL_REL)):
+        return None
+    restructuring = next(
+        (m for m in _kb_pending_migrations(kdir) if m[1] != "additive"), None)
+    if restructuring is None:
+        return None
+    ver, _tier, name, _fn = restructuring
+    sys.stderr.write(
+        "agentware: refusing to capture — a restructuring migration (%d %s) is "
+        "pending; run `scripts/agentware migrate --apply` first (a preference "
+        "write must never land against a schema about to be restructured).\n"
+        % (ver, name))
+    return 1
+
+
 def _prefer_capture(args):
     kdir = require_knowledge_dir()
     if not kdir:
         return 1
+    _mgate = _prefer_write_migration_gate(kdir)
+    if _mgate is not None:
+        return _mgate
     text = (getattr(args, "text", None) or "").strip()
 
     # The REFUSALS run BEFORE the noise bar: a capture naming a kernel/package
@@ -5839,12 +6122,21 @@ def _prefer_list(args):
 
 
 def _prefer_forget(args):
-    """Reversible revoke: remove a captured preference by id + unlink its file."""
+    """Revoke a captured preference by id. Refuses anything that is not a genuine
+    capture (source=user AND tag=preference — see `_prefer_delete_entry`), ARCHIVES
+    the `.md` for genuine reversibility, then removes the index entry + unlinks the
+    live file. Honest ack: the entry is REMOVED (not silently 'reversible')."""
     kdir = require_knowledge_dir()
     if not kdir:
         return 1
+    _mgate = _prefer_write_migration_gate(kdir)
+    if _mgate is not None:
+        return _mgate
     eid = args.id
-    removed, err = _prefer_delete_entry(kdir, eid)
+    archive_rel = os.path.join("logs", "steering", "forgotten")
+    removed, err = _prefer_delete_entry(
+        kdir, eid, require_preference=True,
+        archive_dir=os.path.join(kdir, archive_rel))
     if err is not None:
         sys.stderr.write("agentware: %s\n" % err)
         return 1
@@ -5852,9 +6144,22 @@ def _prefer_forget(args):
         sys.stderr.write(
             "agentware: no captured preference with id '%s'\n" % eid)
         return 1
-    path = removed.get("path") or "(no file)"
-    print("forgot: %s (unlinked %s) — reversible: re-capture to restore."
-          % (eid, path))
+    path = removed.get("path")
+    if path:
+        archived_rel_file = os.path.join(archive_rel, os.path.basename(path))
+        # HONEST ack (audit round-2): only claim unlinked+archived when it actually
+        # happened — an ORPHANED capture (its .md was already gone) archives nothing.
+        if os.path.isfile(os.path.join(kdir, archived_rel_file)):
+            print("forgot: %s — removed from the index and unlinked %s; archived "
+                  "to %s (re-capture, or re-index the archived file, to restore)."
+                  % (eid, path, archived_rel_file))
+        else:
+            print("forgot: %s — removed from the index; its .md (%s) was already "
+                  "missing, so nothing was archived. Re-capture to restore."
+                  % (eid, path))
+    else:
+        print("forgot: %s — removed from the index (no .md file); re-capture to "
+              "restore." % eid)
     return 0
 
 
@@ -5873,7 +6178,14 @@ def _prefer_forget(args):
 # SECOND producer writing the same record shape, with zero drain rework (Q5).
 PREFER_QUEUE_REL = "logs/steering/prefer-queue.jsonl"
 PREFER_QUEUE_CURSOR_REL = "logs/steering/.prefer-queue.cursor.json"
+PREFER_QUEUE_ARCHIVE_REL = "logs/steering/prefer-queue.archive.jsonl"
 PREFER_QUEUE_PRODUCER = "stop-hook-regex"
+# Producer/drain bounds (Task 6, 260713): keep the LIVE queue + the per-session
+# watermark dict from growing without limit. Below the cap the paths are
+# byte-identical to the unbounded behavior (the common small-queue case).
+_PREFER_QUEUE_CAP = 500      # live-queue rotation threshold: terminal records past
+                             # this are archived to a file the producer never reads
+_PREFER_CURSOR_CAP = 200     # per-session watermark-dict cap (oldest sids pruned)
 
 # The layer-2 producer cue — DELIBERATELY broader/cheaper than the capture-time
 # `_PREF_CUE_RE`: a human turn matching any of these phrases is a CANDIDATE for
@@ -5915,8 +6227,44 @@ def _prefer_cand_fp(sid, turn_id, text):
     """Stable candidate fingerprint for the dedup safety net (belt to the
     watermark's braces): session + turn id + a hash of the normalized text."""
     import hashlib
-    h = hashlib.sha1(((text or "").strip()).encode("utf-8")).hexdigest()[:12]
+    txt = (text if isinstance(text, str) else "").strip()   # tolerate non-str text
+    h = hashlib.sha1(txt.encode("utf-8")).hexdigest()[:12]
     return "%s\x1f%s\x1f%s" % (sid or "", turn_id or "", h)
+
+
+def _prefer_archive_fingerprints(apath, max_bytes=262144):
+    """Fingerprints of RECENTLY archived candidates — a BOUNDED tail read of the
+    drain's archive so the producer's dedup belt also suppresses a candidate that
+    was drained + archived OUT of the live queue. This preserves at-most-once
+    across a watermark reset (log rotation) AFTER archival, not only within the
+    live queue. Reads only the last `max_bytes` (discarding a leading partial
+    line), so it stays bounded regardless of archive size; empty on absent/error."""
+    fps = set()
+    try:
+        size = os.path.getsize(apath)
+    except OSError:
+        return fps
+    try:
+        with open(apath, "rb") as af:
+            if size > max_bytes:
+                af.seek(size - max_bytes)
+                af.readline()          # discard the (possibly partial) first line
+            blob = af.read()
+    except OSError:
+        return fps
+    for line in blob.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        fps.add(_prefer_cand_fp(rec.get("sid"), rec.get("turn_id"),
+                                rec.get("text")))
+    return fps
 
 
 def _prefer_queue_scan(kdir, sid, cwd, prompts_path=None):
@@ -5985,10 +6333,18 @@ def _prefer_queue_scan(kdir, sid, cwd, prompts_path=None):
                             rec = json.loads(line)
                         except ValueError:
                             continue
+                        if not isinstance(rec, dict):
+                            continue
                         seen.add(_prefer_cand_fp(
                             rec.get("sid"), rec.get("turn_id"), rec.get("text")))
             except OSError:
                 seen = set()
+        # Also suppress fingerprints of RECENTLY ARCHIVED candidates (bounded tail
+        # read) so a watermark reset (log rotation) after archival cannot re-queue
+        # an already-drained candidate — at-most-once holds across the archive
+        # boundary, not only within the live queue.
+        seen |= _prefer_archive_fingerprints(
+            os.path.join(kdir, PREFER_QUEUE_ARCHIVE_REL))
 
         out_lines = []
         for hdr, bodytext in _parse_prompts_records(chunk):
@@ -6032,8 +6388,21 @@ def _prefer_queue_scan(kdir, sid, cwd, prompts_path=None):
             with open(qpath, "a", encoding="utf-8") as qf:
                 qf.write("\n".join(out_lines) + "\n")
         # Advance the watermark to EOF unconditionally so scanned-but-unmatched
-        # turns are never re-walked (idempotent across consecutive Stops).
+        # turns are never re-walked (idempotent across consecutive Stops). Re-insert
+        # `sid` at the END so dict order tracks LAST-ACTIVITY (LRU): a plain
+        # `cursors[sid] = end` update does NOT reorder, so a still-ACTIVE but
+        # early-first-seen session could otherwise be evicted by the prune below and
+        # then, on a re-seed to EOF, skip its own logged-but-unscanned turns.
+        cursors.pop(sid, None)
         cursors[sid] = end
+        # Bound the per-session watermark dict (Task 6): prune the LEAST-RECENTLY-
+        # ACTIVE sessions past the cap. With the LRU re-insert above, eviction hits
+        # only genuinely-idle sessions (never the current sid, always kept).
+        if len(cursors) > _PREFER_CURSOR_CAP:
+            keep = list(cursors)[-_PREFER_CURSOR_CAP:]
+            if sid not in keep:
+                keep = keep[1:] + [sid]
+            cursors = {k: cursors[k] for k in keep}
         _atomic_write(cpath, json.dumps(cursors, ensure_ascii=False))
         return len(out_lines)
     except Exception:
@@ -6058,6 +6427,78 @@ def _prefer_scan_queue(args):
         getattr(args, "cwd", None) or "",
         prompts_path=getattr(args, "prompts", None) or None)
     print("prefer scan-queue: %d candidate(s) queued" % n)
+    return 0
+
+
+def _prefer_seed_cursor(kdir, sid, prompts_path=None):
+    """Seed a NEW session's watermark to the CURRENT prompts.log size (Task 6,
+    audit LOW): called from session-start.sh so the FIRST Stop of a session scans
+    only bytes written DURING this session, not the entire cross-session
+    prompts.log from offset 0 (the part that contradicts the never-re-walking
+    contract and grows with an unrotated log). At SessionStart none of this
+    session's turns are logged yet, so the current EOF is a correct lower bound.
+
+    Idempotent: a no-op when `sid` already has a cursor, so a resume never clobbers
+    an advanced watermark. Best-effort + flock-serialized (shares the producer's
+    lock so a concurrent Stop cannot race the cursor write). Returns True iff it
+    seeded; never raises (session start must never fail on capture)."""
+    if not kdir or not sid:
+        return False
+    logp = prompts_path or os.path.join(kdir, "logs", "prompts.log")
+    qpath = os.path.join(kdir, PREFER_QUEUE_REL)
+    cpath = os.path.join(kdir, PREFER_QUEUE_CURSOR_REL)
+    try:
+        os.makedirs(os.path.dirname(qpath), exist_ok=True)
+    except OSError:
+        return False
+    import fcntl
+    lockp = qpath + ".lock"
+    try:
+        lf = open(lockp, "a+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        lf.close()
+        return False
+    try:
+        cursors = {}
+        try:
+            with open(cpath, encoding="utf-8") as cf:
+                cursors = json.load(cf) or {}
+        except (OSError, ValueError):
+            cursors = {}
+        if not isinstance(cursors, dict):
+            cursors = {}
+        if sid in cursors:
+            return False        # idempotent: never clobber an advanced watermark
+        try:
+            fsize = os.path.getsize(logp)
+        except OSError:
+            fsize = 0
+        cursors[sid] = fsize
+        _atomic_write(cpath, json.dumps(cursors, ensure_ascii=False))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lf.close()
+
+
+def _prefer_seed_cursor_cli(args):
+    """CLI wrapper for the session-start cursor seed (invoked by session-start.sh).
+    Emits NOTHING to stdout — session-start.sh's stdout IS the hook payload — and
+    ALWAYS exits 0 (session start must never fail on capture)."""
+    kdir = resolve_knowledge_dir()
+    if not kdir or not os.path.isdir(kdir):
+        return 0
+    _prefer_seed_cursor(kdir, getattr(args, "sid", None) or "",
+                        prompts_path=getattr(args, "prompts", None) or None)
     return 0
 
 
@@ -6107,6 +6548,16 @@ def _prefer_emit_workorder(kdir, text, fp):
     keyslug = (_slugify(text or "")[:40]).strip("-") or "pref"
     h = hashlib.sha1((fp or text or "").encode("utf-8")).hexdigest()[:10]
     slug = "pref-%s-%s" % (keyslug, h)
+    # Crash-recovery (Task 6, audit LOW): if the workorder for this candidate
+    # ALREADY exists on disk — a crash between a prior emit and the end-of-loop
+    # queue write left the record `status:queued` with its workorder orphaned — the
+    # re-emit would refuse (feature exists) and the candidate would be permanently
+    # wedged queued, MIS-labeled draft-capped (the orphan also inflates the g3 cap).
+    # Detect the existing workorder and return it as SUCCESS so the re-drain marks
+    # the record proposed (no double emit, no wedge). The slug embeds the candidate
+    # fingerprint, so this is the SAME candidate, not a collision.
+    if os.path.isfile(os.path.join(kdir, "work", "auto", slug, "plan.md")):
+        return "auto/" + slug, None
     ns = argparse.Namespace(
         feature=slug, title="Review captured steering preference candidate",
         auto=True, self_extension=False,
@@ -6131,13 +6582,17 @@ def _render_prefer_classify_report(recs, proposed_now, rejected_now,
     """Deterministic, report-only surface for the drain. FINAL-state sections
     (byte-stable across idempotent re-runs) plus the this-run action counts. No
     clocks / run-ids in the body (INV-1)."""
+    # isinstance-guarded (audit round-2): the producer-agnostic queue may contain a
+    # non-object JSON line (a future producer / manual edit); `.get` on a non-dict
+    # would crash the report render (and thus the drain rewrite).
+    recs = [r for r in recs if isinstance(r, dict)]
     proposed = [r for r in recs if r.get("status") == "proposed"]
     rejected = [r for r in recs if r.get("status") == "rejected"]
     journaled = [r for r in recs if r.get("status") == "journaled"]
     queued = [r for r in recs if r.get("status") == "queued"]
 
     def _first(t):
-        t = (t or "").strip()
+        t = (t if isinstance(t, str) else "").strip()
         return t.splitlines()[0] if t else ""
 
     lines = [
@@ -6188,6 +6643,33 @@ def _render_prefer_classify_report(recs, proposed_now, rejected_now,
         lines.append("_none_")
     lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _prefer_rotate_split(recs):
+    """Bound the LIVE queue (Task 6): split drained records into (kept, archived)
+    when the live queue exceeds `_PREFER_QUEUE_CAP`, else return None (no rotation
+    — the common small-queue path stays byte-identical). LIVE = queued + proposed
+    (proposed still awaits `prefer approve` and is read by it); TERMINAL =
+    everything else (rejected/journaled/approved). Archives the OLDEST terminal
+    records (list order = chronological append order) so the retained set is capped
+    while `kept` preserves overall record order."""
+    valid = [r for r in recs if isinstance(r, dict)]
+    if len(valid) <= _PREFER_QUEUE_CAP:
+        return None
+    live, terminal = [], []
+    for r in valid:
+        if r.get("status") in ("queued", "proposed"):
+            live.append(r)
+        else:
+            terminal.append(r)
+    keep_terminal = max(0, _PREFER_QUEUE_CAP - len(live))
+    drop = terminal[:max(0, len(terminal) - keep_terminal)]
+    if not drop:
+        return None                       # all-live over cap: nothing archivable
+    drop_ids = set(map(id, drop))
+    kept = [r for r in recs
+            if not (isinstance(r, dict) and id(r) in drop_ids)]
+    return kept, drop
 
 
 def _prefer_classify_drain(kdir):
@@ -6255,11 +6737,33 @@ def _prefer_classify_drain(kdir):
                 rec["workorder"] = feature
                 proposed_n += 1
                 changed = True
-        if changed:
-            _atomic_write(qpath, "\n".join(
-                json.dumps(r, ensure_ascii=False) for r in recs) + "\n")
+        # Render the report from this run's FULL record view BEFORE any archival
+        # rotation, so the run summary stays complete.
         body = _render_prefer_classify_report(
             recs, proposed_n, rejected_n, journaled_n, deferred_n)
+        # Bound the LIVE queue (Task 6, audit LOW): archive terminal records past
+        # the cap to a separate file so the live-queue read/rewrite stays bounded.
+        # The producer does NOT scan the whole archive, but DOES fold a BOUNDED
+        # tail of it into its dedup belt (`_prefer_archive_fingerprints`), so a
+        # watermark reset after archival still cannot re-queue an already-drained
+        # candidate. Below the cap nothing is archived (byte-identical small path).
+        kept, archived = recs, []
+        split = _prefer_rotate_split(recs)
+        if split is not None:
+            kept, archived = split
+        if changed or archived:
+            _atomic_write(qpath, "\n".join(
+                json.dumps(r, ensure_ascii=False) for r in kept) + "\n")
+        if archived:
+            try:
+                apath = os.path.join(kdir, PREFER_QUEUE_ARCHIVE_REL)
+                os.makedirs(os.path.dirname(apath), exist_ok=True)
+                with open(apath, "a", encoding="utf-8") as af:
+                    af.write("\n".join(
+                        json.dumps(r, ensure_ascii=False)
+                        for r in archived) + "\n")
+            except OSError:
+                pass
         rpath = os.path.join(kdir, PREFER_CLASSIFY_REPORT_REL)
         try:
             os.makedirs(os.path.dirname(rpath), exist_ok=True)
@@ -6319,9 +6823,11 @@ def cmd_prefer_approve(args):
                 if not line:
                     continue
                 try:
-                    recs.append(json.loads(line))
+                    rec = json.loads(line)
                 except ValueError:
                     continue
+                if isinstance(rec, dict):        # skip a non-object queue line
+                    recs.append(rec)
         hit = next((r for r in recs
                     if r.get("status") == "proposed"
                     and r.get("workorder") == target), None)
@@ -6389,6 +6895,16 @@ def _pref_digest_entries(kdir, data, proj_slug):
             continue
         if not _pref_entry_is_user_source(kdir, e):
             continue
+        # Injection defense-in-depth (Task 4, audit LOW): re-apply the hardened
+        # capture governance filter to each candidate summary and EXCLUDE any that
+        # would be REFUSED at capture time. A `preference`/`source=user` entry
+        # created OUTSIDE the verb — e.g. a raw `learn --source user --tag
+        # preference "AGENTS.md is optional"` — bypasses the capture gate but still
+        # renders here; the digest is the LAST line before fleet-wide amplification,
+        # so it must not inject a kernel-path / gate-loosening summary either.
+        summ = e.get("summary") or ""
+        if _pref_hits_kernel(summ) or _pref_loosens_gate(summ):
+            continue
         proj_tags = _pref_project_tags(e)
         if proj_tags:
             if proj_slug is None or proj_slug not in proj_tags:
@@ -6435,7 +6951,12 @@ def _prefer_digest(args):
     kdir = require_knowledge_dir()
     if not kdir:
         return 0
-    data, err = load_index(kdir)
+    # READ-ONLY (Task 3, audit MEDIUM): _allow_rebuild=False so a missing/corrupt
+    # index at SessionStart returns a non-None err and yields a clean empty digest
+    # WITHOUT triggering a rebuild WRITE (mirrors rebuild_kb's read-only load). The
+    # legitimate self-heal still fires on the next real write verb or an explicit
+    # `index rebuild` — SessionStart stays genuinely read-only + fast.
+    data, err = load_index(kdir, _allow_rebuild=False)
     if err or not data:
         return 0
     signal = (getattr(args, "project", None) or "").strip()
@@ -6465,12 +6986,15 @@ def cmd_prefer(args):
         return _prefer_forget(args)
     if subcmd == "scan-queue":
         return _prefer_scan_queue(args)
+    if subcmd == "seed-cursor":
+        return _prefer_seed_cursor_cli(args)
     if subcmd == "approve":
         return cmd_prefer_approve(args)
     sys.stderr.write(
         "agentware: usage: prefer capture <text> [--global|--project SLUG] | "
         "prefer digest [--project SIGNAL] | prefer list | prefer forget <id> | "
-        "prefer approve <workorder> | prefer scan-queue --sid SID --cwd CWD\n")
+        "prefer approve <workorder> | prefer scan-queue --sid SID --cwd CWD | "
+        "prefer seed-cursor --sid SID\n")
     return 2
 
 
@@ -16050,16 +16574,122 @@ def _resolves_under_repo(candidate, allow_relative=False):
     return rl == rt or rl.startswith(rt + os.sep)
 
 
+# Edge punctuation stripped from BOTH ends of a token before a kernel match: ANY
+# char that is NOT [alphanumeric . / ~]. This one class subsumes ASCII quotes/
+# brackets/pipe, markdown emphasis (* _), leading sigils (@ # -), and UNICODE
+# quotes/guillemets (smart quotes “ ” ‘ ’ « »), WITHOUT touching '.' (a leading
+# '../' traversal + a '.claude' dotfile), '/' (path structure), or '~' (handled
+# separately — a trailing/strikethrough strip vs a '~/…' home path).
+_KERNEL_TOK_EDGE_RE = re.compile(r"^[^0-9A-Za-z./~]+|[^0-9A-Za-z./~]+$")
+_KERNEL_HOME_RE = re.compile(r"~[^/]*/")   # a '~/…' or '~user/…' home-path prefix
+
+
+def _strip_kernel_invisibles(s):
+    """Remove zero-width / invisible / format / control / combining codepoints and
+    NON-ASCII space separators (NBSP …) that hide a kernel basename inside a token
+    (`AGENTS<ZWSP>.md`, `AGENTS<NBSP>.md`, `AGENTS<CGJ>.md`). CATEGORY-based so it
+    covers the whole class (all Cc/Cf/Cs/Co/Cn + Mn/Me marks + Zs/Zl/Zp separators),
+    not an enumerated few — e.g. combining grapheme joiner U+034F, invisible math
+    operators U+2061-2064, LRM/RLM/ALM. Keeps ASCII whitespace (a legit token
+    separator), so a real space still splits `foo AGENTS.md`."""
+    out = []
+    for ch in s:
+        if ch in " \t\n\r\f\v":
+            out.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat[0] == "C" or cat in ("Mn", "Me", "Zs", "Zl", "Zp"):
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+# Common Cyrillic/Greek HOMOGLYPHS -> their Latin lookalike, so a homoglyph'd
+# kernel name (e.g. `АGENTS.md` with a Cyrillic `А`) normalizes to the real token.
+# A CURATED map (not full Unicode TR39) over the ASCII letters kernel basenames
+# use; exotic confusables beyond it are a documented residual on the operator-
+# typed, source=user capture path.
+_KERNEL_CONFUSABLE_TT = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    "к": "k", "м": "m", "т": "t", "н": "h", "в": "b", "і": "i", "ѕ": "s",
+    "ԁ": "d", "ј": "j", "ԍ": "g", "ո": "n",
+    "А": "A", "Е": "E", "О": "O", "Р": "P", "С": "C", "У": "Y", "Х": "X",
+    "К": "K", "М": "M", "Т": "T", "Н": "H", "В": "B", "І": "I", "Ѕ": "S",
+    "Ј": "J",
+    "α": "a", "ο": "o", "ρ": "p", "ϲ": "c", "ς": "s", "ν": "v", "κ": "k",
+    "μ": "m", "τ": "t",
+    "Α": "A", "Β": "B", "Ε": "E", "Ο": "O", "Ρ": "P", "Τ": "T", "Κ": "K",
+    "Μ": "M", "Ν": "N", "Η": "H", "Ι": "I", "Χ": "X", "Υ": "Y", "Ζ": "Z",
+    # SLASH lookalikes -> '/' (path-separator homoglyphs NFKC does NOT fold:
+    # fraction/division/big solidus; fullwidth solidus folds via NFKC but listed
+    # for safety).
+    "⁄": "/", "∕": "/", "⧸": "/", "／": "/",
+    # DOT lookalikes -> '.' (extension-separator homoglyphs: katakana/half-width
+    # katakana middle dot, middle dot, hyphenation/one-dot-leader, ano teleia).
+    "・": ".", "･": ".", "·": ".", "‧": ".", "․": ".",
+    "·": ".",
+})
+
+
+def _norm_kernel_token(raw_tok):
+    """Normalize ONE token for a kernel-path/basename match, closing the audit's
+    normalization-evasion shapes without over-refusing. First DE-OBFUSCATES unicode
+    (drop zero-width/invisible chars, NFKC-fold fullwidth/compatibility forms, map
+    common Cyrillic/Greek homoglyphs to Latin), then iterates to a FIXPOINT so
+    STACKED shapes fully reduce (`AGENTS.md's.`, `**AGENTS.md**~`):
+      * strip edge punctuation that is NOT `.`/`/`/`~` — ASCII + UNICODE quotes/
+        brackets, markdown emphasis (`**`, `_`), and leading sigils (`@`, `#`, `-`);
+      * strip a trailing possessive (`'s`/`’s`);
+      * strip trailing sentence punctuation (a real `.claude` keeps its LEADING dot);
+      * strip a TRAILING tilde run always, and a LEADING tilde run UNLESS it is a
+        `~/…`/`~user/…` home path (which the resolve check needs intact) — so
+        `~~AGENTS.md~~`/`~steering` reduce but `~/agentware` is preserved.
+    Returns '' if nothing survives."""
+    if not raw_tok:
+        return ""
+    t = _strip_kernel_invisibles(raw_tok)
+    t = unicodedata.normalize("NFKC", t)
+    t = t.translate(_KERNEL_CONFUSABLE_TT)
+    for _ in range(8):                      # fixpoint (bounded; each pass shrinks t)
+        prev = t
+        t = _KERNEL_TOK_EDGE_RE.sub("", t)
+        if t[-2:].lower() == "'s" or t[-2:] == "’s":
+            t = t[:-2]
+        t = t.rstrip(".,;:!?").rstrip("~")
+        lead = len(t) - len(t.lstrip("~"))
+        if lead >= 2 or (lead == 1 and not _KERNEL_HOME_RE.match(t)):
+            t = t.lstrip("~")
+        if t == prev:
+            break
+    return t
+
+
+def _kernel_subtokens(raw_tok):
+    """Yield normalized kernel-match sub-tokens from ONE whitespace token: re-split
+    list/glue forms on ',', ';', '=', ':', '|' and em/en-dashes (`AGENTS.md,steering`,
+    `AGENTS.md=optional`, `AGENTS.md:CLAUDE.md`, `scripts/agentware:AGENTS.md`) — but
+    NOT a plain hyphen, so a benign compound (`product-steering`) is NOT split into a
+    kernel segment — then normalize each piece via `_norm_kernel_token`. Empty pieces
+    are dropped."""
+    for piece in re.split(r"[,;=:|—–]+", raw_tok):
+        tok = _norm_kernel_token(piece)
+        if tok:
+            yield tok
+
+
 def _has_kernel_path_segment(raw):
     """True iff `raw` carries a kernel token as a PATH-BOUNDED match — a single-
     segment token (.claude, steering, AGENTS.md, CLAUDE.md, agentware.sh) EQUAL to
     a '/'-delimited path segment, or a multi-segment token (scripts/agentware,
     scripts/hooks) matched on segment boundaries.
 
-    Segment-bounded (not a bare substring) so a legit EXTERNAL path that merely
-    CONTAINS a token as a substring is NOT over-refused: `/x/product-steering/n`
-    and `/x/.claude-backup` no longer false-match (their segments are
-    'product-steering'/'.claude-backup', not 'steering'/'.claude')."""
+    Segment-bounded (NOT a bare substring) so a legit EXTERNAL path/name that merely
+    CONTAINS a kernel token as a substring is NOT over-refused: `/x/product-steering/n`,
+    `/x/.claude-backup`, and `my-agents.md-notes` do not false-match (their segments
+    are 'product-steering'/'.claude-backup'/'my-agents.md-notes', not the kernel
+    tokens). A plain-hyphen GLUE like `AGENTS.md-advisory` is therefore admitted —
+    the same pre-existing, consistent trade-off that lets `product-steering` pass;
+    `,`/`;`/`=`/em-dash glue IS split by `_kernel_subtokens`."""
     if not raw:
         return False
     segs = [s for s in raw.casefold().replace("\\", "/").split("/") if s]
@@ -16085,20 +16715,25 @@ def _text_hits_kernel_path(text):
     if not text:
         return False
     for raw_tok in text.split():
-        # Trim wrapping quotes/brackets from BOTH ends and trailing sentence
-        # punctuation — but NEVER strip leading '.' (that would turn a '../'
-        # traversal token into an absolute '/…' and defeat the traversal check).
-        tok = raw_tok.strip("\"'`()[]{}<>|").rstrip(".,;:!?")
-        if "/" not in tok:
-            continue
-        if _has_kernel_path_segment(tok):
-            return True
-        if _resolves_under_repo(tok):                       # absolute / ~ into repo
-            return True
-        # A `..`-traversal token is suspicious enough to resolve vs CWD; a benign
-        # forward-relative token (logs/a.log) is NOT resolved, so it still emits.
-        if tok.startswith("..") and _resolves_under_repo(tok, allow_relative=True):
-            return True
+        # Normalize each token (strip wrapping quotes/brackets/emphasis, a trailing
+        # tilde, a possessive, trailing punctuation) and re-split list forms — the
+        # SAME normalization the bare-basename scan uses, so a path-shaped evasion
+        # (`**scripts/agentware**`, `foo/AGENTS.md,bar/steering`) is caught too. A
+        # leading '.' / '~' survives so the '../' traversal + '~/…'-into-repo checks
+        # still fire.
+        for tok in _kernel_subtokens(raw_tok):
+            if "/" not in tok:
+                continue
+            if _has_kernel_path_segment(tok):
+                return True
+            if _resolves_under_repo(tok):                   # absolute / ~ into repo
+                return True
+            # A `..`-traversal token is suspicious enough to resolve vs CWD; a
+            # benign forward-relative token (logs/a.log) is NOT resolved, so it
+            # still emits.
+            if tok.startswith("..") and _resolves_under_repo(
+                    tok, allow_relative=True):
+                return True
     return False
 
 
@@ -23847,6 +24482,20 @@ def build_parser():
                               help="prompts.log path (default: <kdir>/logs/"
                                    "prompts.log; overridable for tests)")
     p_pref_scanq.set_defaults(func=cmd_prefer, prefer_command="scan-queue")
+
+    # Producer robustness (Task 6, 260713): session-start seeds a NEW session's
+    # watermark to the CURRENT prompts.log size so the first Stop does not re-parse
+    # the whole cross-session log. Idempotent (never clobbers an advanced cursor).
+    p_pref_seed = prefer_sub.add_parser(
+        "seed-cursor",
+        help="session-start producer seed: set a new session's queue watermark to "
+             "the current prompts.log size (idempotent; bounds first-Stop cost)")
+    p_pref_seed.add_argument("--sid", default="",
+                             help="the current session id")
+    p_pref_seed.add_argument("--prompts", default=None,
+                             help="prompts.log path (default: <kdir>/logs/"
+                                  "prompts.log; overridable for tests)")
+    p_pref_seed.set_defaults(func=cmd_prefer, prefer_command="seed-cursor")
 
     # ingest -----------------------------------------------------------------
     p_ingest = sub.add_parser(

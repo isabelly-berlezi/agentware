@@ -8,9 +8,19 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-cat >/dev/null 2>&1 || true   # consume stdin
+_hook_input="$(cat 2>/dev/null || true)"   # SessionStart JSON (carries session_id)
 
 KDIR="$("$REPO_ROOT/scripts/aw-knowledge-dir" 2>/dev/null || true)"
+
+# Session id (feature 260713, Task 6): used to SEED this session's prefer-queue
+# watermark so the first Stop does not re-parse the whole cross-session
+# prompts.log. Best-effort; empty when absent/unparseable.
+_sid=""
+if command -v jq >/dev/null 2>&1; then
+  _sid="$(printf '%s' "$_hook_input" | jq -r '.session_id // empty' 2>/dev/null || true)"
+elif command -v python3 >/dev/null 2>&1; then
+  _sid="$(printf '%s' "$_hook_input" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("session_id") or "")' 2>/dev/null || true)"
+fi
 
 # Resolve the invocation checkout ONCE (feature invocation-cwd-context): reused
 # by BOTH the per-session preference digest (feature 260712, Task 3) and the
@@ -84,6 +94,14 @@ $(cat "$KDIR/skills/index.md")"
   if [[ -n "$_pref_digest" ]]; then
     CTX="$CTX
 $_pref_digest"
+  fi
+  # Seed this session's prefer-queue watermark to the CURRENT prompts.log size so
+  # the first Stop scans only THIS session's turns, not the whole cross-session
+  # log (feature 260713, Task 6). Idempotent + best-effort; stdout MUST stay the
+  # hook payload, so all output is discarded.
+  if [[ -n "$_sid" ]]; then
+    "$REPO_ROOT/scripts/agentware" prefer seed-cursor --sid "$_sid" \
+      >/dev/null 2>&1 || true
   fi
 fi
 
