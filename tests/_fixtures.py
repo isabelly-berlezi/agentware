@@ -217,6 +217,104 @@ def build_synthetic_kb(root, entries=None):
     return data
 
 
+# --- Snapshot-backfill harness (feature 260714-miner-operationalize, Task 5) --
+# ONE definition of the corpus-snapshot contract, shared by the hermetic tests
+# (synthetic source corpus) and the operator's real-corpus measurement run — so
+# the measured harness and the tested harness can never drift apart.
+
+MINER_STATE_REL = "logs/steering/.transcript-miner.state.json"
+
+
+def seed_miner_state_at_zero(kdir, sids=None):
+    """Pre-write the miner state so a snapshot mines the WHOLE corpus (P1 trap).
+
+    THE TRAP THIS EXISTS TO DEFUSE: `_transcript_load_state` SEEDS a fresh state
+    with `offsets.prompts = <current file size>` — the TAIL — and
+    `_transcript_mine_read` reads prompts.log from that stored offset
+    UNCONDITIONALLY. `--backfill` widens only the SESSION selection; it does NOT
+    rewind the prompts offset (decide-p2c-recurrence-source-forward-offset). So a
+    snapshot KB left to seed itself parks at EOF and mines ZERO prompts —
+    silently, and a harness that asserts nothing then passes vacuously.
+
+    The seed written here is the fresh-seed state with ONE deviation: the offsets
+    are rewound to 0. `backfill_pending` is seeded with every on-disk sid (NOT
+    empty) because `--backfill` selects `pending & on_disk` — an empty pending
+    set scans zero sessions, which would silently disable the error-recovery
+    detector on the snapshot the same way a tail offset disables recurrence.
+    `processed_sessions` mirrors it, matching fresh-seed semantics.
+    """
+    if sids is None:
+        sroot = os.path.join(kdir, "logs", "sessions")
+        try:
+            sids = [d for d in os.listdir(sroot)
+                    if os.path.isdir(os.path.join(sroot, d))]
+        except OSError:
+            sids = []
+    sids = sorted(sids)
+    state = {"offsets": {"prompts": 0, "metrics": 0},   # <- the P1 fix
+             "processed_sessions": list(sids),
+             "backfill_pending": list(sids),
+             "tally": {},
+             "emitted_keys": []}
+    path = os.path.join(kdir, MINER_STATE_REL)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    import json
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+        f.write("\n")
+    return state
+
+
+def snapshot_corpus_kb(src_kdir, dst_kdir, entries=None):
+    """Copy the miner-visible corpus from `src_kdir` into a fresh snapshot KB at
+    `dst_kdir`, then pre-seed the miner state at offset 0.
+
+    Copies ONLY what the miner actually reads: `logs/prompts.log` (recurrence),
+    `logs/metrics.jsonl` (triage context), and each session's `live.jsonl`
+    (error-recovery). `main.jsonl` is reproduced as a ZERO-BYTE marker — it is a
+    settled/not-settled `os.path.isfile` probe only (`_transcript_session_settled`)
+    and its content is never read, so copying the real one would add hundreds of
+    MB of transcript for no read-surface fidelity.
+
+    The snapshot is WRITE-ISOLATED: mining it can never touch `src_kdir` (D4 /
+    R-LOC-03). Returns a summary dict of what was seeded.
+    """
+    build_synthetic_kb(dst_kdir, entries)
+    slogs, dlogs = os.path.join(src_kdir, "logs"), os.path.join(dst_kdir, "logs")
+    os.makedirs(os.path.join(dlogs, "sessions"), exist_ok=True)
+    copied = {}
+    for name in ("prompts.log", "metrics.jsonl"):
+        src = os.path.join(slogs, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dlogs, name))
+            copied[name] = os.path.getsize(src)
+        else:
+            copied[name] = 0
+    sids, settled = [], 0
+    ssess = os.path.join(slogs, "sessions")
+    try:
+        cand = sorted(d for d in os.listdir(ssess)
+                      if os.path.isdir(os.path.join(ssess, d)))
+    except OSError:
+        cand = []
+    for sid in cand:
+        s_live = os.path.join(ssess, sid, "live.jsonl")
+        if not os.path.isfile(s_live):
+            continue                     # nothing the miner can read
+        ddir = os.path.join(dlogs, "sessions", sid)
+        os.makedirs(ddir, exist_ok=True)
+        shutil.copy2(s_live, os.path.join(ddir, "live.jsonl"))
+        if os.path.isfile(os.path.join(ssess, sid, "main.jsonl")):
+            open(os.path.join(ddir, "main.jsonl"), "w").close()   # settled marker
+            settled += 1
+        sids.append(sid)
+    seed_miner_state_at_zero(dst_kdir, sids)
+    return {"prompts_bytes": copied.get("prompts.log", 0),
+            "metrics_bytes": copied.get("metrics.jsonl", 0),
+            "sessions": len(sids), "settled_sessions": settled,
+            "sids": sids}
+
+
 def build_large_loop_kb(root, n_features=40, sessions_per_feature=3,
                         turns_per_session=6, filler_chars=0):
     """Materialize a REALISTICALLY LARGE synthetic loop KB for perf benchmarks.

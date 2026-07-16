@@ -183,6 +183,82 @@ class TestPreferClassify(unittest.TestCase):
         self.assertEqual(self._auto_plans(), [])
         self.assertEqual(self._read_queue()[0]["status"], "journaled")
 
+    # --- Task 4: the emitted proposal is ACTIONABLE (loop-closing) --------
+    # Before this, every tier-2 proposal was a HOLLOW TODO skeleton: `prefer
+    # approve` -> run activated NOTHING (the workorder carried no capture task),
+    # so the loop never closed. The SUBSTANTIVE task is now the concrete
+    # activation, naming the candidate by WORKORDER ID (never inlining the mined
+    # text into an executable line).
+    def test_emitted_workorder_carries_prefer_capture_activation_task(self):
+        self._write_queue([_queue_rec("always pin dependency versions in lockfiles")])
+        self._drain()
+        wo = self._read_queue()[0]["workorder"]
+        body = self._plan_text(self._auto_plans()[0])
+        self.assertIn("prefer capture --from-workorder %s" % wo, body,
+                      "the proposal must carry the concrete activation command")
+        # ...and it is a real TASK line, not prose buried in Context.
+        task_lines = [ln for ln in body.splitlines()
+                      if ln.startswith("- ⬜") or ln.strip().startswith("*Verify:*")]
+        self.assertTrue(
+            any("prefer capture --from-workorder" in ln for ln in task_lines),
+            "the activation must be a task/Verify line, not just prose")
+
+    def test_emitted_workorder_is_not_a_hollow_todo_skeleton(self):
+        self._write_queue([_queue_rec("always squash commits before merging")])
+        self._drain()
+        body = self._plan_text(self._auto_plans()[0])
+        # The legacy hollow skeleton's only tasks were [e2e]+[kb] with TODO
+        # verifies. A substantive first task must now precede them.
+        first = next(ln for ln in body.splitlines() if ln.startswith("- ⬜"))
+        self.assertNotIn("[e2e]", first,
+                         "a substantive activation task must precede the e2e pair")
+        self.assertNotIn(
+            "*Verify:* TODO — exercise the feature end-to-end", body,
+            "the e2e step must verify the activation, not carry a TODO stub")
+        self.assertIn("prefer list", body, "e2e verifies the pref went active")
+
+    def test_activation_task_never_inlines_the_candidate_text(self):
+        # R-SEC-02: mined text stays FENCED + inert in Context. It must never
+        # reach a task/Verify line — where it would be both shell-interpolated
+        # and read as an instruction by the agent running the workorder.
+        text = "always pin dependency versions in lockfiles"
+        self._write_queue([_queue_rec(text)])
+        self._drain()
+        body = self._plan_text(self._auto_plans()[0])
+        for ln in body.splitlines():
+            if ln.startswith("- ⬜") or ln.strip().startswith("*Verify:*"):
+                self.assertNotIn(text, ln,
+                                 "candidate text must never land on a task line")
+
+    def test_activation_task_survives_a_shell_metacharacter_candidate(self):
+        # A candidate crafted to break out of a quoted command line must not be
+        # able to: the activation names the WORKORDER, never the text.
+        evil = 'always use "; rm -rf ~; echo " for the thing we do here'
+        self._write_queue([_queue_rec(evil)])
+        self._drain()
+        plans = self._auto_plans()
+        self.assertEqual(len(plans), 1)
+        body = self._plan_text(plans[0])
+        for ln in body.splitlines():
+            if ln.startswith("- ⬜") or ln.strip().startswith("*Verify:*"):
+                self.assertNotIn("rm -rf", ln,
+                                 "no candidate fragment on an executable line")
+
+    def test_reemitted_orphan_workorder_still_returns_success(self):
+        # Crash-recovery contract (preserved): an already-on-disk workorder for
+        # the same fp returns SUCCESS (no re-emit, no wedge).
+        rec = _queue_rec("always run the linter before pushing")
+        self._write_queue([rec])
+        self._drain()
+        wo = self._read_queue()[0]["workorder"]
+        # Simulate the crash: the workorder is on disk but the record is queued.
+        self._write_queue([_queue_rec("always run the linter before pushing")])
+        res = self._drain()
+        self.assertEqual(res.get("proposed"), 1, "orphan re-drain succeeds")
+        self.assertEqual(res.get("deferred"), 0, "never mis-labeled draft-capped")
+        self.assertEqual(len(self._auto_plans()), 1, "no double emit")
+        self.assertEqual(self._read_queue()[0]["workorder"], wo, "stable fp/slug")
+
     # --- idempotency ------------------------------------------------------
     def test_drain_is_idempotent_no_double_emit(self):
         self._write_queue([_queue_rec("always squash commits before merging")])
