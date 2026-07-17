@@ -108,6 +108,7 @@ Every task runs this loop. Do not skip steps; do not stop until all subtasks are
 - IF the change is a backend endpoint THEN call it yourself and verify status, headers, and body. [R-VERIFY-03]
 - IF the change is a mutation THEN do a read-after-write and capture the request/response in the worklog. [R-VERIFY-04]
 - MUST ensure the user can independently access and verify the result. [R-VERIFY-05]
+- ALWAYS ground a load-bearing plan (a self-extension plan, or one citing a live KB id) before execution: declare a `## Premises` block whose every `check:` re-verifies its cited premise against LIVE state via `plan verify-premises`, which HALTS the run on a reproduced falsification — promoting R-FAIL-08 from guidance to a mechanical, deterministic gate. [R-GND-01]
 
 ## Failure handling (escalation ladder)
 

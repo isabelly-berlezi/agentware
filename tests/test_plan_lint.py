@@ -723,5 +723,75 @@ class R11TargetPackagesTestCase(unittest.TestCase):
         self.assertEqual(dirs, [os.path.expanduser("~/workspace/agentware")])
 
 
+class R14PremisesTestCase(unittest.TestCase):
+    """R14 — a LOAD-BEARING plan (self-extension OR names a live KB id) must carry
+    a well-formed cited `## Premises` block (feature 260717-premise-grounding-gate).
+    Drives lint_plan() directly to control the WARN->ERROR schema ramp precisely."""
+
+    SELF_EXT = GOOD_PLAN.replace(
+        "> A throwaway plan used only by the linter tests.\n",
+        "> A throwaway plan used only by the linter tests.\n"
+        "> Type: **self-extension (package change)**\n")
+
+    PREMISES = ("## Premises\n\n"
+                "- premise: a grounded fact\n"
+                "  cite: work/x/RCA.md\n"
+                "  check: cite-live\n\n"
+                "---\n\n")
+
+    def _lint(self, text, strict=False, schema=0, kdir=None):
+        return load_cli().lint_plan(text, strict=strict, schema_version=schema,
+                                    kdir=kdir)
+
+    def _ramp(self):
+        return load_cli()._PLAN_PREMISES_ERROR_SCHEMA
+
+    def test_selfext_without_premises_warns_by_default(self):
+        errors, warnings = self._lint(self.SELF_EXT, strict=False, schema=0)
+        self.assertTrue(any(w["rule"] == "R14" for w in warnings))
+        self.assertFalse(any(e["rule"] == "R14" for e in errors))
+
+    def test_selfext_stays_warn_under_strict_below_ramp(self):
+        # The strict pre-hook runs at the live schema (=1, below the ramp) so an
+        # existing self-extension plan is never retroactively hard-failed.
+        errors, warnings = self._lint(self.SELF_EXT, strict=True,
+                                      schema=self._ramp() - 1)
+        self.assertTrue(any(w["rule"] == "R14" for w in warnings))
+        self.assertFalse(any(e["rule"] == "R14" for e in errors))
+
+    def test_selfext_errors_under_strict_at_ramp(self):
+        errors, _ = self._lint(self.SELF_EXT, strict=True, schema=self._ramp())
+        self.assertTrue(any(e["rule"] == "R14" for e in errors))
+
+    def test_selfext_with_premises_passes(self):
+        text = self.SELF_EXT.replace("## Tasks", self.PREMISES + "## Tasks", 1)
+        errors, warnings = self._lint(text, strict=True, schema=self._ramp())
+        self.assertFalse(any(x["rule"] == "R14" for x in errors + warnings))
+
+    def test_trivial_plan_is_noop(self):
+        errors, warnings = self._lint(GOOD_PLAN, strict=True, schema=self._ramp())
+        self.assertFalse(any(x["rule"] == "R14" for x in errors + warnings))
+
+    def test_names_live_kb_id_is_load_bearing(self):
+        import shutil
+        from tests._fixtures import build_synthetic_kb
+        kdir = tempfile.mkdtemp(prefix="agentware-r14-kb-")
+        self.addCleanup(shutil.rmtree, kdir, True)
+        build_synthetic_kb(kdir)
+        # A NON-self-extension plan that references a live KB id is load-bearing (D6).
+        text = GOOD_PLAN.replace(
+            "Implement the first thing deterministically.",
+            "Depends on learn-geofence-reminders behavior.")
+        errors, warnings = self._lint(text, strict=False, schema=0, kdir=kdir)
+        self.assertTrue(any(x["rule"] == "R14" for x in errors + warnings))
+
+    def test_malformed_check_flagged(self):
+        bad = ("## Premises\n\n- premise: x\n  cite: y\n"
+               "  check: bogus-kind foo\n\n---\n\n")
+        text = self.SELF_EXT.replace("## Tasks", bad + "## Tasks", 1)
+        errors, warnings = self._lint(text, strict=True, schema=self._ramp())
+        self.assertTrue(any(x["rule"] == "R14" for x in errors + warnings))
+
+
 if __name__ == "__main__":
     unittest.main()

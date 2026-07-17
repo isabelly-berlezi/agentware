@@ -14165,6 +14165,11 @@ _STAGE_TO_PHASE = {
 #   pre_hook_abort    -> a pre-hook gate (steering/index/plan-lint) aborted the run
 _TERMINAL_OUTCOMES = (
     "completed", "hit_max_iterations", "post_hook_failure", "pre_hook_abort",
+    # feature 260717-premise-grounding-gate (D3): a DISTINCT terminal so the
+    # precision of the premise-grounding pre-hook (how often it fires) is
+    # measurable separately from other pre-hook aborts. Purely additive —
+    # derive_outcome only counts outcomes present in this tuple.
+    "premise_falsified",
 )
 
 
@@ -17073,8 +17078,8 @@ def plan_target_dirs(text):
     return dirs
 
 
-def lint_plan(text, strict=False, rel_path=None, schema_version=0):
-    """Apply the structural plan-format rules R1–R13 to `text`.
+def lint_plan(text, strict=False, rel_path=None, schema_version=0, kdir=None):
+    """Apply the structural plan-format rules R1–R14 to `text`.
 
     Returns (errors, warnings); each is a list of {rule, line, message}. R1 (file
     existence) is handled by the caller before this runs. Read-only (INV-2): never
@@ -17084,7 +17089,10 @@ def lint_plan(text, strict=False, rel_path=None, schema_version=0):
     drives R12 (workorder provenance headers required under work/auto/), whose
     severity flips WARN->error once `schema_version >= 1` (the deterministic,
     versioned flip — no config flag). R13 binds the declared `> Status:` header to
-    derived task reality.
+    derived task reality. R14 (feature 260717) requires a LOAD-BEARING plan
+    (self-extension OR names a live KB id — needs `kdir` for the id scan) to carry
+    a well-formed cited `## Premises` block, on the SAME WARN->ERROR versioned ramp
+    keyed on `schema_version >= _PLAN_PREMISES_ERROR_SCHEMA`.
     """
     errors, warnings = [], []
 
@@ -17264,6 +17272,34 @@ def lint_plan(text, strict=False, rel_path=None, schema_version=0):
                 "declared `> Status: done` but %d open task marker(s) remain "
                 "(a done plan must have every task ✅)" % open_n)
 
+    # R14 — a LOAD-BEARING plan (self-extension OR names a live KB id — D6) MUST
+    # carry a well-formed, CITED `## Premises` block. STRUCTURAL only: it checks
+    # that premise rows exist and parse into the closed grammar, NOT whether they
+    # reproduce (that is `plan verify-premises` at run time). Severity: WARN by
+    # default; ERROR under --strict once schema_version >= the ramp threshold (a
+    # WARN->ERROR versioned ramp mirroring R12 — so the strict pre-hook never
+    # retroactively hard-fails existing self-extension plans until the KB schema
+    # advances). A trivial (non-load-bearing) plan is a no-op.
+    if _plan_is_load_bearing(text, kdir):
+        prem = plan_premises(text)
+        cited = [p for p in prem if p.get("cite") and p.get("check")]
+        ramp = strict and schema_version >= _PLAN_PREMISES_ERROR_SCHEMA
+        bucket = errors if ramp else warnings
+        if not cited:
+            add(bucket, "R14", 1,
+                "load-bearing plan (self-extension or cites a live KB id) has no "
+                "well-formed cited `## Premises` block — declare `premise:`/`cite:`"
+                "/`check:` rows so `plan verify-premises` can re-check each premise "
+                "against live state before execution (R-GND-01/R-FAIL-08)")
+        else:
+            bad = next((p for p in prem
+                        if str((p.get("parsed") or {}).get("kind", ""))
+                        .startswith("__")), None)
+            if bad is not None:
+                add(bucket, "R14", bad.get("line", 1),
+                    "premise check is not a valid closed-grammar kind: %s"
+                    % ((bad.get("parsed") or {}).get("error") or "malformed"))
+
     return errors, warnings
 
 
@@ -17332,9 +17368,539 @@ def cmd_plan_lint(args):
     kdir = resolve_knowledge_dir()
     schema_version = _kb_schema_read(kdir) if kdir else 0
     errors, warnings = lint_plan(text, strict=strict, rel_path=rel_path,
-                                 schema_version=schema_version)
+                                 schema_version=schema_version, kdir=kdir)
     result = {"ok": len(errors) == 0, "errors": errors, "warnings": warnings}
     return _emit_plan_lint(result, as_json)
+
+
+# --- R14: Premise-grounding gate (feature 260717-premise-grounding-gate) ------
+# Promote R-FAIL-08 ("treat a point-in-time value as suspect; verify against live
+# state") from guidance to a MECHANICAL, deterministic, fully-offline gate. A
+# load-bearing plan declares a machine-checkable `## Premises` block (or a
+# ```premises fenced block); each record is `premise:` / `cite:` (a KB id/path) /
+# `check:` (a member of a CLOSED named check-kind grammar). `plan verify-premises`
+# re-evaluates every check against LIVE state using ONLY pure functions (index
+# lookup, config read, os.stat, the pure miner folds).
+#
+# INV-1 (deterministic/offline): no LLM, no network, no now() in any decision —
+#   the sole time comparison (path mtime-before) uses an AUTHOR-SUPPLIED ISO.
+# INV-2 (read-only): every evaluator only reads; corpus metrics fold into
+#   THROWAWAY in-memory state so the real miner state is never mutated.
+# SECURITY: the grammar is CLOSED with ZERO command-execution surface — nothing a
+#   plan.md declares is ever shell-executed (auto-workorders are seeded from
+#   UNTRUSTED mined candidates, so a plan must never name a command to run; this
+#   deliberately avoids the injection wedge c0ae543 closed). A `check:` bearing a
+#   shell metacharacter is rejected at PARSE and never stored as runnable.
+
+_PLAN_PREMISES_SECTION_RE = re.compile(r"^##\s+Premises\s*$",
+                                       re.IGNORECASE | re.MULTILINE)
+_PLAN_PREMISES_FENCE_RE = re.compile(r"^\s*```+\s*premises\s*$", re.IGNORECASE)
+_PLAN_PREMISE_ROW_RE = re.compile(r"^\s*-\s+premise:\s*(.+?)\s*$", re.IGNORECASE)
+_PLAN_CITE_ROW_RE = re.compile(r"^\s*cite:\s*(.+?)\s*$", re.IGNORECASE)
+_PLAN_CHECK_ROW_RE = re.compile(r"^\s*check:\s*(.+?)\s*$", re.IGNORECASE)
+# Defense in depth: a command-injection metacharacter in a `check:` is a SECURITY
+# reject at parse. The grammar is closed and nothing is ever shell-executed, but
+# such a check is never even stored as a runnable record. The set is the
+# command-CHAINING / SUBSTITUTION characters (`; & | ` $` + newlines) — NOT the
+# numeric comparison operators `< >`, which corpus-metric legitimately uses
+# (`>= <= > <`) and which are inert in a grammar that is never shell-executed.
+_CHECK_METACHAR_RE = re.compile(r"[;&|`$\n\r]")
+_PREMISE_CHECK_KINDS = ("cite-live", "config-eq", "path", "corpus-metric")
+_CORPUS_METRICS = ("recurrence-keys-at-n", "claude-error-records")
+_CORPUS_OPS = (">=", "<=", "==", "!=", ">", "<")
+_PATH_MODES = ("exists", "absent", "mtime-before")
+# R14 WARN->ERROR versioned ramp (mirrors R12). The lint rule stays WARN under the
+# current KB schema (=1) — so the strict pre-hook cannot retroactively hard-fail an
+# existing self-extension plan lacking a `## Premises` block — and gains its hard
+# error only once a future migration advances the schema to this threshold. The
+# real halt-on-falsification enforcement lives in the `verify-premises` pre-hook.
+_PLAN_PREMISES_ERROR_SCHEMA = 2
+
+
+def _premise_region(text):
+    """(start, end) line-index span of the premises block, or None.
+
+    Collects every candidate span — `## Premises` SECTIONs (heading .. next `##`,
+    in file order) THEN ```premises FENCED blocks — and returns the FIRST span that
+    actually CONTAINS a `- premise:` row. So a populated section still wins over a
+    fence (section spans come first), but an EMPTY `## Premises` heading never
+    silently suppresses a populated fenced block. If none are populated, the first
+    section span is returned (so R14 still flags an empty premises block). Pure."""
+    lines = (text or "").splitlines()
+    candidates = []
+    for i, ln in enumerate(lines):
+        if _PLAN_PREMISES_SECTION_RE.match(ln):
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                if re.match(r"^##\s+", lines[j]):
+                    end = j
+                    break
+            candidates.append((i + 1, end))
+    for i, ln in enumerate(lines):
+        if _PLAN_PREMISES_FENCE_RE.match(ln):
+            end = len(lines)
+            for j in range(i + 1, len(lines)):
+                if re.match(r"^\s*```+\s*$", lines[j]):
+                    end = j
+                    break
+            candidates.append((i + 1, end))
+    for (start, end) in candidates:
+        if any(_PLAN_PREMISE_ROW_RE.match(lines[k]) for k in range(start, end)):
+            return (start, end)
+    return candidates[0] if candidates else None
+
+
+def _parse_premise_check(check):
+    """Parse a `check:` string into {kind, args, raw, error} WITHOUT executing.
+
+    kind ∈ _PREMISE_CHECK_KINDS, or a sentinel: '__rejected__' (shell
+    metacharacter — SECURITY), '__unknown__' (kind not in the closed grammar), or
+    '__malformed__' (bad arity/value). NEVER runs anything."""
+    raw = (check or "").strip()
+    if not raw:
+        return {"kind": "__malformed__", "args": [], "raw": raw,
+                "error": "empty check"}
+    if _CHECK_METACHAR_RE.search(raw):
+        return {"kind": "__rejected__", "args": [], "raw": raw,
+                "error": "shell metacharacter in check — rejected at parse, "
+                         "never run"}
+    toks = raw.split()
+    kind, args = toks[0], toks[1:]
+    if kind == "cite-live":
+        return {"kind": "cite-live", "args": args, "raw": raw, "error": None}
+    if kind == "config-eq":
+        if len(args) != 2:
+            return {"kind": "__malformed__", "args": args, "raw": raw,
+                    "error": "config-eq requires <KEY> <value>"}
+        return {"kind": "config-eq", "args": args, "raw": raw, "error": None}
+    if kind == "path":
+        if not args or args[0] not in _PATH_MODES:
+            return {"kind": "__malformed__", "args": args, "raw": raw,
+                    "error": "path requires <exists|absent|mtime-before> …"}
+        if args[0] == "mtime-before":
+            if len(args) != 3:
+                return {"kind": "__malformed__", "args": args, "raw": raw,
+                        "error": "path mtime-before requires <ISO> <rel>"}
+        elif len(args) != 2:
+            return {"kind": "__malformed__", "args": args, "raw": raw,
+                    "error": "path %s requires <rel>" % args[0]}
+        return {"kind": "path", "args": args, "raw": raw, "error": None}
+    if kind == "corpus-metric":
+        if (len(args) != 3 or args[0] not in _CORPUS_METRICS
+                or args[1] not in _CORPUS_OPS):
+            return {"kind": "__malformed__", "args": args, "raw": raw,
+                    "error": "corpus-metric requires <metric> <op> <int> "
+                             "(metric∈%s op∈%s)"
+                             % (_CORPUS_METRICS, _CORPUS_OPS)}
+        try:
+            int(args[2])
+        except (TypeError, ValueError):
+            return {"kind": "__malformed__", "args": args, "raw": raw,
+                    "error": "corpus-metric threshold must be an integer"}
+        return {"kind": "corpus-metric", "args": args, "raw": raw, "error": None}
+    return {"kind": "__unknown__", "args": args, "raw": raw,
+            "error": "unknown check kind %r (closed grammar: %s)"
+                     % (kind, ", ".join(_PREMISE_CHECK_KINDS))}
+
+
+def plan_premises(text):
+    """Parse the `## Premises` section (or ```premises fenced block) into records.
+
+    Each record: {premise, cite, check, parsed, line}. Returns [] when no premises
+    block is present (trivial plans stay untouched). `parsed` is the closed-grammar
+    parse of `check:` (a metacharacter-bearing check parses to '__rejected__' and
+    is NEVER runnable). Pure, offline, read-only — the parser twin of
+    plan_target_dirs()."""
+    span = _premise_region(text)
+    if span is None:
+        return []
+    lines = (text or "").splitlines()
+    start, end = span
+    records, cur = [], None
+    for i in range(start, end):
+        ln = lines[i]
+        m = _PLAN_PREMISE_ROW_RE.match(ln)
+        if m:
+            if cur is not None:
+                cur["parsed"] = _parse_premise_check(cur.get("check") or "")
+                records.append(cur)
+            cur = {"premise": m.group(1).strip(), "cite": None,
+                   "check": None, "line": i + 1}
+            continue
+        if cur is None:
+            continue
+        mc = _PLAN_CITE_ROW_RE.match(ln)
+        if mc and cur.get("cite") is None:
+            cur["cite"] = mc.group(1).strip()
+            continue
+        mk = _PLAN_CHECK_ROW_RE.match(ln)
+        if mk and cur.get("check") is None:
+            cur["check"] = mk.group(1).strip()
+    if cur is not None:
+        cur["parsed"] = _parse_premise_check(cur.get("check") or "")
+        records.append(cur)
+    return records
+
+
+# --- The four CLOSED check-kind evaluators (all pure + read-only) -------------
+
+def _premise_cite_resolves(cite, kdir):
+    """True iff `cite` resolves to a live KB entry (indexed id/path) OR a real file
+    under the knowledge dir (work artifacts are NOT indexed, so an RCA under work/
+    resolves by filesystem existence). Path traversal escaping the KB is refused
+    (unresolvable). Read-only."""
+    if not cite or not kdir:
+        return False
+    # INV-2: _allow_rebuild=False — a read-only verb must NEVER trigger load_index's
+    # transparent index.json rebuild (which writes index.json / FEATURES.md /
+    # rosters / the BM25 cache). A missing/corrupt index simply degrades to the
+    # filesystem-existence fallback below.
+    try:
+        data, err = load_index(kdir, _allow_rebuild=False)
+    except Exception:
+        data, err = None, "load error"
+    if err is None and isinstance(data, dict):
+        for e in data.get("entries") or []:
+            if isinstance(e, dict) and (e.get("id") == cite
+                                        or e.get("path") == cite):
+                return True
+    try:
+        base = os.path.abspath(kdir)
+        cand = os.path.abspath(os.path.join(base, cite))
+        if (cand == base or cand.startswith(base + os.sep)) \
+                and os.path.exists(cand):
+            return True
+    except (ValueError, OSError):
+        pass
+    return False
+
+
+def _eval_check_cite_live(rec, kdir):
+    cite = rec.get("cite")
+    if not cite:
+        return {"verdict": "uncheckable", "detail": "premise has no cite"}
+    if _premise_cite_resolves(cite, kdir):
+        return {"verdict": "grounded", "detail": "citation resolves: %s" % cite}
+    return {"verdict": "uncheckable", "unresolved_cite": True,
+            "detail": "citation does not resolve to a live KB entry or file: %s"
+                      % cite}
+
+
+def _eval_check_config_eq(parsed):
+    key, want = parsed["args"][0], parsed["args"][1]
+    val = _read_config_key(key)
+    if val is None:
+        return {"verdict": "uncheckable", "expected": want,
+                "detail": "config key %s is unset" % key}
+    if val == want:
+        return {"verdict": "grounded", "actual": val, "expected": want,
+                "detail": "%s == %s" % (key, want)}
+    return {"verdict": "falsified", "actual": val, "expected": want,
+            "detail": "%s is %r, expected %r" % (key, val, want)}
+
+
+def _parse_iso_to_epoch(iso):
+    """Author-supplied ISO-8601 -> UTC epoch seconds, or None. Deterministic;
+    NEVER calls now() (the only time input is the author's literal string)."""
+    import calendar
+    import datetime as _dt
+    s = str(iso or "").strip().replace("Z", "").replace("z", "")
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return calendar.timegm(_dt.datetime.strptime(s, fmt).timetuple())
+        except ValueError:
+            continue
+    return None
+
+
+def _premise_path_state(path):
+    """Tri-state existence via os.stat: 'exists' | 'absent' | 'error'. Unlike
+    os.path.exists (which maps every OSError — including PermissionError — to
+    False), a permission / I-O error yields 'error' so the caller can treat it as
+    uncheckable (D5 fail-open) rather than let an unreadable target masquerade as
+    'absent' and false-falsify a premise."""
+    try:
+        os.stat(path)
+        return "exists"
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError:
+        return "error"
+
+
+def _eval_check_path(parsed, kdir):
+    mode = parsed["args"][0]
+    if mode == "mtime-before":
+        iso, rel = parsed["args"][1], parsed["args"][2]
+    else:
+        rel, iso = parsed["args"][1], None
+    if not kdir:
+        return {"verdict": "uncheckable", "detail": "no knowledge dir resolved"}
+    base = os.path.abspath(kdir)
+    cand = os.path.abspath(os.path.join(base, rel))
+    if not (cand == base or cand.startswith(base + os.sep)):
+        return {"verdict": "uncheckable",
+                "detail": "path escapes the knowledge dir: %s" % rel}
+    # Tri-state via os.stat (NOT os.path.exists, which collapses EVERY OSError —
+    # incl. PermissionError on an unreadable ancestor — to False and would
+    # false-falsify a premise). A permission/other error is uncheckable (D5
+    # fail-open), never a halt.
+    state = _premise_path_state(cand)
+    if state == "error":
+        return {"verdict": "uncheckable",
+                "detail": "cannot stat %s (permission or I/O error)" % rel}
+    exists = state == "exists"
+    if mode == "exists":
+        return {"verdict": "grounded" if exists else "falsified",
+                "detail": "%s %s" % (rel, "exists" if exists else "is ABSENT")}
+    if mode == "absent":
+        return {"verdict": "grounded" if not exists else "falsified",
+                "detail": "%s %s" % (rel, "is absent" if not exists else "EXISTS")}
+    # mtime-before ISO — author-supplied bound, never now()
+    if not exists:
+        return {"verdict": "uncheckable",
+                "detail": "%s absent (cannot compare mtime)" % rel}
+    bound = _parse_iso_to_epoch(iso)
+    if bound is None:
+        return {"verdict": "uncheckable", "detail": "unparseable ISO %r" % iso}
+    try:
+        mt = os.stat(cand).st_mtime
+    except OSError as exc:
+        return {"verdict": "uncheckable", "detail": "stat failed: %s" % exc}
+    ok = mt < bound
+    return {"verdict": "grounded" if ok else "falsified",
+            "detail": "mtime(%s) %s %s" % (rel, "<" if ok else ">=", iso)}
+
+
+def _premise_corpus_metric_value(metric, kdir):
+    """Compute a corpus metric from LIVE state via the PURE miner folds. INV-2:
+    read-only — never mutates the real miner state (folds run over throwaway
+    in-memory structures). INV-1: deterministic over a fixed corpus.
+
+    Returns an int (a PRESENT-but-empty corpus is a genuine 0), or None when the
+    corpus SOURCE is UNAVAILABLE (logs/ absent, the specific source file absent, or
+    a read error) so the caller fails OPEN (D5) — a plan grounded at authoring can
+    never DoS a later run just because its source log rotated away.
+
+    SCOPE CAVEAT (deliberate — see the worklog `> DECISION:`): `claude-error-records`
+    counts ERR records in the KB's OWN logs/sessions/<sid>/live.jsonl ONLY. It does
+    NOT reconcile the durable $HOME transcripts (the F-B is_error reconstruction) —
+    that source is machine-specific and non-reproducible, which INV-1 (deterministic,
+    offline, hermetic) forbids in a decision. The metric therefore measures the
+    KB-local, deterministic error-record count (sufficient to detect signal
+    PRESENCE), not the reconciled corpus-wide total."""
+    if not kdir:
+        return None
+    logs = os.path.join(kdir, "logs")
+    if not os.path.isdir(logs):
+        return None
+    if metric == "recurrence-keys-at-n":
+        # Reuse the SAME folds the miner emits with — _parse_prompts_records,
+        # _transcript_norm_key, _transcript_recurrence_relevant, MINER_RECURRENCE_N,
+        # _transcript_recurrence_gate — counting keys that reach N DISTINCT sessions
+        # AND pass the F-C relevance gate, WITHOUT building records (no side effects).
+        logp = os.path.join(logs, "prompts.log")
+        if not os.path.isfile(logp):
+            return None   # source absent -> uncheckable (fail-open), not a 0
+        try:
+            with open(logp, "rb") as f:
+                raw = f.read().decode("utf-8", "replace")
+        except OSError:
+            return None
+        gate = _transcript_recurrence_gate()
+        sessions_by_key = {}
+        try:
+            for hdr, body in _parse_prompts_records(raw):
+                if hdr.get("origin") != "human":
+                    continue
+                b = (body or "").strip()
+                if not b:
+                    continue
+                key = _transcript_norm_key(b)
+                if not key:
+                    continue
+                sessions_by_key.setdefault(key, set()).add(hdr.get("sid") or "")
+        except Exception:
+            return None
+        return sum(1 for key, sids in sessions_by_key.items()
+                   if len(sids) >= MINER_RECURRENCE_N
+                   and _transcript_recurrence_relevant(key, gate))
+    if metric == "claude-error-records":
+        # Count ERR-status records across the KB's own live.jsonl files (the fold
+        # _transcript_is_err_status). KB-scoped -> hermetic + deterministic. If NO
+        # session live.jsonl exists at all, the source is unavailable -> None
+        # (uncheckable / fail-open), never a 0 that could falsify a grounded premise.
+        n, any_live = 0, False
+        for sid in _transcript_list_session_ids(kdir):
+            lpath = os.path.join(logs, "sessions", sid, "live.jsonl")
+            if not os.path.isfile(lpath):
+                continue
+            any_live = True
+            for r in _transcript_read_live(lpath):
+                if isinstance(r, dict) and _transcript_is_err_status(
+                        r.get("status")):
+                    n += 1
+        return n if any_live else None
+    return None
+
+
+def _premise_num_cmp(a, op, b):
+    return {">=": a >= b, "<=": a <= b, ">": a > b, "<": a < b,
+            "==": a == b, "!=": a != b}.get(op, False)
+
+
+def _eval_check_corpus_metric(parsed, kdir):
+    metric, op, n = parsed["args"][0], parsed["args"][1], int(parsed["args"][2])
+    actual = _premise_corpus_metric_value(metric, kdir)
+    if actual is None:
+        return {"verdict": "uncheckable",
+                "detail": "corpus metric %s unavailable (logs/ absent)" % metric}
+    ok = _premise_num_cmp(actual, op, n)
+    return {"verdict": "grounded" if ok else "falsified",
+            "actual": actual, "op": op, "expected": n,
+            "detail": "%s = %d; check `%s %s %d` %s"
+                      % (metric, actual, metric, op, n,
+                         "holds" if ok else "FAILS")}
+
+
+def evaluate_premise(rec, kdir):
+    """Evaluate ONE premise record against live state. Pure/read-only.
+    Returns {verdict ∈ grounded|falsified|uncheckable, detail, ...}."""
+    parsed = rec.get("parsed") or _parse_premise_check(rec.get("check") or "")
+    kind = parsed.get("kind")
+    if kind == "__rejected__":
+        return {"verdict": "uncheckable", "rejected": True,
+                "detail": parsed.get("error")}
+    if kind in ("__unknown__", "__malformed__"):
+        return {"verdict": "uncheckable", "detail": parsed.get("error")}
+    if kind == "cite-live":
+        return _eval_check_cite_live(rec, kdir)
+    if kind == "config-eq":
+        return _eval_check_config_eq(parsed)
+    if kind == "path":
+        return _eval_check_path(parsed, kdir)
+    if kind == "corpus-metric":
+        return _eval_check_corpus_metric(parsed, kdir)
+    return {"verdict": "uncheckable", "detail": "unhandled check kind %r" % kind}
+
+
+def _plan_is_self_extension(text):
+    """Deterministic: does the plan declare itself a package/self-extension change?
+    Matches the `> Type: … self-extension …` header or the Self-extension warning
+    heading seeded by `plan new --self-extension`."""
+    t = text or ""
+    if re.search(r"(?im)^>\s*Type:.*self-extension", t):
+        return True
+    if re.search(r"(?im)^##\s+.*Self-extension warning", t):
+        return True
+    return False
+
+
+def _plan_names_live_kb_id(text, kdir):
+    """D6 (second trigger): does the plan reference a live KB id? Deterministic;
+    reads the index once. Ids are long/distinctive (>=8 chars) so a substring
+    match is a reliable, cheap signal."""
+    if not kdir:
+        return False
+    # INV-2: read-only — never rebuild the index as a side effect of a lint.
+    try:
+        data, err = load_index(kdir, _allow_rebuild=False)
+    except Exception:
+        return False
+    if err is not None or not isinstance(data, dict):
+        return False
+    t = text or ""
+    for e in data.get("entries") or []:
+        if isinstance(e, dict):
+            eid = e.get("id")
+            if eid and len(eid) >= 8 and eid in t:
+                return True
+    return False
+
+
+def _plan_is_load_bearing(text, kdir=None):
+    """D6: a plan is load-bearing iff it is self-extension OR names a live KB id."""
+    if _plan_is_self_extension(text):
+        return True
+    return _plan_names_live_kb_id(text, kdir)
+
+
+def verify_premises(text, kdir, strict=False):
+    """Core of `plan verify-premises` (pure/read-only). Returns a summary dict.
+
+    Exit policy (mirrored by cmd_plan_verify_premises' return code):
+      - a REPRODUCED falsification => not ok (hard stop, strict-independent);
+      - D5 fail-CLOSED: an UNRESOLVABLE citation on a SELF-EXTENSION plan => not ok
+        ONLY under --strict;
+      - every other uncheckable (missing verb/corpus/path, unknown/malformed kind)
+        => WARN, still ok (D5 fail-OPEN — a drifted check can never DoS the loop)."""
+    records = plan_premises(text)
+    self_ext = _plan_is_self_extension(text)
+    results, falsified, fail_closed = [], False, False
+    for rec in records:
+        verd = evaluate_premise(rec, kdir)
+        v = verd.get("verdict")
+        item = {"premise": rec.get("premise"), "cite": rec.get("cite"),
+                "check": rec.get("check"), "line": rec.get("line"),
+                "verdict": v, "detail": verd.get("detail")}
+        for k in ("actual", "expected", "op", "rejected"):
+            if k in verd:
+                item[k] = verd[k]
+        if v == "falsified":
+            falsified = True
+        if v == "uncheckable" and verd.get("unresolved_cite") and self_ext \
+                and strict:
+            fail_closed = True
+            item["fail_closed"] = True
+        results.append(item)
+    ok = not (falsified or fail_closed)
+    return {"ok": ok, "self_extension": self_ext,
+            "load_bearing": _plan_is_load_bearing(text, kdir),
+            "premises": results, "falsified": falsified,
+            "fail_closed_unresolved_cite": fail_closed, "strict": bool(strict)}
+
+
+def cmd_plan_verify_premises(args):
+    """Re-verify a plan's declared premises against LIVE state (read-only). Exit 1
+    on a reproduced falsification, or (under --strict) an unresolvable citation on
+    a self-extension plan; an uncheckable premise WARNs and exits 0 (D5). NEVER a
+    KB writer (absent from _kb_writer_funcs by omission)."""
+    path = args.path
+    strict = bool(getattr(args, "strict", False))
+    as_json = getattr(args, "format", "text") == "json"
+    if not os.path.isfile(path):
+        sys.stderr.write("agentware: plan not found: %s\n" % path)
+        return 1
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as exc:
+        sys.stderr.write("agentware: cannot read plan %s: %s\n" % (path, exc))
+        return 1
+    kdir = resolve_knowledge_dir()
+    summary = verify_premises(text, kdir, strict=strict)
+    summary["plan"] = path
+    if as_json:
+        json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("PREMISE VERIFY %s" % ("PASSED" if summary["ok"] else "FAILED"))
+        for r in summary["premises"]:
+            glyph = {"grounded": "✔", "falsified": "✖",
+                     "uncheckable": "⚠"}.get(r["verdict"], "?")
+            print("  %s [%s] %s" % (glyph, r["verdict"], r["premise"]))
+            print("        cite:  %s" % r["cite"])
+            print("        check: %s" % r["check"])
+            print("        -> %s" % r["detail"])
+        if summary["falsified"]:
+            print("REPRODUCED FALSIFICATION — a load-bearing premise does not "
+                  "hold against live state.")
+        if summary["fail_closed_unresolved_cite"]:
+            print("UNRESOLVABLE CITATION on a self-extension plan (fail-closed "
+                  "under --strict).")
+    return 0 if summary["ok"] else 1
 
 
 # --- Plan authoring (feature 260625-plan-authoring-toolkit) -------------------
@@ -17462,6 +18028,23 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
     tasks_block = "".join(
         "- ⬜ **%d** %s\n  *Verify:* %s\n" % (i, desc, ver)
         for i, (desc, ver) in enumerate(task_rows, 1))
+    # Self-extension plans are load-bearing (R14 / R-GND-01): seed a `## Premises`
+    # stub so the author grounds each premise. Empty for a normal plan -> the
+    # scaffold stays byte-identical to the legacy output.
+    premises_block = ""
+    if self_extension:
+        premises_block = (
+            "## Premises\n\n"
+            "> Load-bearing (self-extension) plans MUST ground their premises: each\n"
+            "> row is `premise:` / `cite:` (a KB id or KB-relative path) / `check:` —\n"
+            "> a member of the CLOSED grammar `cite-live` | `config-eq <KEY> <val>` |\n"
+            "> `path <exists|absent|mtime-before ISO> <rel>` | `corpus-metric\n"
+            "> <recurrence-keys-at-n|claude-error-records> <op> <n>`. `plan verify-\n"
+            "> premises --strict` re-checks each against LIVE state before the run.\n\n"
+            "- premise: TODO — a load-bearing assumption this plan rests on\n"
+            "  cite: TODO — the KB id or KB-relative path that grounds it\n"
+            "  check: cite-live\n\n"
+            "---\n\n")
     selfext_line = "YES (`R-PKG-03` record-and-proceed)" if self_extension else "NO"
     # Author line: included when a handle is available (team mode provenance).
     author_line = ""
@@ -17483,6 +18066,7 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
         "## Target packages\n\n"
         "%s"
         "---\n\n"
+        "%s"
         "## Tasks\n\n"
         "%s"
         "\n"
@@ -17497,7 +18081,7 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None,
         % (title, feature, _today(), prov_block, author_line,
            "**self-extension (package change)**" if self_extension
            else "feature work",
-           warning, context_body, target_block, tasks_block,
+           warning, context_body, target_block, premises_block, tasks_block,
            int(max_iterations), selfext_line, _plan_promise(feature))
     )
 
@@ -26499,6 +27083,19 @@ def build_parser():
         help="check ONLY the mechanical draft->ready gate: no emitter placeholder "
              "signatures remain and >=1 real acceptance checkbox exists")
     p_plan_lint.set_defaults(func=cmd_plan_lint)
+
+    p_plan_verify = plan_sub.add_parser(
+        "verify-premises", parents=[fmt_parent],
+        help="re-verify a plan's declared `## Premises` against LIVE state "
+             "(read-only; a reproduced falsification exits 1 — the loop pre-hook "
+             "halts a load-bearing run before phase 1)")
+    p_plan_verify.add_argument("--path", required=True, help="path to a plan.md")
+    p_plan_verify.add_argument(
+        "--strict", action="store_true",
+        help="fail-CLOSED on an unresolvable citation for a self-extension plan "
+             "(used by the loop pre-hook); a reproduced falsification always "
+             "exits 1 regardless of --strict")
+    p_plan_verify.set_defaults(func=cmd_plan_verify_premises)
 
     p_plan_new = plan_sub.add_parser(
         "new", parents=[fmt_parent],
