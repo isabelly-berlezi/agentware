@@ -272,7 +272,7 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
         payload = json.loads(out)
         self.assertTrue(payload["dry_run"])
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["1", "2", "a", "b", "c", "d", "e", "m", "g", "f"])
+                         ["1", "2", "a", "b", "c", "d", "e", "s", "m", "g", "f"])
         for s in payload["steps"]:
             self.assertEqual(s["status"], "planned")
 
@@ -427,8 +427,21 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
                 rel == "index.json" or rel.startswith(".cache/")
                 or rel.startswith("logs/") or rel.startswith("benchmarks/")
                 or rel.endswith("index.md") or rel == "FEATURES.md"
+                # step s (stale-propose) may emit ONE tier-2 review workorder —
+                # a non-auto-start DRAFT proposal (asserted below), never a
+                # destructive edit or an autopromotion.
+                or rel.startswith("work/auto/")
                 or rel == ".gitignore",
                 "unexpected mutation outside the sanctioned set: %s" % rel)
+        # The ONLY work/auto/ mutation the cycle may make is the step-s tier-2
+        # PROPOSAL: assert every emitted plan is a non-auto-start DRAFT, so the
+        # "no autopromotion" guarantee still holds for the new emission surface.
+        for rel in changed:
+            if rel.startswith("work/auto/") and rel.endswith("plan.md"):
+                txt = open(os.path.join(self.kdir, rel), encoding="utf-8").read()
+                self.assertIn("> Status: draft", txt)
+                self.assertNotIn("> Status: running", txt)
+                self.assertNotIn("> Status: ready", txt)
 
 
 class DreamGitSyncTests(unittest.TestCase, _GuardedEnv):
@@ -1223,7 +1236,7 @@ class DreamObservabilityE2ETests(unittest.TestCase, _GuardedEnv):
         steps = {s["step"]: s for s in payload["steps"]}
         # The full a-f cycle ran (c failed but never aborted the rest).
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["1", "2", "a", "b", "c", "d", "e", "m", "g", "f"])
+                         ["1", "2", "a", "b", "c", "d", "e", "s", "m", "g", "f"])
         self.assertEqual(steps["c"]["status"], "fail")
         self.assertEqual(steps["e"]["status"], "ok")
 

@@ -161,7 +161,8 @@ class TestDreamStep(_Base):
         self.assertIn("m", steps)
         self.assertLess(steps.index("m"), steps.index("g"),
                         "step m (mine) must precede step g (classify)")
-        self.assertEqual(steps, ["1", "2", "a", "b", "c", "d", "e", "m", "g", "f"])
+        self.assertEqual(
+            steps, ["1", "2", "a", "b", "c", "d", "e", "s", "m", "g", "f"])
 
     def test_cycle_mines_then_drains_in_one_pass(self):
         self._guard()

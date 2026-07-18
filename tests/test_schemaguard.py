@@ -58,6 +58,10 @@ _GROUND_TRUTH_WRITERS = {
     "cmd_index_add", "cmd_index_remove", "cmd_index_sync", "cmd_index_rebuild",
     "cmd_index_migrate",
     "cmd_learn", "cmd_decide", "cmd_ingest",
+    # declare verb (260717 follow-up B1): mutates the subject `.md` + index.json
+    # via _declare_relation -> save_index, registered by func name so the
+    # predispatch schema-guard refuses it on a newer KB.
+    "cmd_relate",
     # steering-capture verb (260712-steering-capture, Task 2): sugar over
     # cmd_learn(--source user) + cmd_index_remove, but the predispatch gate keys
     # on the dispatched args.func, so it MUST be registered by func name.
@@ -107,6 +111,8 @@ _EXPECTED_INDEX_WRITER_DEFS = {
     "cmd_learn": "cmd_learn",
     "cmd_decide": "cmd_decide",
     "cmd_ingest": "cmd_ingest",
+    "_declare_relation": "cmd_relate",           # relate verb's index writer
+
     "kb_git_push_once": "cmd_kb_git_commit",     # git-sync rebuild-before-commit
     "kb_git_merge_continue": "cmd_kb_git_merge_continue",
     "_mq_integrate_kb": "cmd_fanout_merge_queue",
