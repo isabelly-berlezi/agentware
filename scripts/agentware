@@ -2670,6 +2670,31 @@ def load_index(kdir, _allow_rebuild=True):
     return data, None
 
 
+def _entry_list_field(entry, name):
+    """Normalize a list-typed index entry field (`relates`/`tags`) for READERS.
+
+    Returns a FRESH list of the STRING elements when the field is a list/tuple,
+    else `[]`. This is the shared, purely-defensive normalizer adopted at every
+    RAW-index read site so a poisoned/imported index.json (a hand-edited or
+    out-of-policy-committed index whose list field is a scalar, dict, string, or a
+    list carrying non-string elements) can never crash the recall hot path
+    (`build_adjacency`, `_entry_doc_text`), `audit`, `query`, or
+    `index migrate-frontmatter`.
+
+    Dropping non-string elements also kills the `unhashable type: 'dict'` crash in
+    `graph_relation_errors`' `sorted(set(...))` (a dict element never reaches the
+    set). BYTE-IDENTICAL — value-equal (`==`, a fresh copy, never `is`) — to the
+    raw field for a valid list-of-strings, so downstream `list(...)`/`" ".join(...)`
+    output is unchanged on all valid data. Fail-open by design: the DEDICATED
+    integrity gates (`validate_index`, `audit --graph_integrity`) stay STRICT and
+    surface the corruption loudly (recoverable via `index rebuild`). Pure + read-only.
+    """
+    v = entry.get(name)
+    if isinstance(v, (list, tuple)):
+        return [x for x in v if isinstance(x, str)]
+    return []
+
+
 def _try_rebuild_missing_index(kdir):
     """Best-effort rebuild of a MISSING/corrupt derived index.json from entry
     frontmatter. Returns True iff a valid index.json now exists on disk.
@@ -3269,9 +3294,26 @@ def validate_index(kdir, data):
             else:
                 seen_ids[eid] = entry
 
+        # Strict list-field gate (poisoned-index hardening). The lenient READERS
+        # DROP a bad `tags`/`relates` field or non-string element on the hot path
+        # so recall/audit never crash; `validate_index` is the DEDICATED strict
+        # gate that must REJECT the poison (exit 1) so a lenient reader can never
+        # silently MASK corruption forever. `list` (not `(list, tuple)`) matches
+        # JSON semantics (no tuples). Additive + byte-neutral on the real KB —
+        # all-string lists pass unchanged.
         etags = entry.get("tags")
         if etags is not None and not isinstance(etags, list):
             errors.append("entry '%s' tags is not a list" % label)
+        elif isinstance(etags, list) and not all(
+                isinstance(x, str) for x in etags):
+            errors.append("entry '%s' tags has a non-string element" % label)
+
+        erel = entry.get("relates")
+        if erel is not None and not isinstance(erel, list):
+            errors.append("entry '%s' relates is not a list" % label)
+        elif isinstance(erel, list) and not all(
+                isinstance(x, str) for x in erel):
+            errors.append("entry '%s' relates has a non-string element" % label)
 
         # Optional `last_verified` (freshness). Back-compat: absent is fine
         # (treated as == created). When present it MUST be a YYYY-MM-DD date.
@@ -3285,10 +3327,11 @@ def validate_index(kdir, data):
         if not isinstance(entry, dict):
             continue
         eid = entry.get("id")
-        etags = entry.get("tags")
-        if not isinstance(etags, list):
-            continue
-        for t in etags:
+        # Iterate STRING tags only: a list carrying a dict element would crash
+        # `tags.get(<dict>)` (unhashable). The malformed element is separately
+        # rejected by the per-entry element-type check, so skipping it here only
+        # keeps this consistency scan crash-robust — it never masks the poison.
+        for t in _entry_list_field(entry, "tags"):
             ids = tags.get(t)
             if not isinstance(ids, list) or eid not in ids:
                 errors.append("tag map missing id '%s' under tag '%s'" % (eid, t))
@@ -3304,7 +3347,11 @@ def validate_index(kdir, data):
             entry = seen_ids.get(eid)
             if entry is None:
                 errors.append("tag '%s' references unknown id '%s'" % (t, eid))
-            elif t not in (entry.get("tags") or []):
+            elif t not in _entry_list_field(entry, "tags"):
+                # `_entry_list_field` guards a poisoned (scalar/dict) entry `tags`
+                # so the validator REPORTS the back-ref mismatch instead of
+                # crashing on `t not in <scalar>`; a scalar `tags` is separately
+                # rejected by the per-entry is-a-list check above.
                 errors.append("entry '%s' does not list tag '%s' (back-ref mismatch)"
                               % (eid, t))
 
@@ -4895,7 +4942,7 @@ def build_adjacency(data):
         eid = e.get("id")
         if not eid:
             continue
-        for tok in (e.get("relates") or []):
+        for tok in _entry_list_field(e, "relates"):
             parsed = _fm_parse_relate_token(tok)
             if parsed is None:
                 continue
@@ -4972,7 +5019,7 @@ def graph_relation_errors(data):
         eid = e.get("id")
         if not eid:
             continue
-        for tok in (e.get("relates") or []):
+        for tok in _entry_list_field(e, "relates"):
             parsed = _fm_parse_relate_token(tok)
             if parsed is None:
                 continue
@@ -5491,7 +5538,7 @@ def build_entry_frontmatter(entry, kdir, author=None,
         "id": entry.get("id") or "",
         "title": entry.get("title") or "",
         "category": entry.get("category") or "",
-        "tags": list(entry.get("tags") or []),
+        "tags": _entry_list_field(entry, "tags"),
         "created": created,
         "summary": entry.get("summary") or "",
         "author": author if author is not None else _operator_handle(kdir),
@@ -5499,7 +5546,9 @@ def build_entry_frontmatter(entry, kdir, author=None,
         "last_verified": last_verified or entry.get("last_verified") or created,
         # Declared graph edges; defaults to [] so a no-edge entry emits no
         # `relates:` line and stays byte-identical to the pre-graph format.
-        "relates": list(entry.get("relates") or []),
+        # `_entry_list_field` keeps `migrate-frontmatter` from crashing on a
+        # poisoned index (R4) while staying value-equal for a valid list.
+        "relates": _entry_list_field(entry, "relates"),
     }
 
 
@@ -6121,7 +6170,7 @@ def _prefer_delete_entry(kdir, eid, require_preference=False, archive_dir=None):
     if match is None:
         return None, None
     if require_preference:
-        is_pref = "preference" in (match.get("tags") or [])
+        is_pref = "preference" in _entry_list_field(match, "tags")
         is_user = _pref_entry_is_user_source(kdir, match)
         # Orphan tolerance (audit LOW): a genuine capture whose `.md` is MISSING/
         # unreadable cannot prove source=user via frontmatter, so fall back to the
@@ -8338,7 +8387,7 @@ _PREF_DIGEST_CHAR_BUDGET = 1500  # soft total-char budget (mirrors recall discip
 
 def _pref_project_tags(entry):
     """The `project-<slug>` scope slugs carried by a captured preference."""
-    return [t[len("project-"):] for t in (entry.get("tags") or [])
+    return [t[len("project-"):] for t in _entry_list_field(entry, "tags")
             if t.startswith("project-")]
 
 
@@ -8369,7 +8418,7 @@ def _pref_digest_entries(kdir, data, proj_slug):
     """
     out = []
     for e in data.get("entries") or []:
-        if "preference" not in (e.get("tags") or []):
+        if "preference" not in _entry_list_field(e, "tags"):
             continue
         if not _pref_entry_is_user_source(kdir, e):
             continue
@@ -9286,7 +9335,7 @@ def tag_consistency_errors(data):
         if not isinstance(e, dict):
             continue
         eid = e.get("id")
-        for t in (e.get("tags") or []):
+        for t in _entry_list_field(e, "tags"):
             ids = tags.get(t)
             if not isinstance(ids, list) or eid not in ids:
                 errors.append("tag map missing id '%s' under tag '%s'" % (eid, t))
@@ -9300,7 +9349,7 @@ def tag_consistency_errors(data):
             entry = by_id.get(eid)
             if entry is None:
                 errors.append("tag '%s' references unknown id '%s'" % (t, eid))
-            elif t not in (entry.get("tags") or []):
+            elif t not in _entry_list_field(entry, "tags"):
                 errors.append("entry '%s' missing back-ref for tag '%s'" % (eid, t))
     return errors
 
@@ -9402,7 +9451,10 @@ def _entry_doc_text(kdir, entry):
     parts = [
         entry.get("title") or "",
         entry.get("summary") or "",
-        " ".join(entry.get("tags") or []),
+        # `_entry_list_field` keeps the recall corpus from crashing (scalar tags)
+        # or silently corrupting (a string `tags` would join per-char) on a
+        # poisoned index; byte-identical for a valid list-of-strings.
+        " ".join(_entry_list_field(entry, "tags")),
         _read_entry_body(kdir, entry),
     ]
     return "\n".join(parts)
