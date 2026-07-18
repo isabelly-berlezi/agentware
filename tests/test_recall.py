@@ -222,10 +222,15 @@ class RecallCommandTest(SyntheticKBTestCase):
         payload = json.loads(self.run_cli(
             ["recall", "geofence arrive reminders", "--format", "json"])[1])
         self.assertTrue(payload["results"])
-        NEW = {"abs_path", "created", "last_verified", "age_days"}
+        # Fields layered on top of the BASE record by later features, each proved
+        # additive by its own feature's suite. Subtracting them must leave the
+        # base schema EXACTLY — a later feature may ADD a declared field, never
+        # silently drop or rename a base one.
+        FRESHNESS = {"abs_path", "created", "last_verified", "age_days"}
+        TRUST = {"stale", "superseded_by", "trust"}   # 260713-p3-trust-staleness
         for r in payload["results"]:
             self.assertEqual(
-                set(r) - NEW,
+                set(r) - FRESHNESS - TRUST,
                 {"id", "path", "category", "score", "summary",
                  "estimated_tokens"})
         scores = [r["score"] for r in payload["results"]]
