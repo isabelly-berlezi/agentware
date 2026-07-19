@@ -51,6 +51,15 @@ else
     CTX="$CTX
 $_upd_line"
   fi
+  # Periodic self-exam surfacing (feature 260713-p5-checkup). Prints ONE line only
+  # when checkup is ON AND a fresh, unacknowledged report exists; byte-identical
+  # no-op (no output, no side-effect write) when OFF / no fresh report. Mirrors the
+  # `update --status-line` read-only nudge above. Never blocks session start.
+  _checkup_line="$("$REPO_ROOT/scripts/agentware" checkup --status-line 2>/dev/null || true)"
+  if [[ -n "$_checkup_line" ]]; then
+    CTX="$CTX
+$_checkup_line"
+  fi
   if [[ -f "$KDIR/MAIN.md" ]]; then
     CTX="$CTX
 ----- knowledge/MAIN.md (operator profile + active work) -----

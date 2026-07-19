@@ -4075,6 +4075,29 @@ def cmd_config(args):
                      "ON" if norm == "1" else "OFF"))
         return 0
 
+    # --set-checkup on|off: persist the periodic self-exam opt-in (feature
+    # 260713-p5-checkup) to ~/.agentware/config.env. Default OFF; env overrides
+    # per-run (AGENTWARE_CHECKUP). A runtime kill switch — the tick job + the
+    # status-line hook SKIP when OFF without uninstalling the shared tick.
+    checkup_val = getattr(args, "set_checkup", None)
+    if checkup_val is not None:
+        norm = _parse_checkup(checkup_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-checkup value %r (use on|off|1|0|yes|no)\n"
+                % checkup_val)
+            return 2
+        _set_config_value(CHECKUP_KEY, norm)
+        if as_json:
+            json.dump({"ok": True, "checkup": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (periodic self-exam %s)"
+                  % (CHECKUP_KEY, norm, HOME_CONFIG,
+                     "ON" if norm == "1" else "OFF"))
+        return 0
+
     # --set-dream-schedule <HH:MM|cron>: persist the nightly dream schedule token
     # the installer wires into launchd/cron. Invalid tokens are rejected.
     dream_sched_val = getattr(args, "set_dream_schedule", None)
@@ -4160,6 +4183,12 @@ def cmd_config(args):
     # (onboarding confirm + the tick job gate). Default OFF.
     if getattr(args, "updater_only", False):
         print("on" if resolve_updater() == "1" else "off")
+        return 0
+
+    # --checkup-only: bare resolved checkup setting (on/off) for shell consumers
+    # (the status-line hook gate). Default OFF.
+    if getattr(args, "checkup_only", False):
+        print("on" if resolve_checkup() == "1" else "off")
         return 0
 
     # --dream-schedule-only: bare resolved dream schedule token (empty if unset).
@@ -26274,6 +26303,1009 @@ def _audit_pkg_version_check(kdir):
                 "details": ["update-state sidecar tampered — %s" % exc]}
 
 
+# =============================================================================
+# checkup — the periodic self-examination service (feature 260713-p5-checkup)
+# =============================================================================
+# The periodic PHYSICAL EXAM: mostly-deterministic aggregation over P1
+# instrumentation PLUS one bounded, REPORT-ONLY LLM narrative pass. Its ONLY
+# outputs are (a) a deterministic, byte-stable session-top report under
+# logs/checkup/ surfaced by a one-line `checkup --status-line` banner, and (b)
+# tier-2 suggested workorders built ONLY from the DETERMINISTIC candidate set
+# (stalled plan · frozen metric · fired structure trigger) through the EXISTING
+# sanitized `plan new --auto --context` emitter (never --target). checkup mutates
+# NO governance state (no index add/remove, no plan set-state, no kernel write);
+# its only writes are files under logs/checkup/ + sanitized work/auto/ workorders.
+#
+# Q5 self-amendment ban (NOT overridable) — enforced BY CONSTRUCTION: the LLM
+# never emits, so no LLM-authored proposal can become a workorder; every
+# DETERMINISTIC candidate is still filtered through the tier-3 reject scan
+# (_pref_hits_kernel or _pref_loosens_gate) BEFORE emit (defense-in-depth) and a
+# dropped candidate is surfaced in the report's Rejected section (the human
+# escape valve); and every checkup workorder is tier-2 (operator-approved).
+# Opt-in + default OFF (like dream/updater): inert until `config --set-checkup on`.
+
+CHECKUP_KEY = "AGENTWARE_CHECKUP"
+CHECKUP_DEFAULT = "0"       # opt-in + OFF, like dream/updater (consequential automation)
+# One bounded LLM narrative pass, ON by default; a runtime kill switch so a
+# hermetic/offline run (or an operator who wants deterministic-only) can disable
+# the single subprocess without touching the deterministic signals (Q4).
+CHECKUP_LLM_KEY = "AGENTWARE_CHECKUP_LLM"
+CHECKUP_LLM_DEFAULT = "1"
+
+CHECKUP_INTERVAL_SEC = 7 * 24 * 3600     # Q1: weekly cadence (in-band wall-clock)
+CHECKUP_WINDOW_DAYS = 7                   # Q9: window = the cadence window
+CHECKUP_LEARNING_FRESH_DAYS = 14         # Q9: learning-freshness N
+CHECKUP_CORPUS_ENTRIES_MAX = 7000        # Q8: corpus-size structure trigger (~16x under solo)
+CHECKUP_WORKTREE_MAX = 12                # Q8: git-worktree structure trigger
+CHECKUP_RECALL_P50_MS_MAX = 1000         # Q8: recall-latency proxy (report-only, never fires)
+CHECKUP_HEARTBEAT_STALE_H = 6            # tick-liveness: pkg_version heartbeat older than this
+MIN_FROZEN_CYCLES = 3                    # "130-for-13-nights": min PRESENT samples (> 2)
+
+CHECKUP_DIR_REL = os.path.join("logs", "checkup")
+CHECKUP_REPORT_REL = os.path.join("logs", "checkup", "checkup-latest.md")
+CHECKUP_ACK_REL = os.path.join("logs", "checkup", ".ack")
+CHECKUP_LASTRUN_REL = os.path.join("logs", "checkup", ".last-run")
+
+# Curated, TUNABLE allowlist of drift-EXPECTED numeric journal metrics for the
+# "130-for-13-nights" frozen-metric check, keyed "<step>.<field>" as parsed from
+# the dream-journal step lines. Each value is the tolerance BAND (a wobble within
+# it is NOT "moved"). DELIBERATELY EXCLUDES boolean flags (force/with_tests/
+# audit_ok) and steady-state finding-counts whose constant value is HEALTHY
+# (stale/duplicates/unpromoted_markers/tests_failed/failed_checks, miner
+# candidates) — those are constant BY DESIGN, not frozen (audit L4-3). A metric is
+# frozen ONLY when it is in this allowlist AND held within tolerance across
+# >= MIN_FROZEN_CYCLES cycles where it was actually PRESENT.
+CHECKUP_FROZEN_METRICS = {
+    "d.reliability": 0.005,   # eval reliability — SHOULD move as code changes
+    "c.tests_ran": 0.0,       # test count — SHOULD grow as tests are added
+    "d.rows_added": 0.0,      # eval rows appended — a permanently-flat 0 is suspect
+}
+
+
+def _parse_checkup(raw):
+    """Lenient on/off parse for the checkup flag ('1'/'0'/None-if-unknown).
+    Mirrors _parse_updater: a typo returns None so the caller falls through to the
+    safe OFF default — a typo never silently ENABLES the unattended exam."""
+    if raw is None:
+        return None
+    v = str(raw).strip().strip('"').strip("'").lower()
+    if v == "":
+        return None
+    if v in _DREAM_OFF_TOKENS:
+        return "0"
+    if v in _DREAM_ON_TOKENS:
+        return "1"
+    return None
+
+
+def resolve_checkup():
+    """Effective checkup setting '1' (on) / '0' (off). Precedence:
+    AGENTWARE_CHECKUP env -> config.env -> default OFF. Read per-run; the tick job
+    + the `checkup --status-line` hook gate on it (a runtime kill switch — no
+    uninstall of the shared tick needed)."""
+    env = _parse_checkup(os.environ.get(CHECKUP_KEY))
+    if env is not None:
+        return env
+    cfg = _parse_checkup(_read_config_key(CHECKUP_KEY))
+    if cfg is not None:
+        return cfg
+    return CHECKUP_DEFAULT
+
+
+def resolve_checkup_llm():
+    """Effective bounded-LLM-pass setting '1'/'0'. Precedence:
+    AGENTWARE_CHECKUP_LLM env -> config.env -> default ON. Disabling it leaves the
+    deterministic signals untouched (Q4) and is how a hermetic run avoids a real
+    spawn without monkeypatching the seam."""
+    env = _parse_checkup(os.environ.get(CHECKUP_LLM_KEY))
+    if env is not None:
+        return env
+    cfg = _parse_checkup(_read_config_key(CHECKUP_LLM_KEY))
+    if cfg is not None:
+        return cfg
+    return CHECKUP_LLM_DEFAULT
+
+
+# --- run-state paths + watermarks (all under logs/checkup/, gitignored) --------
+
+def _checkup_report_path(kdir):
+    return os.path.join(kdir, CHECKUP_REPORT_REL)
+
+
+def _checkup_read_report(kdir):
+    """The current report body, or None (tolerant of a missing file)."""
+    try:
+        with open(_checkup_report_path(kdir), "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _checkup_content_hash(text):
+    """Stable content hash for the `.ack` freshness watermark (audit L6-1)."""
+    import hashlib
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _checkup_last_run_ts(kdir):
+    """ISO 'Z' timestamp of checkup's own last run from logs/checkup/.last-run, or
+    None. The due-gate keys off THIS (checkup-owned), never updater/dream state."""
+    if not kdir:
+        return None
+    try:
+        with open(os.path.join(kdir, CHECKUP_LASTRUN_REL), "r",
+                  encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _checkup_write_last_run(kdir):
+    """Stamp checkup's last-run watermark (best-effort; never raises)."""
+    try:
+        p = os.path.join(kdir, CHECKUP_LASTRUN_REL)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(_now_iso() + "\n")
+    except OSError:
+        pass
+
+
+def _checkup_anchor_epoch(now):
+    """STABLE window anchor = floor(now) to the cadence boundary — never raw now
+    (INV-1, audit L6-2). Identical for every re-run within a 7-day bucket, so the
+    set of in-window events (and thus the report) is byte-stable across idempotent
+    re-runs. AGE thresholds (72h stall, 48h stale) still use live `now` but the
+    report renders only the BOOLEAN crossing (no live age), so back-to-back re-runs
+    stay byte-identical."""
+    return int(now // CHECKUP_INTERVAL_SEC) * CHECKUP_INTERVAL_SEC
+
+
+# --- Task 2: deterministic read-only window aggregator + flywheel signals ------
+
+def _checkup_trend(values):
+    """rising/falling/flat from an ordered numeric list, or None when there are
+    fewer than 2 samples (insufficient data — never a fabricated direction)."""
+    vals = [v for v in values if isinstance(v, (int, float))]
+    if len(vals) < 2:
+        return None
+    half = len(vals) // 2
+    first = sum(vals[:half]) / half if half else 0.0
+    second = sum(vals[half:]) / (len(vals) - half)
+    d = second - first
+    if d > 1e-6:
+        return "rising"
+    if d < -1e-6:
+        return "falling"
+    return "flat"
+
+
+def _checkup_flywheel(kdir, window_lo, anchor):
+    """LIVE flywheel signals over the window (Q9). Each is a pure function over a
+    read-only snapshot returning {value|..., direction|gauge, sample_n}, each
+    forward-compatible with an EMPTY channel -> 'insufficient data' (Q10), never a
+    crash and never a fabricated number. Read-only (no writes anywhere)."""
+    out = {}
+    _empty_ret = {"sessions": [], "corpus_coverage": {"ratio": None,
+                                                       "corpus_size": 0}}
+    # read-through ratio trend (per-session, None-filtered, audit L3-4). PROBE the
+    # index READ-ONLY first: a missing/corrupt index.json is a NORMAL fresh-clone
+    # state, and derive_retrieval load_index's it with rebuild ON — which would
+    # WRITE index.json + FEATURES.md + rosters + the BM25 cache, breaking the Q7
+    # read-only-w.r.t.-index invariant (adversarial-review finding). Only call
+    # derive_retrieval when the index loads read-only; else the channel is simply
+    # insufficient (never a governance-state write).
+    _data, _err = load_index(kdir, _allow_rebuild=False)
+    if _err:
+        ret = _empty_ret
+    else:
+        try:
+            ret = derive_retrieval(kdir)
+        except Exception:
+            ret = _empty_ret
+    ratios = [s["read_through"]["ratio"]
+              for s in ret.get("sessions", [])
+              if isinstance(s.get("read_through"), dict)
+              and s["read_through"].get("ratio") is not None]
+    out["read_through"] = ({"insufficient_data": True} if not ratios else {
+        "value": round(sum(ratios) / len(ratios), 4),
+        "direction": _checkup_trend(ratios), "sample_n": len(ratios)})
+    # corpus-coverage: point-in-time GAUGE, NO direction (a single all-time
+    # aggregate, audit L3-4)
+    cc = ret.get("corpus_coverage") or {}
+    out["corpus_coverage"] = ({"insufficient_data": True}
+                              if cc.get("ratio") is None else {
+        "value": cc.get("ratio"), "gauge": True,
+        "sample_n": cc.get("corpus_size", 0)})
+    # error-recovery yield — the KEPT miner arm (claude-error-records)
+    er = _premise_corpus_metric_value("claude-error-records", kdir)
+    out["error_recovery"] = ({"insufficient_data": True} if er is None else {
+        "value": er, "gauge": True, "sample_n": er})
+    # recurrence gauge — RETIRED, low-precision, NO direction, NEVER a workorder
+    # driver (decide-miner-recurrence-arm-retired-keep-error-recovery, audit L3-1)
+    rc = _premise_corpus_metric_value("recurrence-keys-at-n", kdir)
+    out["recurrence"] = ({"insufficient_data": True} if rc is None else {
+        "value": rc, "gauge": True, "low_precision": True, "sample_n": rc})
+    # learning-freshness (N=14): a fresh learning (index `created` <= N days) whose
+    # id was SURFACED by recall in a session — a faithful LOWER BOUND over the
+    # existing derive_retrieval seam (returned_ids), NOT a phantom recall-ts join
+    # (audit L3-2; see the worklog `> DECISION:`).
+    out["learning_freshness"] = _checkup_learning_freshness(kdir, ret, anchor)
+    return out
+
+
+def _checkup_learning_freshness(kdir, ret, anchor):
+    """Fresh learnings (index `created` <= N days before the STABLE window anchor)
+    that recall SURFACED in a session (lower bound). The cutoff keys off `anchor`
+    (the cadence-bucket epoch), NEVER live now — a learning near the N-day boundary
+    would otherwise flip fresh<->stale between two idempotent re-runs, leaking live
+    time into the byte-stable report (adversarial-review finding). load_index is
+    READ-ONLY (no rebuild write). Degrades to insufficient data on an empty
+    corpus."""
+    import calendar
+    import datetime
+    try:
+        data, _err = load_index(kdir, _allow_rebuild=False)
+        entries = (data or {}).get("entries") or []
+    except Exception:
+        entries = []
+    cutoff = anchor - CHECKUP_LEARNING_FRESH_DAYS * 86400
+    fresh = set()
+    for e in entries:
+        if not isinstance(e, dict) or e.get("category") != "learnings":
+            continue
+        eid, created = e.get("id"), e.get("created")
+        if not eid or not created:
+            continue
+        try:
+            cepoch = calendar.timegm(
+                datetime.datetime.strptime(created, "%Y-%m-%d").timetuple())
+        except (ValueError, TypeError):
+            continue
+        if cepoch >= cutoff:
+            fresh.add(eid)
+    if not fresh:
+        return {"insufficient_data": True}
+    surfaced = set()
+    for s in ret.get("sessions", []):
+        for i in (s.get("returned_ids") or []):
+            surfaced.add(i)
+    used = fresh & surfaced
+    return {"value": len(used), "fresh_total": len(fresh),
+            "gauge": True, "lower_bound": True, "sample_n": len(fresh)}
+
+
+# --- Task 3: plan-health + declared-vs-derived DRIFT (read-only) ---------------
+
+def _checkup_plan_title(ptext):
+    """First `# ` heading of a plan, collapsed to one line + truncated. Best-effort
+    (empty string when none). Feeds the stalled-plan candidate text so a plan about
+    editing a kernel path is DROPPED by the reject scan (defense-in-depth)."""
+    for ln in (ptext or "").splitlines():
+        s = ln.strip()
+        if s.startswith("#"):
+            t = s.lstrip("#").strip()
+            if t:
+                return " ".join(t.split())[:140]
+    return ""
+
+
+def _checkup_walk_plans(kdir, now):
+    """ONE read-only walk of work/<feature>/plan.md + work/auto/<slug>/plan.md,
+    returning per-plan {feature, rel, state, claim_age_h, title, is_auto, mtime_d}.
+    Reused by plan-health AND drift (no double walk, audit L4-4/L7-04). Reuses the
+    dream drift primitives (_read_plan_status/_parse_claim/_iso_to_epoch)."""
+    import glob
+    work = os.path.join(kdir, "work")
+    paths = sorted(set(glob.glob(os.path.join(work, "*", "plan.md")) +
+                       glob.glob(os.path.join(work, "auto", "*", "plan.md"))))
+    out = []
+    for p in paths:
+        d = os.path.dirname(p)
+        feat = os.path.relpath(d, work)
+        # NEVER examine checkup's OWN emitted workorders — they are checkup's
+        # OUTPUT, not input. Counting them would (a) make plan-health draft/rotting
+        # counts change every cycle (breaking the byte-stable report, INV-1) and
+        # (b) create a self-observation feedback loop. Other services' auto-
+        # workorders (dream/prefer/review) are legitimate external plans to observe.
+        if feat.startswith("auto/checkup-"):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                ptext = f.read()
+        except OSError:
+            continue
+        state, _cnt = _read_plan_status(ptext)
+        claim = _parse_claim(ptext)
+        cepoch = _iso_to_epoch(claim["ts"]) if claim else None
+        age_h = ((now - cepoch) / 3600.0) if cepoch is not None else None
+        try:
+            mtime_d = (now - os.path.getmtime(p)) / 86400.0
+        except OSError:
+            mtime_d = 0.0
+        out.append({"feature": feat, "rel": "work/%s/plan.md" % feat,
+                    "state": state, "claim_age_h": age_h,
+                    "title": _checkup_plan_title(ptext),
+                    "is_auto": feat.startswith("auto/"), "mtime_d": mtime_d})
+    return out
+
+
+def _checkup_plan_health(kdir, now, plans=None):
+    """done-vs-rotting over the 6-state lifecycle (audit L5-2): rot = `running`-
+    stalled (claim >= STALLED_CLAIM_HOURS) + `draft` idle past its TTL; EXCLUDE
+    cancelled/superseded/done from the rot numerator; `ready` = healthy-waiting.
+    Read-only — a stalled plan is a REPORTED finding, never a state flip."""
+    plans = _checkup_walk_plans(kdir, now) if plans is None else plans
+    stalled, counts = [], {s: 0 for s in _PLAN_STATES}
+    rotting = 0
+    for p in plans:
+        counts[p["state"]] = counts.get(p["state"], 0) + 1
+        if p["state"] == "running" and p["claim_age_h"] is not None \
+                and p["claim_age_h"] >= STALLED_CLAIM_HOURS:
+            stalled.append({"feature": p["feature"], "rel": p["rel"],
+                            "title": p["title"]})
+            rotting += 1
+        elif p["state"] == "draft":
+            ttl = AUTO_DRAFT_TTL_DAYS if p["is_auto"] else OPERATOR_DRAFT_TTL_DAYS
+            if p["mtime_d"] > ttl:
+                rotting += 1
+    done = counts.get("done", 0)
+    return {"stalled": stalled, "rotting": rotting, "done": done,
+            "ready": counts.get("ready", 0), "running": counts.get("running", 0),
+            "draft": counts.get("draft", 0), "counts": counts,
+            "total": len(plans),
+            "done_ratio": (round(done / len(plans), 4) if plans else None),
+            "insufficient_data": not plans}
+
+
+def _checkup_drift(kdir, now, watcher, plan_health):
+    """Declared-vs-derived drift, each {kind, declared, derived, severity}. STRICTLY
+    read-only; renders BOOLEAN crossings only (no live ages) for byte-stability."""
+    out = []
+    # (i) dream declared ON but no cycle fired on cadence — REFERENCE Task 4's
+    # single computation, never recompute (audit L4-4).
+    if resolve_dream() == "1" and not watcher.get("fired_ok"):
+        out.append({"kind": "dream-declared-not-fired", "declared": "dream ON",
+                    "derived": watcher.get("verdict") or "no fresh cycle",
+                    "severity": "warn"})
+    # (ii) header `running` whose claim went stale (declared-active vs derived-
+    # stalled) — reuse plan-health's stalled set (no re-walk).
+    for s in plan_health.get("stalled", []):
+        out.append({"kind": "running-but-stalled", "declared": "Status: running",
+                    "derived": "claim aged past %dh" % STALLED_CLAIM_HOURS,
+                    "severity": "warn", "feature": s["feature"]})
+    # (iii) version drift split: applied-vs-available (honors updater-OFF inert)
+    # and heartbeat-ts freshness as tick-liveness — NOT a tautological version-vs-
+    # version compare (audit L3-3).
+    try:
+        vc = _audit_pkg_version_check(kdir)
+    except Exception:
+        vc = {"ok": True}
+    if not vc.get("ok"):
+        out.append({"kind": "version-drift",
+                    "declared": "applied %s" % (vc.get("pkg_version") or "?"),
+                    "derived": "; ".join(vc.get("details", [])) or "behind",
+                    "severity": "warn"})
+    if _checkup_heartbeat_stale(kdir, now):
+        out.append({"kind": "heartbeat-stale",
+                    "declared": "tick expected ~30m", "derived": "no fresh "
+                    "pkg_version heartbeat (> %dh)" % CHECKUP_HEARTBEAT_STALE_H,
+                    "severity": "info"})
+    return out
+
+
+def _checkup_heartbeat_stale(kdir, now):
+    """True iff the latest pkg_version heartbeat in logs/metrics.jsonl is older than
+    the tick-liveness threshold. Boolean crossing only (no live age rendered).
+    Absent channel -> not-stale (fail-open, never a false alarm on a bare KB)."""
+    try:
+        events = _read_metrics_jsonl(kdir)
+    except Exception:
+        return False
+    ts = None
+    for e in events:
+        if isinstance(e, dict) and e.get("event") == "pkg_version" and e.get("ts"):
+            ts = e["ts"]
+    if not ts:
+        return False
+    epoch = _iso_to_epoch(ts)
+    if epoch is None:
+        return False
+    return (now - epoch) > CHECKUP_HEARTBEAT_STALE_H * 3600
+
+
+# --- Task 4: watcher-watching (dream itself) — the load-bearing check ----------
+
+def _checkup_parse_journal(kdir):
+    """Parse logs/dream-journal.md into per-cycle {ts, metrics:{"<step>.<field>":
+    float}} records (fixed-field lines, audit L4-2). ONLY numeric, space-free
+    values are captured — booleans (True/False) and dash placeholders naturally
+    fail float() and are skipped; failed_tests/reason carry spaces and are excluded
+    by the space-free rule. Read-only; tolerant of a missing/garbled journal ([])."""
+    path = os.path.join(kdir, DREAM_JOURNAL_REL)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return []
+    step_re = re.compile(r"^- step (\S+) \([^)]*\):\s+\S+(?:\s+(.*))?$")
+    cycles, cur = [], None
+    for ln in text.splitlines():
+        m = re.match(r"^## dream (\S+)\s*$", ln)
+        if m:
+            cur = {"ts": m.group(1), "metrics": {}}
+            cycles.append(cur)
+            continue
+        if cur is None:
+            continue
+        sm = step_re.match(ln)
+        if not sm:
+            continue
+        step = sm.group(1)
+        tail = sm.group(2) or ""
+        for kv in tail.split():
+            if "=" not in kv:
+                continue
+            k, _, v = kv.partition("=")
+            try:
+                val = float(v)
+            except (ValueError, TypeError):
+                continue     # non-numeric (bool/dash/string) -> skip
+            cur["metrics"]["%s.%s" % (step, k)] = val
+    return cycles
+
+
+def _checkup_frozen_metrics(cycles):
+    """The "130-for-13-nights" check: for each ALLOWLISTED metric, gather its
+    PRESENT (ts, value) samples across the window cycles; flag frozen ONLY when
+    there are >= MIN_FROZEN_CYCLES present samples spanning distinct cycles AND the
+    spread (max-min) is within the metric's tolerance band. Fewer present samples
+    -> NOT frozen (never a false freeze on n<MIN, audit L4-1/L4-5). A change-gate-
+    skipped step is simply ABSENT here (a GAP, not a repeated value)."""
+    frozen = []
+    for metric, tol in sorted(CHECKUP_FROZEN_METRICS.items()):
+        samples = [(c["ts"], c["metrics"][metric]) for c in cycles
+                   if metric in c.get("metrics", {})]
+        if len(samples) < MIN_FROZEN_CYCLES:
+            continue
+        vals = [v for _ts, v in samples]
+        if (max(vals) - min(vals)) <= tol:
+            frozen.append({"metric": metric, "value": vals[0],
+                           "present_cycles": len(samples), "tolerance": tol})
+    return frozen
+
+
+def _checkup_watch_dream(kdir, cycles, now):
+    """REUSE _audit_dream_health_check for the single last-cycle fired/stale verdict
+    (audit L7-03), and own ONLY what dream_health cannot: the window-level missed-
+    cycle COUNT (gaps >= DREAM_STALE_HOURS with dream ON) and the frozen-metric
+    check over the journal. Returns {fired_ok, verdict, missed_cycles,
+    frozen_metrics, insufficient_data}."""
+    try:
+        health = _audit_dream_health_check(kdir)
+    except Exception:
+        health = {"ok": True, "details": ["dream_health unavailable"]}
+    verdict = "; ".join(health.get("details", [])) or ("ok" if health.get("ok")
+                                                        else "fail")
+    # window-level missed-cycle count (only meaningful when dream is declared ON)
+    missed = 0
+    if resolve_dream() == "1":
+        epochs = sorted(e for e in (_iso_to_epoch(c["ts"]) for c in cycles)
+                        if e is not None)
+        gap = DREAM_STALE_HOURS * 3600
+        for a, b in zip(epochs, epochs[1:]):
+            if (b - a) > gap:
+                missed += 1
+        if epochs and (now - epochs[-1]) > gap:
+            missed += 1
+        elif not epochs:
+            missed += 1     # dream ON but no cycle in the window at all
+    frozen = _checkup_frozen_metrics(cycles)
+    # PRESENT-sample sufficiency: fewer than MIN across all metrics AND no cycles
+    # -> insufficient data for the frozen check (never a false freeze).
+    return {"fired_ok": bool(health.get("ok")), "verdict": verdict,
+            "missed_cycles": missed, "frozen_metrics": frozen,
+            "cycles_in_window": len(cycles),
+            "insufficient_data": len(cycles) < MIN_FROZEN_CYCLES}
+
+
+# --- Task 5: KB-structure trigger-signal measurement (read-only) ---------------
+
+def _checkup_worktree_count():
+    """Distinct git worktrees for the package repo via a READ-ONLY `git worktree
+    list --porcelain`, or None on error (uncheckable -> never fires)."""
+    try:
+        cp = _git(REPO_ROOT, "worktree", "list", "--porcelain")
+    except Exception:
+        return None
+    if cp.returncode != 0:
+        return None
+    return sum(1 for ln in cp.stdout.splitlines() if ln.startswith("worktree "))
+
+
+def _checkup_recall_p50_ms():
+    """recall p50 latency from the benchmarks/history.jsonl `latency_ms_p50` eval
+    proxy (env-dependent + stale between eval runs), or None. Report-only — NEVER
+    fires a workorder on its own (Q8). There is NO per-recall latency in
+    metrics.jsonl, so this is the only (weak) available source."""
+    path = os.path.join(REPO_ROOT, "benchmarks", "history.jsonl")
+    val = None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("latency_ms_p50") is not None:
+                    val = rec.get("latency_ms_p50")
+    except OSError:
+        return None
+    return val
+
+
+def _checkup_structure_triggers(kdir):
+    """Measure ONLY the structure-change signals that have a READ-ONLY source (Q8).
+    rebuild-time is DROPPED — inert by construction (no passive source; timing a
+    rebuild would WRITE index.json, breaking Q7). Each: {signal, value, threshold,
+    fired, source, fires_workorder}. At solo scale EVERY signal is far under
+    threshold, so this ships inert. Read-only."""
+    out = []
+    # corpus size — the one clean live threshold. load_index is READ-ONLY
+    # (_allow_rebuild=False): a missing/corrupt index is a normal fresh-clone state,
+    # and the default rebuild-on-load would WRITE index.json, breaking Q7 (adversarial-
+    # review finding). A missing index -> None (uncheckable -> never fires).
+    try:
+        data, err = load_index(kdir, _allow_rebuild=False)
+        n = None if err else len((data or {}).get("entries") or [])
+    except Exception:
+        n = None
+    out.append({"signal": "corpus-size", "value": n,
+                "threshold": CHECKUP_CORPUS_ENTRIES_MAX,
+                "fired": bool(n is not None and n >= CHECKUP_CORPUS_ENTRIES_MAX),
+                "source": "len(index.json entries)", "fires_workorder": True})
+    # git-worktree count
+    wt = _checkup_worktree_count()
+    out.append({"signal": "git-worktrees", "value": wt,
+                "threshold": CHECKUP_WORKTREE_MAX,
+                "fired": bool(wt is not None and wt >= CHECKUP_WORKTREE_MAX),
+                "source": "git worktree list", "fires_workorder": True})
+    # multi-tenancy — team-mode flag + distinct provenance handles
+    try:
+        team = resolve_kb_mode() == KB_MODE_TEAM
+    except Exception:
+        team = False
+    handles = set()
+    uh = resolve_user_handle()
+    if uh:
+        handles.add(uh)
+    try:
+        handles.add(_operator_handle(kdir))
+    except Exception:
+        pass
+    nh = len(handles)
+    out.append({"signal": "multi-tenancy", "value": (max(nh, 2) if team else nh),
+                "threshold": 2,
+                "fired": bool(team or nh >= 2),
+                "source": "KB_MODE_TEAM + distinct handles",
+                "fires_workorder": True})
+    # recall p50 latency — REPORT-ONLY, never fires a workorder on its own
+    p50 = _checkup_recall_p50_ms()
+    out.append({"signal": "recall-p50-ms", "value": p50,
+                "threshold": CHECKUP_RECALL_P50_MS_MAX,
+                "fired": bool(p50 is not None and p50 >= CHECKUP_RECALL_P50_MS_MAX),
+                "source": "benchmarks/history.jsonl (eval proxy, stale)",
+                "fires_workorder": False})
+    return out
+
+
+# --- Task 7a: one bounded REPORT-ONLY LLM narrative pass -----------------------
+
+def _checkup_llm_input(agg):
+    """A compact, numeric/enum/id-only summary of the deterministic aggregate for
+    the LLM. Prefer values over inlined free text (untrusted-vs-trusted, Q4)."""
+    fw = agg.get("flywheel", {})
+    ph = agg.get("plan_health", {})
+    wa = agg.get("watcher", {})
+    lines = ["checkup deterministic aggregate (numeric/enum only):"]
+    for k, v in sorted(fw.items()):
+        lines.append("- flywheel.%s: %s" % (k, json.dumps(v, sort_keys=True)))
+    lines.append("- plan_health: done=%s rotting=%s stalled=%s ready=%s"
+                 % (ph.get("done"), ph.get("rotting"),
+                    len(ph.get("stalled", [])), ph.get("ready")))
+    lines.append("- watcher: fired_ok=%s missed_cycles=%s frozen=%d"
+                 % (wa.get("fired_ok"), wa.get("missed_cycles"),
+                    len(wa.get("frozen_metrics", []))))
+    lines.append("- structure_triggers_fired: %d"
+                 % sum(1 for t in agg.get("triggers", []) if t.get("fired")))
+    return "\n".join(lines)
+
+
+def _checkup_llm_narrative(agg, cfg):
+    """DELEGATE the ONE bounded pass to the CLI-aware _review_invoke_agent seam
+    (NOT a hand-rolled `claude -p` — a copy breaks under AGENTWARE_CLI=codex, audit
+    L2-1), with the aggregate FENCED as untrusted data (R-SEC-02, audit L2-2). Parse
+    stdout with _review_extract_json expecting ONE wrapping object
+    {"narrative","observations"} (the parser returns the FIRST object, not a list,
+    audit L1-03). Its output lands ONLY in the report; on failure/timeout the seam
+    returns '' -> extract None -> the report OMITS the narrative. The LLM NEVER
+    emits a workorder."""
+    prompt = "\n\n".join([
+        "You are a checkup meta-audit narrator for the agentware self-maintenance "
+        "system. Read the DETERMINISTIC aggregate below and write a brief, sober "
+        "narrative of what the trends mean plus a few concrete observations. You "
+        "have NO authority to change anything — your output is REPORT-ONLY.",
+        _review_fence("CHECKUP_AGGREGATE", _checkup_llm_input(agg)),
+        "Return ONLY one JSON object: "
+        "{\"narrative\": \"<2-4 sentences>\", "
+        "\"observations\": [\"<short observation>\", ...]}.",
+    ])
+    try:
+        out = _review_invoke_agent("checkup", REVIEW_REVIEWER_PERSONA, prompt,
+                                   cfg or {}, timeout=REVIEW_AGENT_TIMEOUT)
+    except Exception:
+        return None
+    obj = _review_extract_json(out)
+    if not isinstance(obj, dict):
+        return None
+    narrative = obj.get("narrative")
+    obs = obj.get("observations")
+    if not isinstance(narrative, str):
+        narrative = ""
+    clean_obs = []
+    if isinstance(obs, list):
+        for o in obs:
+            if isinstance(o, str) and o.strip():
+                clean_obs.append(" ".join(o.split())[:300])
+    narrative = " ".join(narrative.split())[:1200]
+    if not narrative and not clean_obs:
+        return None
+    return {"narrative": narrative, "observations": clean_obs}
+
+
+# --- Task 7b: DETERMINISTIC-ONLY workorder emit --------------------------------
+
+def _checkup_candidates(agg):
+    """The CLOSED, checkup-authored DETERMINISTIC candidate set (Q5/Q6): stalled
+    plan · frozen metric · fired structure trigger. LLM findings are NEVER here —
+    the emitter's input set is closed by construction, so no LLM-authored proposal
+    can become a workorder. Each candidate = {kind, fp, trigger, text}."""
+    cands = []
+    for s in agg.get("plan_health", {}).get("stalled", []):
+        text = ("Stalled plan %s is running with a claim aged past the %dh "
+                "threshold — investigate or cancel it. Plan title: %s"
+                % (s["rel"], STALLED_CLAIM_HOURS, s.get("title") or "(untitled)"))
+        cands.append({"kind": "stalled", "fp": "stalled:" + s["feature"],
+                      "trigger": "checkup meta-audit: stalled plan "
+                                 "(tier-2 deterministic candidate)", "text": text})
+    for fm in agg.get("watcher", {}).get("frozen_metrics", []):
+        text = ("Frozen metric %s held at %s across %d present dream cycles within "
+                "tolerance (the 130-for-13-nights pathology) — the watcher runs but "
+                "its number is not moving; investigate the underlying step."
+                % (fm["metric"], fm["value"], fm["present_cycles"]))
+        cands.append({"kind": "frozen", "fp": "frozen:" + fm["metric"],
+                      "trigger": "checkup meta-audit: frozen headline metric "
+                                 "(130-for-13-nights)", "text": text})
+    for t in agg.get("triggers", []):
+        if not (t.get("fired") and t.get("fires_workorder")):
+            continue
+        text = ("KB-structure trigger fired: %s value %s reached threshold %s — "
+                "propose a structure migration (author a TESTED rollback per the "
+                "safe-migration skill at execution time)."
+                % (t["signal"], t.get("value"), t.get("threshold")))
+        cands.append({"kind": "trigger", "fp": "trigger:" + t["signal"],
+                      "trigger": "checkup meta-audit: KB-structure migration "
+                                 "trigger (approval-gated)", "text": text})
+    return cands
+
+
+def _checkup_emit_workorder(kdir, cand):
+    """Emit ONE tier-2 suggested workorder for a DETERMINISTIC candidate through
+    the EXISTING sanitized `plan new --auto --context` emitter (never --target,
+    never a Verify/executable line; candidate fenced in Context only) — a copy of
+    _prefer_emit_workorder / _review_emit_low_workorder. `title=` is REQUIRED
+    (cmd_plan_new reads args.title DIRECT, audit L1-04). Fingerprint-slugged for
+    idempotence: an existing workorder for this candidate returns SUCCESS (no double
+    emit). Returns (feature, None) or (None, reason) when the emitter REFUSES (g1/g3)
+    so the caller DEFERS — deterministic candidates re-derive each cycle so a g3
+    DEFER recurs next cycle (audit L1-05)."""
+    import hashlib
+    keyslug = (_slugify("%s %s" % (cand.get("kind", "checkup"),
+                                   cand.get("text", "")))[:40]).strip("-") \
+        or "checkup"
+    h = hashlib.sha1((cand.get("fp") or cand.get("text") or "").encode("utf-8")
+                     ).hexdigest()[:10]
+    slug = "checkup-%s-%s" % (keyslug, h)
+    existing = os.path.join(kdir, "work", "auto", slug, "plan.md")
+    if os.path.isfile(existing):
+        return "auto/" + slug, None      # idempotent no-op (already emitted)
+    ns = argparse.Namespace(
+        feature=slug, title="Review a checkup meta-audit finding",
+        auto=True, self_extension=False, generated_by="checkup",
+        trigger=cand["trigger"], evidence=CHECKUP_REPORT_REL,
+        target=None, context=cand["text"], force=False,
+        max_iterations=30, author=None, format="json")
+    rc, out = _dream_capture(cmd_plan_new, ns)
+    if rc != 0:
+        return None, "emitter refused (rc=%d)" % rc
+    try:
+        feat = json.loads(out).get("feature") or ("auto/" + slug)
+    except ValueError:
+        feat = "auto/" + slug
+    return feat, None
+
+
+def _checkup_reject_reason(text):
+    """Which tier-3 reject scan fires (for the report's Rejected section), or None
+    when the candidate is clean. Mirrors _prefer_classify_tier's tier-3 predicate."""
+    if _pref_hits_kernel(text):
+        return "names a kernel path / the agentware package"
+    if _pref_loosens_gate(text):
+        return "reads as weakening a governance gate"
+    return None
+
+
+# --- Task 6: deterministic report renderer -------------------------------------
+
+def _checkup_sig(d):
+    """Render one flywheel signal dict as a stable one-liner."""
+    if not isinstance(d, dict) or d.get("insufficient_data"):
+        return "insufficient data"
+    parts = []
+    if "value" in d:
+        parts.append("%s" % d["value"])
+    if d.get("gauge"):
+        tags = ["gauge"]
+        if d.get("low_precision"):
+            tags.append("low-precision")
+        if d.get("lower_bound"):
+            tags.append("lower bound")
+        parts.append("(%s, n=%s)" % (", ".join(tags), d.get("sample_n")))
+    elif d.get("direction"):
+        parts.append("(%s, n=%s)" % (d["direction"], d.get("sample_n")))
+    elif "direction" in d and d.get("direction") is None:
+        parts.append("(no direction, n=%s)" % d.get("sample_n"))
+    return " ".join(parts) if parts else "insufficient data"
+
+
+def _checkup_render_report(agg):
+    """Deterministic, diff-friendly report body (fixed section order). Renders
+    WINDOW AGGREGATES ONLY — NO per-run delta line, NO clock/run-id/window-boundary
+    timestamp (INV-1, audit L6-2) — so an idempotent re-run within a cadence period
+    is byte-identical. A pure renderer that RETURNS a string (the caller writes)."""
+    fw = agg.get("flywheel", {})
+    ph = agg.get("plan_health", {})
+    wa = agg.get("watcher", {})
+    lines = [
+        "# checkup — periodic self-examination (latest)",
+        "",
+        "> Deterministic OFFLINE meta-audit over P1 instrumentation. Report-only",
+        "> surface: window aggregates only (no clock/run-id in the body). Suggested",
+        "> workorders are tier-2 (operator-approved) and built ONLY from the",
+        "> DETERMINISTIC candidate set; the LLM narrative NEVER emits a workorder.",
+        "",
+        "## Flywheel signals",
+        "- read-through: %s" % _checkup_sig(fw.get("read_through", {})),
+        "- corpus-coverage: %s" % _checkup_sig(fw.get("corpus_coverage", {})),
+        "- error-recovery yield: %s" % _checkup_sig(fw.get("error_recovery", {})),
+        "- recurrence (retired, never a workorder driver): %s"
+        % _checkup_sig(fw.get("recurrence", {})),
+        "- learning-freshness (<=%dd, surfaced-by-recall lower bound): %s"
+        % (CHECKUP_LEARNING_FRESH_DAYS, _checkup_sig(fw.get("learning_freshness", {}))),
+        "",
+        "## Plan health",
+    ]
+    if ph.get("insufficient_data"):
+        lines.append("- insufficient data (no plans)")
+    else:
+        lines.append("- done: %d · rotting: %d · running: %d · ready: %d · draft: %d"
+                     % (ph.get("done", 0), ph.get("rotting", 0),
+                        ph.get("running", 0), ph.get("ready", 0), ph.get("draft", 0)))
+        if ph.get("stalled"):
+            for s in ph["stalled"]:
+                lines.append("- stalled: %s" % s["rel"])
+        else:
+            lines.append("- stalled: none")
+    lines += ["", "## Drift (declared vs derived)"]
+    drift = agg.get("drift", [])
+    if not drift:
+        lines.append("- none")
+    else:
+        for d in drift:
+            feat = (" [%s]" % d["feature"]) if d.get("feature") else ""
+            lines.append("- %s%s: declared=%s derived=%s [%s]"
+                         % (d["kind"], feat, d.get("declared"), d.get("derived"),
+                            d.get("severity")))
+    lines += ["", "## Watcher-watching (dream itself)"]
+    lines.append("- dream fired on cadence: %s" % wa.get("verdict", "unknown"))
+    lines.append("- missed cycles in window: %d" % wa.get("missed_cycles", 0))
+    if wa.get("frozen_metrics"):
+        for fm in wa["frozen_metrics"]:
+            lines.append("- FROZEN: %s held at %s across %d present cycles"
+                         % (fm["metric"], fm["value"], fm["present_cycles"]))
+    elif wa.get("insufficient_data"):
+        lines.append("- frozen-metric check: insufficient data (< %d present cycles)"
+                     % MIN_FROZEN_CYCLES)
+    else:
+        lines.append("- frozen metrics: none")
+    lines += ["", "## Structure triggers"]
+    for t in agg.get("triggers", []):
+        tag = "FIRED" if t.get("fired") else "under threshold"
+        ro = " [report-only]" if not t.get("fires_workorder") else ""
+        lines.append("- %s: %s / %s — %s%s"
+                     % (t["signal"], t.get("value"), t.get("threshold"), tag, ro))
+    narrative = agg.get("narrative")
+    if narrative:
+        lines += ["", "## LLM narrative (report-only — never emits a workorder)"]
+        if narrative.get("narrative"):
+            lines.append(narrative["narrative"])
+        for o in narrative.get("observations", []):
+            lines.append("- observation: %s" % o)
+    lines += ["", "## Proposed workorders (tier-2, operator-approved)"]
+    proposed = agg.get("proposed", [])
+    if not proposed:
+        lines.append("- none")
+    else:
+        for p in sorted(proposed, key=lambda x: x.get("feature", "")):
+            lines.append("- %s: %s" % (p["feature"], p["text"]))
+    deferred = agg.get("deferred", [])
+    if deferred:
+        lines += ["", "## Deferred (emitter refused — recurs next cycle)"]
+        for d in sorted(deferred, key=lambda x: x.get("text", "")):
+            lines.append("- deferred (%s): %s" % (d.get("reason"), d["text"]))
+    lines += ["", "## Rejected (governance escape-valve — NOT emitted)"]
+    rejected = agg.get("rejected", [])
+    if not rejected:
+        lines.append("- none")
+    else:
+        for r in sorted(rejected, key=lambda x: x.get("text", "")):
+            lines.append("- rejected: %s — %s" % (r.get("reason"), r["text"]))
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+# --- Task 8: cmd_checkup + additive opt-in tick-job registration ---------------
+
+def _checkup_aggregate(kdir, now):
+    """Compose Tasks 2-5 into ONE read-only deterministic aggregate. Every channel
+    degrades to insufficient data on an empty KB (Q10)."""
+    anchor = _checkup_anchor_epoch(now)
+    window_lo = anchor - CHECKUP_WINDOW_DAYS * 86400
+    cycles = [c for c in _checkup_parse_journal(kdir)
+              if (_iso_to_epoch(c.get("ts")) or 0) >= window_lo]
+    plans = _checkup_walk_plans(kdir, now)
+    flywheel = _checkup_flywheel(kdir, window_lo, anchor)
+    plan_health = _checkup_plan_health(kdir, now, plans=plans)
+    watcher = _checkup_watch_dream(kdir, cycles, now)
+    drift = _checkup_drift(kdir, now, watcher, plan_health)
+    triggers = _checkup_structure_triggers(kdir)
+    return {"flywheel": flywheel, "plan_health": plan_health, "drift": drift,
+            "watcher": watcher, "triggers": triggers, "narrative": None,
+            "proposed": [], "rejected": [], "deferred": []}
+
+
+def _checkup_status_line(kdir):
+    """One-line SessionStart banner — prints ONLY when checkup is ON AND a FRESH
+    (content-hash unacked) report exists. Short-circuits to a byte-identical NO-OP
+    (no output, NO write) when OFF / no kdir / no report / already-acked (audit
+    L6-1). Writes logs/checkup/.ack AFTER printing. Never blocks; mirrors
+    `update --status-line`."""
+    if resolve_checkup() != "1" or not kdir:
+        return 0
+    body = _checkup_read_report(kdir)
+    if not body:
+        return 0
+    cur = _checkup_content_hash(body)
+    ackp = os.path.join(kdir, CHECKUP_ACK_REL)
+    try:
+        with open(ackp, "r", encoding="utf-8") as f:
+            prev = f.read().strip()
+    except OSError:
+        prev = ""
+    if cur == prev:
+        return 0                     # already acknowledged — byte-identical no-op
+    print("agentware checkup: a fresh self-exam report is ready — see "
+          "logs/checkup/checkup-latest.md (run `scripts/agentware checkup`).")
+    try:
+        os.makedirs(os.path.dirname(ackp), exist_ok=True)
+        with open(ackp, "w", encoding="utf-8") as f:
+            f.write(cur + "\n")
+    except OSError:
+        pass
+    return 0
+
+
+def cmd_checkup(args):
+    """The periodic self-exam: aggregate (2-5) -> report-only LLM narrative (7a) ->
+    render report (6) -> deterministic-only emit (7b) -> summary. Read-only w.r.t.
+    the index + all governance state; writes ONLY files under logs/checkup/ and
+    sanitized work/auto/ workorders."""
+    as_json = getattr(args, "format", "text") == "json"
+    if getattr(args, "status_line", False):
+        return _checkup_status_line(resolve_knowledge_dir())
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    now = time.time()
+    agg = _checkup_aggregate(kdir, now)
+    # (7a) ONE bounded REPORT-ONLY LLM narrative pass (delegates to the CLI-aware
+    # seam). Disabled -> deterministic-only. NEVER emits a workorder.
+    if resolve_checkup_llm() == "1":
+        cfg = {"model": os.environ.get("AGENTWARE_CHECKUP_MODEL") or None,
+               "effort": os.environ.get("AGENTWARE_CHECKUP_EFFORT") or None}
+        agg["narrative"] = _checkup_llm_narrative(agg, cfg)
+    # (7b) DETERMINISTIC-only emit: reject-scan each candidate, emit survivors via
+    # the EXISTING sanitized emitter, surface drops in the Rejected section.
+    for cand in _checkup_candidates(agg):
+        reason = _checkup_reject_reason(cand["text"])
+        if reason:
+            agg["rejected"].append({"reason": reason, "text": cand["text"]})
+            continue
+        feat, err = _checkup_emit_workorder(kdir, cand)
+        if feat:
+            agg["proposed"].append({"feature": feat, "text": cand["text"]})
+        else:
+            agg["deferred"].append({"reason": err, "text": cand["text"]})
+    # render + atomically write the byte-stable report, then stamp last-run
+    body = _checkup_render_report(agg)
+    _atomic_write(_checkup_report_path(kdir), body)
+    _checkup_write_last_run(kdir)
+    summary = {"ok": True, "report": CHECKUP_REPORT_REL,
+               "proposed": [p["feature"] for p in agg["proposed"]],
+               "rejected": len(agg["rejected"]),
+               "deferred": len(agg["deferred"]),
+               "stalled": len(agg["plan_health"].get("stalled", [])),
+               "frozen_metrics": [f["metric"]
+                                  for f in agg["watcher"].get("frozen_metrics", [])],
+               "triggers_fired": [t["signal"] for t in agg["triggers"]
+                                  if t.get("fired") and t.get("fires_workorder")],
+               "narrative": bool(agg.get("narrative"))}
+    if as_json:
+        json.dump(summary, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("checkup: wrote %s (proposed %d, rejected %d, deferred %d)"
+              % (CHECKUP_REPORT_REL, len(agg["proposed"]), len(agg["rejected"]),
+                 len(agg["deferred"])))
+        for f in summary["frozen_metrics"]:
+            print("checkup: FROZEN metric %s (130-for-13-nights)" % f)
+    return 0
+
+
+def _checkup_due(kdir, now):
+    """Due when >= CHECKUP_INTERVAL_SEC (7d) since checkup's OWN last run. Always-
+    due when never run — sleep-proof: keyed off checkup's last-run WALL-CLOCK, NOT
+    the tick cadence and NOT updater/dream state (audit L5-3; mirrors
+    _dream_cadence_due, never _pkg_updater_due)."""
+    last = _pkg_iso_to_epoch(_checkup_last_run_ts(kdir))
+    if last is None:
+        return True
+    return (now - last) >= CHECKUP_INTERVAL_SEC
+
+
+def _checkup_run(kdir, now):
+    """Dispatch ONE checkup via _dream_capture (mirrors _dream_cadence_run).
+    Returns a compact status dict for the tick result list."""
+    ns = argparse.Namespace(format="json", status_line=False)
+    rc, _out = _dream_capture(cmd_checkup, ns)
+    return {"status": "ok" if rc == 0 else "error", "rc": rc,
+            "detail": "checkup dispatched cmd_checkup rc=%d" % rc}
+
+
+# Register checkup as a PURELY ADDITIVE tick job (THIRD, after updater + dream-
+# cadence). Gated on resolve_checkup()==1 so it is INERT until the operator enables
+# it (config --set-checkup on). _tick_dispatch makes NO per-job assumptions and
+# isolates a raising job, so no dispatcher change is needed.
+_TICK_JOB_REGISTRY.append({
+    "key": "checkup",
+    "enabled": lambda: resolve_checkup() == "1",
+    "due": _checkup_due,
+    "run": _checkup_run,
+})
+
+
 # --- Task 12: release-signing go-live preflight (OPERATOR-GATED handoff) -------
 # AUTONOMOUS: a READ-ONLY readiness check + the docs/release-signing.md runbook.
 # OPERATOR-GATED (R-GIT-01): generating the real signing key and cutting+pushing
@@ -27874,6 +28906,12 @@ def build_parser():
                             "AGENTWARE_UPDATE overrides per-run)")
     p_cfg.add_argument("--updater-only", action="store_true", dest="updater_only",
                        help="print only the resolved updater setting (on/off)")
+    p_cfg.add_argument("--set-checkup", dest="set_checkup", metavar="on|off",
+                       help="persist the periodic self-exam (checkup) opt-in to "
+                            "~/.agentware/config.env (default OFF; env "
+                            "AGENTWARE_CHECKUP overrides per-run)")
+    p_cfg.add_argument("--checkup-only", action="store_true", dest="checkup_only",
+                       help="print only the resolved checkup setting (on/off)")
     p_cfg.add_argument("--kb-autocommit-only", action="store_true",
                        dest="kb_autocommit_only",
                        help="print only the resolved KB-autocommit setting (1/0)")
@@ -28854,6 +29892,18 @@ def build_parser():
         help="print the updater/tick lock state (free|held|stale) and exit "
              "(read-only; used by the loop reverse-guard)")
     p_tick.set_defaults(func=cmd_tick)
+
+    # checkup (periodic self-examination, feature 260713-p5-checkup) ----------
+    p_checkup = sub.add_parser(
+        "checkup", parents=[fmt_parent],
+        help="run ONE periodic self-exam: deterministic aggregation over P1 "
+             "instrumentation + one bounded REPORT-ONLY LLM narrative; writes a "
+             "session-top report + tier-2 suggested workorders (opt-in, default OFF)")
+    p_checkup.add_argument(
+        "--status-line", action="store_true", dest="status_line",
+        help="print the one-line SessionStart banner ONLY when a fresh report "
+             "exists (read-only; byte-identical no-op when OFF/no-report)")
+    p_checkup.set_defaults(func=cmd_checkup)
 
     # release (signing go-live preflight, feature 260712) --------------------
     p_release = sub.add_parser(
