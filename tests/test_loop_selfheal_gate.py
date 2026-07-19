@@ -203,7 +203,8 @@ class SelfHealGateLoopTest(unittest.TestCase):
     def test_planted_defect_is_fixed_reaudited_clean_then_proceeds(self):
         # Round 1 finds a CONFIRMED high; remediation applies a verified fix +
         # drops the marker; round 2 re-audits CLEAN -> the run PROCEEDS.
-        proc = self._run(self._env(FAKE_FIXABLE="1", AGENTWARE_REVIEW_MAX_ROUNDS="3"))
+        proc = self._run(self._env(FAKE_FIXABLE="1", AGENTWARE_REVIEW_MAX_ROUNDS="3",
+                                   AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
         out = proc.stdout
         self.assertEqual(proc.returncode, 0,
                          "a self-healed run must complete:\n%s" % out)
@@ -217,7 +218,8 @@ class SelfHealGateLoopTest(unittest.TestCase):
     def test_unfixable_defect_blocks_done_and_escalates(self):
         # The fixer never provides a regression test -> every fix is REFUSED -> the
         # confirmed high survives every bounded round -> BLOCKED, no done, no commit.
-        proc = self._run(self._env(FAKE_FIXABLE="0", AGENTWARE_REVIEW_MAX_ROUNDS="2"))
+        proc = self._run(self._env(FAKE_FIXABLE="0", AGENTWARE_REVIEW_MAX_ROUNDS="2",
+                                   AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
         out = proc.stdout
         self.assertNotEqual(proc.returncode, 0,
                             "an unfixable defect must block the run:\n%s" % out)
@@ -228,7 +230,8 @@ class SelfHealGateLoopTest(unittest.TestCase):
                          "the unfixable fixer must not signal a closed defect")
 
     def test_clean_self_extension_diff_proceeds_without_remediation(self):
-        proc = self._run(self._env(FAKE_CLEAN="1"))
+        proc = self._run(self._env(FAKE_CLEAN="1",
+                                   AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
         out = proc.stdout
         self.assertEqual(proc.returncode, 0,
                          "a clean self-extension audit must proceed:\n%s" % out)
