@@ -38,6 +38,13 @@
       "title": "How glaciers move and shape the land",
       "summary": "A glacier is a thick mass of ice that forms where snow accumulates faster than it melts and compresses into ice over many years. Under its own weight the glacier slowly flows downhill, grinding rock and carrying debris that it deposits as ridges called moraines. Glaciers carve valleys and are sensitive indicators of climate change.",
       "tags": ["glacier", "ice", "moraine", "climate", "geology"]
+    },
+    {
+      "id": "gf-skill-kayak-launch",
+      "category": "skills",
+      "title": "Skill: time a kayak harbor departure by the tide",
+      "summary": "This procedure is a step-by-step checklist for timing a kayak harbor departure around the tide. Read the local tide table for the slack window between high and low, confirm the harbor ramp is not exposed at low water, launch on a rising tide so the current carries the kayak out of the harbor, and plan the return before the ebb. A repeatable launch checklist for paddlers.",
+      "tags": ["kayak", "harbor", "departure", "launch", "paddling"]
     }
   ],
   "gold": [
@@ -64,6 +71,10 @@
     {
       "query": "how do glaciers move downhill and form moraines",
       "expected_ids": ["gf-glacier"]
+    },
+    {
+      "query": "step by step checklist to time a kayak harbor departure launch by the tide",
+      "expected_ids": ["gf-skill-kayak-launch"]
     }
   ]
 }

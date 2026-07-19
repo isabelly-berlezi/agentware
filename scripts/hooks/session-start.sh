@@ -82,6 +82,16 @@ EXECUTOR: ${USER_HANDLE} — your environment/paths come from profiles/${USER_HA
 ----- knowledge/skills/index.md (operator skills roster) -----
 $(cat "$KDIR/skills/index.md")"
   fi
+  # Per-machine VETTED execution-cache skills roster (feature 260713-p4): the
+  # installed + pending-approval skills from the machine-local lockfile. Fixed-
+  # format, sanitized (counts + validated names only, NO author/raw metadata).
+  # Silent (empty output) when the lockfile is empty/absent — byte-identical
+  # no-op for power-users. Mirrors the `update --status-line` read-only nudge.
+  _skill_line="$("$REPO_ROOT/scripts/agentware" skill sync --status-line 2>/dev/null || true)"
+  if [[ -n "$_skill_line" ]]; then
+    CTX="$CTX
+$_skill_line"
+  fi
   # Active steering preferences (feature 260712, Task 3): render a compact,
   # capped, scope-filtered digest of the operator's `prefer`-captured settings so
   # a preference stated once is in force EVERY future session. Global prefs

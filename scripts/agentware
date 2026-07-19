@@ -10564,6 +10564,9 @@ def retrieve_bm25(kdir, data, query, top_k=None):
     scored.sort(key=lambda es: es[0].get("id") or "")                       # id asc
     scored.sort(key=lambda es: es[0].get("created") or "", reverse=True)    # created desc
     scored.sort(key=lambda es: es[1], reverse=True)                         # score desc
+    # Skill pin in the SHARED core so the eval/gate path (evaluate -> retrieve ->
+    # retrieve_bm25) exercises it too (feature 260713-p4). Applied pre-trim.
+    scored = _apply_skill_pin(scored, SKILL_PIN_FLOOR, top_k)
     ids = [e.get("id") for (e, _s) in scored]
     return ids if top_k is None else ids[:top_k]
 
@@ -10772,23 +10775,32 @@ def retrieve_bm25_embed(kdir, data, query, top_k=None, as_of=None):
 
 
 # --- Skill pin (R-RET-03 stage-1 precedence) ----------------------------------
-# Default DISABLED (None). When set to a float (e.g. 0.85), a skill whose score
-# >= floor * top_overall_score AND > 0 is pinned to position 1 (the "matched
-# procedure — follow it" behavior). Learnings are NEVER evicted. The pin is
-# applied in the SHARED ranking core so both recall_ranked and retrieve_bm25
-# (the eval/gate path) exercise it. The default flip is DEFERRED to a later
-# gated change; until then ranking is byte-unchanged from pre-pin.
-SKILL_PIN_FLOOR = None  # e.g. 0.85 when enabled
+# When set to a float (e.g. 0.85), a skill whose score >= floor * top_overall_score
+# AND > 0 is pinned to position 0 (the "matched procedure — follow it" behavior).
+# Learnings are NEVER evicted (see _apply_skill_pin). ENABLED (feature 260713-p4):
+# the pin is applied in the SHARED ranking core so BOTH recall_ranked (plain-bm25
+# AND bm25+embed branches) AND the eval/gate retrieve_bm25 path exercise it — the
+# release gate can therefore measure it, and the flip is gated by a self-contained
+# gold-fixture Recall@5 no-regression check (R-PKG-06).
+SKILL_PIN_FLOOR = 0.85
 
 
-def _apply_skill_pin(scored, pin_floor):
-    """Apply threshold-gated skill pin to a scored list.
+def _apply_skill_pin(scored, pin_floor, top_k=None):
+    """Apply the threshold-gated skill pin to a scored list.
 
     `scored` is [(entry, score), ...] already sorted by BM25+tie-break.
     If `pin_floor` is None (disabled), returns scored unchanged.
     Otherwise: find the top skill; if skill_score >= pin_floor * top_overall_score
-    AND > 0, move it to position 0 (pinned). Learnings are never evicted.
-    Deterministic; read-only.
+    AND > 0, move it to position 0 (pinned). Deterministic; read-only.
+
+    LEARNINGS ARE NEVER EVICTED (R-RET-03, feature 260713-p4 R4-3): the plain
+    pop+insert can push whatever sat at rank `top_k-1` out of the surfaced window.
+    When `top_k` is given, any learning that was in the PRE-pin top_k window is
+    guaranteed to remain in the POST-pin window — if the pin would drop one, the
+    lowest-ranked non-learning, non-skill entry in the window is evicted instead.
+    Callers that trim to `top_k` (recall_ranked) pass it; the eval/gate path
+    (retrieve_bm25 with top_k=None) is guarded by the self-contained pin
+    regression check.
     """
     if pin_floor is None or not scored:
         return scored
@@ -10796,17 +10808,42 @@ def _apply_skill_pin(scored, pin_floor):
     if top_score <= 0:
         return scored
     threshold = pin_floor * top_score
-    # Find the highest-scoring skill entry
     best_skill_idx = None
     for i, (entry, score) in enumerate(scored):
         if entry.get("category") == "skills" and score >= threshold and score > 0:
             best_skill_idx = i
-            break  # Already sorted by score desc, first skill above threshold wins
+            break  # sorted by score desc, first skill above threshold wins
     if best_skill_idx is None or best_skill_idx == 0:
-        return scored  # No qualifying skill, or already at top
-    # Pin: move the skill to position 0
+        return scored  # no qualifying skill, or already at top
+    # Learnings surfaced BEFORE the pin (in the pre-pin top_k window) to protect.
+    protected = set()
+    if top_k is not None:
+        for entry, _s in scored[:top_k]:
+            if entry.get("category") == "learnings":
+                protected.add(id(entry))
+    # Pin: move the skill to position 0.
     skill_item = scored.pop(best_skill_idx)
     scored.insert(0, skill_item)
+    # A single pin move pushes exactly one entry out of the window; if that entry
+    # is a protected learning, swap it back in by evicting the lowest-ranked
+    # non-learning, non-skill window entry instead.
+    if top_k is not None and protected and top_k < len(scored):
+        in_window = set(id(e) for (e, _s) in scored[:top_k])
+        for oi in range(top_k, len(scored)):
+            e = scored[oi][0]
+            if id(e) in protected and id(e) not in in_window:
+                victim = None
+                for wi in range(top_k - 1, 0, -1):  # never evict the pinned skill (idx 0)
+                    if scored[wi][0].get("category") not in ("learnings", "skills"):
+                        victim = wi
+                        break
+                if victim is None:
+                    break  # window is all learnings + the pinned skill; cannot protect
+                learning_item = scored.pop(oi)     # oi > victim -> victim index stable
+                victim_item = scored.pop(victim)
+                scored.insert(victim, learning_item)
+                scored.insert(top_k, victim_item)  # push the victim just out of window
+                break  # only one entry can fall out from a single pin move
     return scored
 
 
@@ -10838,8 +10875,14 @@ def recall_ranked(kdir, data, query, top_k=None, category=None,
             sub = dict(data)
             sub["entries"] = [e for e in (data.get("entries") or [])
                               if e.get("category") == category]
-        scored = retrieve_bm25_embed_scored(kdir, sub, query, top_k=top_k,
+        # Fetch UNTRIMMED (top_k=None) so the pin runs pre-trim and can pull a
+        # matched skill INTO the surfaced window (feature 260713-p4 R2-7); then
+        # apply the pin and trim — mirroring the plain branch's pin-then-trim.
+        scored = retrieve_bm25_embed_scored(kdir, sub, query, top_k=None,
                                             as_of=as_of)
+        scored = _apply_skill_pin(scored, SKILL_PIN_FLOOR, top_k)
+        if top_k is not None:
+            scored = scored[:top_k]
         text_by_id = {e.get("id"): t for (e, t) in build_corpus(kdir, sub)}
         return [(e, s, text_by_id.get(e.get("id"), "")) for (e, s) in scored]
     # Cache-backed (O(query-terms)) when fresh + uncategorized, else the live scan;
@@ -10860,8 +10903,9 @@ def recall_ranked(kdir, data, query, top_k=None, category=None,
     scored.sort(key=lambda es: es[0].get("created") or "", reverse=True)    # created desc
     scored.sort(key=lambda es: es[1], reverse=True)                         # score desc
     # Skill pin (shared ranking core — both recall_ranked and the eval/gate
-    # retrieve_bm25 path exercise this). Applied AFTER sort, BEFORE top_k trim.
-    scored = _apply_skill_pin(scored, SKILL_PIN_FLOOR)
+    # retrieve_bm25 path exercise this). Applied AFTER sort, BEFORE top_k trim;
+    # top_k is passed so learnings are never evicted from the window (R4-3).
+    scored = _apply_skill_pin(scored, SKILL_PIN_FLOOR, top_k)
     if top_k is not None:
         scored = scored[:top_k]
     # Reconstruct doc_text for the SURFACED entries only (token estimation), via
@@ -11289,6 +11333,10 @@ def load_gold_fixture(path):
             "title": e.get("title") or "",
             "summary": e.get("summary") or "",
             "tags": list(e.get("tags") or []),
+            # Thread `category` through so a fixture skills-entry can exercise the
+            # SKILL_PIN_FLOOR pin on the eval/gate path (feature 260713-p4). Entries
+            # without a category stay None (byte-identical to pre-change scoring).
+            "category": e.get("category"),
         })
     if not isinstance(gold_rows, list) or not gold_rows:
         raise ValueError("gold-fixture 'gold' must be a non-empty list")
@@ -20775,6 +20823,10 @@ def cmd_kb_git_pull(args):
     # next rebuild. Reconcile now so a pull leaves the KB immediately recallable.
     if _rebuild_kb_after_pull(target, before, _git_head(target)):
         summary += " (index rebuilt from pulled frontmatter)"
+    # Trigger (feature 260713-p4): a QUARANTINE-ONLY skills reconcile so a freshly
+    # pulled skill reaches the pending-approval roster. NEVER installs, NEVER
+    # raises, NEVER blocks the pull (best-effort; mirrors _rebuild_kb_after_pull).
+    _skill_reconcile_after_pull(target)
     print("kb-git pull: %s" % summary)
     return 0
 
@@ -26619,7 +26671,15 @@ def cmd_skill_validate(args):
 
 def _copy_skill_tree(src_dir, dest_dir):
     """Copy a skill folder src_dir -> dest_dir, never clobbering an existing
-    SKILL.md (idempotent; protects operator edits). Returns (copied_bool, note)."""
+    SKILL.md (idempotent; protects operator edits). Returns (copied_bool, note).
+
+    REFUSES any source tree containing a symlink (feature 260713-p4, R2-3/R2-5):
+    the shared choke point for EVERY cache-write caller (skill add + skill sync),
+    so copytree's symlinks=False dereference can never smuggle unvetted target
+    content / host secrets into an invocable location."""
+    link = _skill_tree_link(src_dir)
+    if link is not None:
+        return False, "refused: symlink present in source tree (%s)" % link
     dest_md = os.path.join(dest_dir, "SKILL.md")
     if os.path.exists(dest_md):
         return False, "already installed at %s (left untouched)" % dest_dir
@@ -26664,22 +26724,31 @@ def cmd_skill_add(args):
         sys.stderr.write("agentware: skill source not found: %s\n" % skill_dir)
         return 1
 
-    # skill-vetter static review + provenance/pinned-ref report (R-SEC-02).
-    findings = vet_skill_dir(skill_dir)
+    # skill-vetter static review via the BLOCK-dominant, symlink-refusing verdict
+    # (feature 260713-p4, R2-3/R2-5) so EVERY cache-write path shares one boundary.
+    # Validate the TARGET install `name` (not the source basename) so a clean skill
+    # installed from a non-conforming SOURCE dir under a valid name is not falsely
+    # BLOCKed; an invalid TARGET name is still refused.
+    verdict, findings = _skill_verdict(skill_dir, name=name)
     provenance = {
         "name": name,
         "trust": trust,
         "source": skill_dir,
         "pinned_ref": _pinned_ref() if not external else "n/a (external)",
         "vet_findings": findings,
+        "verdict": verdict,
     }
-    if findings:
-        sys.stderr.write("agentware: skill-vetter found issues in '%s':\n" % name)
+    if verdict == "BLOCK":
+        sys.stderr.write("agentware: skill-vetter BLOCKED '%s' (danger / symlink / "
+                         "invalid name):\n" % name)
         for f in findings:
             sys.stderr.write("  - %s\n" % f)
-        sys.stderr.write("Aborting install (fail-closed). Resolve the findings "
-                         "or vet manually with the skill-vetter skill.\n")
+        sys.stderr.write("Aborting install (fail-closed, R-SEC-02).\n")
         return 1
+    if verdict == "REVIEW":
+        sys.stderr.write("agentware: WARNING — '%s' contains unscannable/binary "
+                         "content (%s); installing on explicit request.\n"
+                         % (name, "; ".join(findings)))
     if external and not getattr(args, "allow_external", False):
         sys.stderr.write("agentware: '%s' is an EXTERNAL source. It passed the "
                          "static vet, but external skills require explicit "
@@ -26796,6 +26865,720 @@ def cmd_skill_remove(args):
               % ("UNREGISTERED" if had_entry else "NOT-INDEXED", eid,
                  (" + removed %s" % dest_dir) if removed_files else ""))
     return 0
+
+
+# ============================================================================
+# Skills two-tier: KB skills/ (canonical, synced) + a per-machine VETTED
+# execution cache (~/.claude/skills, never synced), governed by a machine-local
+# content-hash lockfile (~/.agentware/skills.lock.json, OUTSIDE any KB). Feature
+# 260713-p4-skills-two-tier. SECURITY MODEL: the KB sync channel is an unsigned
+# ff-only pull, so identity is NOT a security signal and the reconcile NEVER
+# installs — an explicit `skill sync --approve` (or local `skill add
+# --harness-path`) is the ONLY install gate. Ownership is by PROVENANCE (a
+# lockfile `installed` entry), never by hash.
+# ============================================================================
+
+SKILL_LOCK_SCHEMA = 1
+
+
+class _SkillHashError(Exception):
+    """Raised by _skill_tree_sha256 when a tree cannot be hashed safely
+    (a symlink or unreadable content is present). Callers that vet treat this as
+    BLOCK; the cache-integrity check treats it as divergence (drop + requarantine)."""
+
+
+def _skill_lock_path():
+    """Absolute path to the machine-local skills lockfile — the trust boundary.
+
+    Default `~/.agentware/skills.lock.json` (beside HOME_CONFIG), NEVER inside a
+    KB (a poisoned pull must not be able to edit its own allowlist). Honors the
+    `AGENTWARE_SKILLS_LOCK_PATH` env override (operator/harness-set, NOT reachable
+    over the sync channel) so hermetic tests can redirect it — HOME_CONFIG is
+    bound at import time and cannot be redirected in-process.
+    """
+    override = os.environ.get("AGENTWARE_SKILLS_LOCK_PATH")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.dirname(HOME_CONFIG), "skills.lock.json")
+
+
+def _empty_skill_lock():
+    return {"schema": SKILL_LOCK_SCHEMA, "skills": {}}
+
+
+def load_skill_lock(path=None):
+    """Load the skills lockfile -> dict. Tolerant: a missing/corrupt/legacy file
+    yields a fresh empty lock (never raises). Read-only."""
+    p = path or _skill_lock_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return _empty_skill_lock()
+    if not isinstance(data, dict) or not isinstance(data.get("skills"), dict):
+        return _empty_skill_lock()
+    data.setdefault("schema", SKILL_LOCK_SCHEMA)
+    return data
+
+
+def save_skill_lock(data, path=None):
+    """Atomically persist the skills lockfile (temp sibling + os.replace). The
+    lockfile lives OUTSIDE any KB (asserted by _skill_lock_path)."""
+    p = path or _skill_lock_path()
+    if not isinstance(data, dict):
+        data = _empty_skill_lock()
+    data.setdefault("schema", SKILL_LOCK_SCHEMA)
+    data.setdefault("skills", {})
+    _atomic_write(p, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def _skill_name_ok(name):
+    """True iff `name` is a safe skill directory basename: strict
+    `[a-z0-9._-]` allowlist, lowercase, bounded length, no leading dot / slash /
+    traversal / newline. Enforced BEFORE any name reaches the lockfile / cache /
+    roster so an attacker-crafted KB directory name can never inject."""
+    if not isinstance(name, str) or not name or name in (".", ".."):
+        return False
+    return bool(_SKILL_NAME_RE.match(name))
+
+
+def _skill_tree_link(skill_dir):
+    """Return the first symlink relpath (a directory OR file) under `skill_dir`,
+    else None. Walks with followlinks=False AND checks os.path.islink on every
+    entry (dirs included), so a symlinked SUBDIR is detected — closing the
+    os.walk(followlinks=False) vs copytree(symlinks=False) inconsistency."""
+    if not os.path.isdir(skill_dir):
+        return None
+    if os.path.islink(skill_dir):
+        return "."
+    for root, dirs, files in os.walk(skill_dir, followlinks=False):
+        for nm in sorted(dirs) + sorted(files):
+            p = os.path.join(root, nm)
+            if os.path.islink(p):
+                return os.path.relpath(p, skill_dir)
+    return None
+
+
+def _skill_tree_sha256(skill_dir):
+    """Deterministic, mode-aware, symlink-FREE content hash of a skill tree.
+
+    One sha256 over the SORTED list of `(relpath, oct(mode & 0o777),
+    sha256(file-bytes))` for every regular file under `skill_dir`. Order-
+    independent (sorted); includes the executable mode bit (a 0644->0755 flip
+    changes the hash); covers every file (a bundled-script swap changes the
+    hash). RAISES _SkillHashError if any symlink is present (consistent with the
+    copy/vet symlink refusal) or a file cannot be read. Read-only."""
+    link = _skill_tree_link(skill_dir)
+    if link is not None:
+        raise _SkillHashError("symlink present in skill tree: %s" % link)
+    if not os.path.isdir(skill_dir):
+        raise _SkillHashError("skill tree not found: %s" % skill_dir)
+    parts = []
+    for root, _dirs, files in os.walk(skill_dir, followlinks=False):
+        for fn in files:
+            path = os.path.join(root, fn)
+            if os.path.islink(path):
+                raise _SkillHashError("symlink present in skill tree: %s"
+                                      % os.path.relpath(path, skill_dir))
+            rel = os.path.relpath(path, skill_dir)
+            try:
+                with open(path, "rb") as f:
+                    fb = f.read()
+            except OSError as exc:
+                raise _SkillHashError("unreadable file %s: %s" % (rel, exc))
+            mode = oct(os.stat(path).st_mode & 0o777)
+            parts.append((rel, mode, hashlib.sha256(fb).hexdigest()))
+    parts.sort()
+    h = hashlib.sha256()
+    for rel, mode, digest in parts:
+        h.update(("%s\0%s\0%s\n" % (rel, mode, digest)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _skill_is_binary(path):
+    """True iff `path` is non-text (undecidable to the vetter): contains a NUL
+    byte OR fails a strict UTF-8 decode. Explicit — do NOT rely on
+    vet_skill_dir's errors="replace" (which never reports a real file as
+    unreadable, so a binary/obfuscated blob would otherwise PASS)."""
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read()
+    except OSError:
+        return True  # unreadable -> undecidable -> not text
+    if b"\x00" in chunk:
+        return True
+    try:
+        chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def _skill_verdict(skill_dir, name=None):
+    """Map a skill tree to (verdict, findings) with BLOCK > REVIEW > PASS.
+
+    `name` is the INTENDED install name to validate (defaults to the source dir
+    basename for the sync/approve path, where basename IS the canonical name). A
+    caller installing under a DIFFERENT target name (cmd_skill_add --source) MUST
+    pass the target `name` so a non-conforming SOURCE basename does not falsely
+    BLOCK a legitimately-named install (feature 260713-p4).
+
+    BLOCK (never installable, even via --approve) if ANY of: a symlink is present
+    (reuse _skill_tree_link), the install `name` fails _skill_name_ok, or
+    vet_skill_dir reports any danger finding. BLOCK DOMINATES. REVIEW (quarantine;
+    --approve installs with a loud unscannable-content warning) iff the ONLY issue
+    is a binary/undecodable file (no danger, no symlink, valid name). PASS iff
+    every file is text-decodable, no danger marker, no symlink, valid name.
+    vet_skill_dir PASS is a filter signal, NOT a safety certificate — the operator
+    approval is the real control. Read-only; reuses vet_skill_dir (no re-scan)."""
+    findings = []
+    if not os.path.isdir(skill_dir):
+        return "BLOCK", ["skill source directory not found: %s" % skill_dir]
+    if name is None:
+        name = os.path.basename(os.path.normpath(skill_dir))
+    if not _skill_name_ok(name):
+        findings.append("invalid skill name: %r" % name)
+    link = _skill_tree_link(skill_dir)
+    if link is not None:
+        findings.append("symlink present (refused): %s" % link)
+    danger = vet_skill_dir(skill_dir)
+    if danger:
+        findings.extend(danger)
+    if findings:
+        # Any danger / symlink / invalid-name -> BLOCK dominates.
+        return "BLOCK", findings
+    # No danger: is there an undecidable (binary) file? -> REVIEW, else PASS.
+    binaries = []
+    for root, _dirs, files in os.walk(skill_dir, followlinks=False):
+        for fn in files:
+            p = os.path.join(root, fn)
+            if os.path.islink(p):
+                continue  # already excluded above
+            if _skill_is_binary(p):
+                binaries.append(os.path.relpath(p, skill_dir))
+    if binaries:
+        return "REVIEW", ["binary/undecodable file(s) (unscannable): %s"
+                          % ", ".join(sorted(binaries))]
+    return "PASS", []
+
+
+_SKILL_DISPLAY_RE = re.compile(r"[^A-Za-z0-9 <>@._-]")
+
+
+def _skill_sanitize_display(s):
+    """Strip a display string to a safe charset ([A-Za-z0-9 <>@._-]) and truncate.
+    Applied to the git author BEFORE it enters the lockfile so an attacker-
+    controlled ident (settable via `git commit --author=` over the unsigned pull)
+    carries no shell/markup metacharacters and is length-bounded (R-SEC-02). NOTE:
+    the safe charset still permits words + spaces, so a sanitized value can still
+    read as prose — therefore authored_by is NOT rendered to ANY agent-facing sink
+    (neither --status-line nor --status render it; it is internal lockfile metadata
+    only). This function is defense-in-depth on the stored value."""
+    if not s:
+        return ""
+    cleaned = _SKILL_DISPLAY_RE.sub("", str(s)).strip()
+    return cleaned[:80]
+
+
+def _skill_author(kdir, name):
+    """Best-effort, DISPLAY-ONLY, SANITIZED first-commit git author of
+    skills/<name>/ (git %an <%ae>). Returns "" when unavailable. NEVER gates
+    install and NEVER changes disposition — identity is not a security signal;
+    the value is attacker-controllable over the unsigned pull, so it is sanitized
+    here and shown only under an "(UNVERIFIED)" label. Read-only."""
+    rel = os.path.join("skills", name)
+    cp = _git(kdir, "log", "--reverse", "--format=%an <%ae>", "-1", "--", rel)
+    if cp.returncode != 0:
+        return ""
+    line = (cp.stdout or "").splitlines()
+    return _skill_sanitize_display(line[0] if line else "")
+
+
+def _skill_cache_dir(args=None, lock=None):
+    """Resolve the per-machine execution-cache dir. Precedence: --harness-path >
+    AGENTWARE_SKILLS_HARNESS_DIR > the lockfile-recorded harness_dir (so the
+    argless post-pull reconcile reconciles the SAME cache a flag-based --approve
+    installed into — feature 260713-p4 S3) > ~/.claude/skills. Never synced."""
+    if args is not None and getattr(args, "harness_path", None):
+        return os.path.abspath(os.path.expanduser(args.harness_path))
+    env = os.environ.get("AGENTWARE_SKILLS_HARNESS_DIR")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    if lock and lock.get("harness_dir"):
+        return os.path.abspath(os.path.expanduser(lock["harness_dir"]))
+    return os.path.join(os.path.expanduser("~"), ".claude", "skills")
+
+
+def _skill_kb_names(kdir):
+    """{name: skill_dir} for every KB skills/<name>/ that holds a SKILL.md."""
+    base = os.path.join(kdir, "skills")
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    for nm in os.listdir(base):
+        d = os.path.join(base, nm)
+        if os.path.isdir(d) and os.path.isfile(os.path.join(d, "SKILL.md")):
+            out[nm] = d
+    return out
+
+
+def _package_skill_names():
+    """Names of shipped PACKAGE skills (repo .claude/skills/ dirs + catalog) —
+    reserved so a KB skill cannot shadow/impersonate a trusted package skill."""
+    names = set()
+    pkg = os.path.join(REPO_ROOT, ".claude", "skills")
+    if os.path.isdir(pkg):
+        for nm in os.listdir(pkg):
+            if os.path.isdir(os.path.join(pkg, nm)):
+                names.add(nm)
+    data, _err = load_skill_catalog()
+    if data:
+        for s in data.get("skills", []):
+            if isinstance(s, dict) and s.get("name"):
+                names.add(s["name"])
+    return names
+
+
+@contextlib.contextmanager
+def _skill_sync_lock():
+    """Advisory flock around a sync/approve run so concurrent runs never lose
+    lockfile updates (mirrors _index_lock). Best-effort: never blocks work if the
+    lock cannot be taken. The sidecar lives beside the lockfile (machine-local)."""
+    lockpath = _skill_lock_path() + ".lock"
+    fcntl_mod = None
+    try:
+        import fcntl as fcntl_mod  # noqa: F401
+    except Exception:  # noqa: BLE001 - non-posix: degrade to no lock
+        fcntl_mod = None
+    f = None
+    try:
+        try:
+            os.makedirs(os.path.dirname(lockpath) or ".", exist_ok=True)
+            f = open(lockpath, "w")
+            if fcntl_mod is not None:
+                fcntl_mod.flock(f.fileno(), fcntl_mod.LOCK_EX)
+        except OSError:
+            f = None  # best-effort; proceed unlocked rather than block work
+        yield
+    finally:
+        if f is not None:
+            try:
+                if fcntl_mod is not None:
+                    fcntl_mod.flock(f.fileno(), fcntl_mod.LOCK_UN)
+            except Exception:  # noqa: BLE001
+                pass
+            f.close()
+
+
+def _skill_rmtree(path):
+    """Remove a cache entry if present. Returns True iff it existed and was removed.
+
+    A SYMLINK is unlinked EXPLICITLY (feature 260713-p4): `shutil.rmtree` refuses a
+    symbolic link and, with ignore_errors=True, would silently NO-OP — leaving a
+    symlink-tampered owned cache dir invocable while the remediation paths (cache-
+    integrity divergence, --reject/--uninstall/--reset/GC) falsely report removal.
+    Use `lexists` so a broken symlink is also caught."""
+    if os.path.islink(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            return False
+        return True
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+        return True
+    if os.path.lexists(path):  # a non-dir, non-symlink file at the cache name
+        try:
+            os.unlink(path)
+        except OSError:
+            return False
+        return True
+    return False
+
+
+def _skill_owned(lock, name):
+    """OWNERSHIP BY PROVENANCE (D12): we own <name> iff a lockfile entry records
+    status:'installed' — NEVER by whether the on-disk hash still matches (a
+    divergent/tampered copy is still ours to remediate, R3-1/R3-2)."""
+    e = lock.get("skills", {}).get(name)
+    return bool(e) and e.get("status") == "installed"
+
+
+def _skill_entry(kdir, name, tree_hash, status, verdict, findings):
+    """Build a lockfile entry. `authored_by` is sanitized+display-only (D2);
+    `reason` is stored for diagnostics but NEVER rendered to an agent-facing
+    sink (roster/status render only enum status/verdict + sanitized name/author)."""
+    return {
+        "tree_sha256": tree_hash,
+        "status": status,
+        "verdict": verdict,
+        "authored_by": _skill_author(kdir, name),
+        "vetted_at": utc_now_iso(),
+        "source_rel": os.path.join("skills", name),
+        "reason": ("; ".join(findings)[:200] if findings else None),
+    }
+
+
+def _skill_reconcile(kdir, lock, cache_dir):
+    """The TOTAL reconcile state machine. NEVER installs (D1): it only vets,
+    hashes, records lockfile status, enforces the quarantined/blocked =>
+    cache-absent invariant for OWNED copies, and GC-revokes skills gone from the
+    KB. Ownership is by provenance (D12). Mutates `lock` in place; returns a
+    counts summary. Deterministic, no network, no KB write."""
+    summary = {"installed": 0, "quarantined": 0, "blocked": 0, "unchanged": 0,
+               "revoked": 0, "rejected_name": 0}
+    skills = lock.setdefault("skills", {})
+    kb = _skill_kb_names(kdir)
+    for name in sorted(kb):
+        if not _skill_name_ok(name):
+            summary["rejected_name"] += 1  # NEVER record the raw (crafted) name
+            continue
+        src = kb[name]
+        verdict, findings = _skill_verdict(src)
+        try:
+            tree_hash = None if verdict == "BLOCK" else _skill_tree_sha256(src)
+        except _SkillHashError:
+            verdict, tree_hash, findings = "BLOCK", None, (findings or ["unhashable tree"])
+        entry = skills.get(name)
+        # Per-entry cache dir (S3 multi-cache): an installed entry is checked against
+        # the dir it was installed into, not the reconcile's default cache_dir.
+        entry_cache_dir = (entry.get("harness_dir") if entry else None) or cache_dir
+        cache_path = os.path.join(entry_cache_dir, name)
+        if entry is None:  # never seen -> NEVER install
+            if verdict == "BLOCK":
+                skills[name] = _skill_entry(kdir, name, None, "blocked", verdict, findings)
+                summary["blocked"] += 1
+            else:
+                skills[name] = _skill_entry(kdir, name, tree_hash, "quarantined", verdict, findings)
+                summary["quarantined"] += 1
+            continue
+        status = entry.get("status")
+        recorded = entry.get("tree_sha256")
+        if status == "installed":
+            if verdict == "BLOCK":  # KB source turned dangerous
+                _skill_rmtree(cache_path)  # owned by provenance -> remove
+                skills[name] = _skill_entry(kdir, name, None, "blocked", verdict, findings)
+                summary["blocked"] += 1
+            elif tree_hash != recorded:  # KB source changed -> ALWAYS requarantine
+                _skill_rmtree(cache_path)
+                skills[name] = _skill_entry(kdir, name, tree_hash, "quarantined", verdict, findings)
+                summary["quarantined"] += 1
+            else:  # KB matches recorded -> cache-integrity check on-disk copy
+                try:
+                    on_disk = _skill_tree_sha256(cache_path)
+                except _SkillHashError:
+                    on_disk = None  # symlink/unhashable injected out-of-band -> divergent
+                if on_disk == recorded and os.path.isdir(cache_path):
+                    summary["unchanged"] += 1
+                else:  # missing / divergent / unhashable -> drop owned copy + requarantine
+                    _skill_rmtree(cache_path)
+                    skills[name] = _skill_entry(kdir, name, tree_hash, "quarantined", verdict, findings)
+                    summary["quarantined"] += 1
+        elif status == "quarantined":
+            if verdict == "BLOCK":
+                skills[name] = _skill_entry(kdir, name, None, "blocked", verdict, findings)
+                summary["blocked"] += 1
+            elif tree_hash != recorded:
+                skills[name] = _skill_entry(kdir, name, tree_hash, "quarantined", verdict, findings)
+                summary["quarantined"] += 1
+            else:
+                summary["unchanged"] += 1
+        elif status == "blocked":
+            if verdict == "BLOCK":
+                summary["unchanged"] += 1  # stay blocked, not re-prompted
+            elif tree_hash != recorded:
+                skills[name] = _skill_entry(kdir, name, tree_hash, "quarantined", verdict, findings)
+                summary["quarantined"] += 1
+            else:
+                summary["unchanged"] += 1
+        else:  # unknown/legacy status -> re-adjudicate as newly seen (totality)
+            if verdict == "BLOCK":
+                skills[name] = _skill_entry(kdir, name, None, "blocked", verdict, findings)
+                summary["blocked"] += 1
+            else:
+                skills[name] = _skill_entry(kdir, name, tree_hash, "quarantined", verdict, findings)
+                summary["quarantined"] += 1
+    # Reverse-GC pass, PROVENANCE-scoped: a lockfile entry whose KB source is gone
+    # is revoked; its OWNED (installed) cache dir is removed unconditionally. A
+    # cache dir with NO lockfile entry is NEVER scanned/touched here (R2-1).
+    for name in list(skills.keys()):
+        if name not in kb:
+            if skills[name].get("status") == "installed":
+                gc_dir = skills[name].get("harness_dir") or cache_dir  # per-entry (S3)
+                _skill_rmtree(os.path.join(gc_dir, name))
+            del skills[name]
+            summary["revoked"] += 1
+    return summary
+
+
+def _skill_reconcile_after_pull(kdir):
+    """Quarantine-only reconcile invoked at the tail of a kb-git pull so a freshly
+    pulled skill reaches the pending-approval roster. NEVER installs, NEVER
+    raises, NEVER blocks the pull (best-effort, mirrors _rebuild_kb_after_pull)."""
+    try:
+        with _skill_sync_lock():
+            lock = load_skill_lock()
+            _skill_reconcile(kdir, lock, _skill_cache_dir(None, lock))
+            save_skill_lock(lock)
+    except Exception:  # noqa: BLE001 - reconciliation must never break a pull
+        return False
+    return True
+
+
+def _skill_install_snapshot(kdir, name, cache_dir, lock, force_conflict):
+    """SNAPSHOT-BIND install (D7, R2-2): copy KB skills/<name> into ONE immutable
+    temp snapshot (symlinks PRESERVED for vetting), vet + hash THAT snapshot, and
+    os.replace THAT SAME snapshot into the cache — so vet, hash, and the installed
+    bytes are provably identical even under a concurrent kb-git pull. Returns
+    (ok, verdict, note). Ownership-by-provenance conflict handling (D12, R2-8)."""
+    src = os.path.join(kdir, "skills", name)
+    # ROOT-symlink guard (feature 260713-p4): `shutil.copytree(symlinks=True)`
+    # preserves INNER symlinks but DEREFERENCES a symlinked ROOT `src`, which would
+    # materialize the target's content into a symlink-free snapshot that then vets
+    # PASS — the exact bypass reconcile blocks. Refuse a symlinked source root (and
+    # any inner symlink) BEFORE copytree so --approve shares the boundary.
+    link = _skill_tree_link(src)
+    if link is not None:
+        return False, "BLOCK", "BLOCK (refused): symlink present in source (%s)" % link
+    if not os.path.isfile(os.path.join(src, "SKILL.md")):
+        return False, None, "no such KB skill '%s'" % name
+    os.makedirs(cache_dir, exist_ok=True)
+    snap_parent = tempfile.mkdtemp(prefix=".skill-snap-", dir=cache_dir)
+    snap = os.path.join(snap_parent, name)
+    try:
+        # symlinks=True PRESERVES inner symlinks so _skill_verdict can BLOCK them (a
+        # dereferencing copy would hide a symlink by materializing its target). The
+        # root was already refused above.
+        shutil.copytree(src, snap, symlinks=True)
+        # Post-copy re-check (S1 TOCTOU): the pre-copy guard reads the LIVE tree, so
+        # a real-dir->symlink swap landing DURING copytree would be dereferenced into
+        # a symlink-free snapshot. A single ff-pull leaves `src` a symlink afterward,
+        # so re-checking the root here catches any swap that affected the copy — the
+        # snapshot then provably binds a symlink-free source (no unlocked-pull race).
+        link_after = _skill_tree_link(src)
+        if link_after is not None:
+            return False, "BLOCK", ("BLOCK (refused): source changed to a symlink "
+                                    "during copy (%s)" % link_after)
+        verdict, findings = _skill_verdict(snap)
+        if verdict == "BLOCK":
+            return False, verdict, "BLOCK (refused): %s" % "; ".join(findings)
+        tree_hash = _skill_tree_sha256(snap)  # snapshot is symlink-free here
+        dest = os.path.join(cache_dir, name)
+        if os.path.lexists(dest):  # lexists so a (possibly broken) symlink dest is seen
+            if _skill_owned(lock, name):
+                _skill_rmtree(dest)  # ours by provenance -> remove + reinstall
+            elif force_conflict:
+                _skill_rmtree(dest)  # explicit foreign-dest override (R3-3)
+            else:
+                return False, verdict, ("CONFLICT: a skill dir already exists at %s "
+                                        "that agentware did not install; remove it or "
+                                        "re-run with --force-conflict" % dest)
+        os.replace(snap, dest)  # atomic move of the SAME vetted snapshot bytes
+        lock.setdefault("skills", {})[name] = {
+            "tree_sha256": tree_hash,
+            "status": "installed",
+            "verdict": verdict,
+            "authored_by": _skill_author(kdir, name),
+            "vetted_at": utc_now_iso(),
+            "source_rel": os.path.join("skills", name),
+            "reason": ("REVIEW: unscannable/binary content" if verdict == "REVIEW" else None),
+            # Per-entry install dir so reconcile/GC check the RIGHT cache even when
+            # different skills were installed to different --harness-path targets (S3
+            # multi-cache). Falls back to the pass/top-level dir when absent (legacy).
+            "harness_dir": cache_dir,
+        }
+        # Also record the last-used dir at top level so the argless post-pull reconcile
+        # defaults to it (S3 single-cache). Env/flag still override; per-entry wins for
+        # the integrity/GC check.
+        lock["harness_dir"] = cache_dir
+        note = "installed" + (" (REVIEW: unscannable content approved)" if verdict == "REVIEW" else "")
+        return True, verdict, note
+    finally:
+        _skill_rmtree(snap_parent)  # snap moved out on success; cleans temp either way
+
+
+def _skill_status_line(lock):
+    """Read-only, FIXED-FORMAT, sanitized session-start roster (installed +
+    pending-approval). Prints NOTHING when empty (byte-identical no-op). Emits
+    only counts + _skill_name_ok-validated names + the approve hint — NO author,
+    NO reason, NO raw attacker metadata (R2-9)."""
+    skills = (lock or {}).get("skills", {})
+    installed = sorted(n for n, e in skills.items()
+                       if e.get("status") == "installed" and _skill_name_ok(n))
+    pending = sorted(n for n, e in skills.items()
+                     if e.get("status") == "quarantined" and _skill_name_ok(n))
+    if not installed and not pending:
+        return 0  # power-user / empty -> print nothing
+    lines = ["AGENTWARE_SKILLS: %d installed, %d pending-approval"
+             % (len(installed), len(pending))]
+    if installed:
+        lines.append("  installed: " + ", ".join(installed))
+    if pending:
+        lines.append("  pending-approval: " + ", ".join(pending))
+        lines.append("  approve with: scripts/agentware skill sync --approve <name>")
+    print("\n".join(lines))
+    return 0
+
+
+def _skill_status(lock, fmt):
+    """Full roster (installed / quarantined / blocked). Renders ONLY the enum
+    status/verdict + the _skill_name_ok-validated name — never the attacker-
+    controllable authored_by, reason, or findings. (authored_by is git %an<%ae>
+    from an unsigned pull; even sanitized to a charset it can still form prose, so
+    it is NOT rendered at ANY sink — matching --status-line. It stays in the
+    lockfile as internal metadata only.)"""
+    skills = (lock or {}).get("skills", {})
+    buckets = {"installed": [], "quarantined": [], "blocked": []}
+    for n in sorted(skills):
+        if not _skill_name_ok(n):
+            continue
+        e = skills[n]
+        st = e.get("status")
+        row = {"name": n, "verdict": e.get("verdict")}
+        buckets.setdefault(st, []).append(row)
+    if fmt == "json":
+        json.dump({"ok": True, "installed": buckets.get("installed", []),
+                   "quarantined": buckets.get("quarantined", []),
+                   "blocked": buckets.get("blocked", [])},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    total = sum(len(v) for v in buckets.values())
+    if total == 0:
+        print("No skills recorded in the execution-cache lockfile.")
+        return 0
+    for bucket in ("installed", "quarantined", "blocked"):
+        rows = buckets.get(bucket, [])
+        print("%s (%d):" % (bucket, len(rows)))
+        for r in rows:
+            print("  - %s [%s]" % (r["name"], r["verdict"] or "?"))
+        if bucket == "quarantined" and rows:
+            print("  approve with: scripts/agentware skill sync --approve <name>")
+    return 0
+
+
+def cmd_skill_sync(args):
+    """Reconcile the canonical KB skills/ against the per-machine vetted execution
+    cache. The BARE reconcile NEVER installs (D1); explicit --approve is the ONLY
+    install path. Read-only status modes are lock-free + fast (used by the hook)."""
+    fmt = getattr(args, "format", "text")
+    if getattr(args, "status_line", False):
+        return _skill_status_line(load_skill_lock())
+    if getattr(args, "status", False):
+        return _skill_status(load_skill_lock(), fmt)
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    with _skill_sync_lock():
+        lock = load_skill_lock()
+        # Resolve the cache dir with the lock so a flag-less run reconciles the
+        # SAME cache a prior flag-based --approve recorded (S3).
+        cache_dir = _skill_cache_dir(args, lock)
+
+        if getattr(args, "reset", False):
+            removed = []
+            for name, e in list(lock.get("skills", {}).items()):
+                edir = e.get("harness_dir") or cache_dir  # per-entry (S3)
+                if e.get("status") == "installed" and _skill_rmtree(os.path.join(edir, name)):
+                    removed.append(name)
+            save_skill_lock(_empty_skill_lock())
+            if fmt == "json":
+                json.dump({"ok": True, "reset": True, "removed": sorted(removed)},
+                          sys.stdout, ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                print("skill sync: reset — cleared lockfile + removed %d owned cache dir(s)%s"
+                      % (len(removed), (": " + ", ".join(sorted(removed))) if removed else ""))
+            return 0
+
+        approve = getattr(args, "approve", None)
+        reject = getattr(args, "reject", None)
+        uninstall = getattr(args, "uninstall", None)
+
+        if approve:
+            names = [n.strip() for n in approve.split(",") if n.strip()]
+            pkg = _package_skill_names()
+            results = []
+            rc = 0
+            for name in names:
+                if not _skill_name_ok(name):
+                    results.append((name, "refused", "invalid name")); rc = 1; continue
+                if name in pkg and not getattr(args, "force_shadow", False):
+                    results.append((name, "refused",
+                                    "shadows a shipped package skill (use --force-shadow)"))
+                    rc = 1; continue
+                ok, _verdict, note = _skill_install_snapshot(
+                    kdir, name, cache_dir, lock, getattr(args, "force_conflict", False))
+                results.append((name, "installed" if ok else "refused", note))
+                if not ok:
+                    rc = 1
+            save_skill_lock(lock)
+            if fmt == "json":
+                json.dump({"ok": rc == 0, "results": [
+                    {"name": n, "outcome": o, "note": note} for (n, o, note) in results]},
+                    sys.stdout, ensure_ascii=False, indent=2)
+                sys.stdout.write("\n")
+            else:
+                for n, o, note in results:
+                    print("%s: %s — %s" % (n, o.upper(), note))
+            return rc
+
+        if reject:
+            name = reject.strip()
+            if not _skill_name_ok(name):
+                sys.stderr.write("agentware: invalid skill name %r\n" % name)
+                return 1
+            entry0 = lock.get("skills", {}).get(name, {})
+            cache_path = os.path.join(entry0.get("harness_dir") or cache_dir, name)
+            removed = False
+            conflict = False
+            if _skill_owned(lock, name):
+                removed = _skill_rmtree(cache_path)  # provenance -> remove owned copy
+            elif os.path.lexists(cache_path):
+                conflict = True  # foreign dir/symlink -> never delete, surface (lexists)
+            entry = lock.setdefault("skills", {}).get(name, {})
+            entry.update({"status": "blocked", "reason": "operator-rejected",
+                          "source_rel": os.path.join("skills", name),
+                          "vetted_at": utc_now_iso()})
+            entry.setdefault("verdict", "BLOCK")
+            lock["skills"][name] = entry
+            save_skill_lock(lock)
+            msg = "blocked '%s'%s" % (name, " + removed owned cache copy" if removed else "")
+            if conflict:
+                msg += " (WARNING: a foreign dir at %s was NOT removed)" % cache_path
+            print("skill sync: " + msg)
+            return 0
+
+        if uninstall:
+            name = uninstall.strip()
+            if not _skill_name_ok(name):
+                sys.stderr.write("agentware: invalid skill name %r\n" % name)
+                return 1
+            udir = lock.get("skills", {}).get(name, {}).get("harness_dir") or cache_dir
+            removed = _skill_rmtree(os.path.join(udir, name)) if _skill_owned(lock, name) else False
+            existed = name in lock.get("skills", {})
+            lock.get("skills", {}).pop(name, None)
+            save_skill_lock(lock)
+            print("skill sync: uninstalled '%s'%s%s" % (
+                name, " (removed cache copy)" if removed else "",
+                "" if existed else " (no lockfile entry)"))
+            return 0
+
+        # Bare reconcile (also the pull-trigger path): NEVER installs.
+        summary = _skill_reconcile(kdir, lock, cache_dir)
+        save_skill_lock(lock)
+        if fmt == "json":
+            json.dump({"ok": True, "summary": summary}, sys.stdout,
+                      ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("skill sync: %s" % ", ".join("%s=%d" % (k, summary[k])
+                  for k in ("installed", "quarantined", "blocked", "unchanged",
+                            "revoked", "rejected_name")))
+        return 0
 
 
 def _catalog_skill_names_at_ref(ref):
@@ -27342,6 +28125,34 @@ def build_parser():
     p_sk_rm.add_argument("--keep-files", action="store_true", dest="keep_files",
                          help="unregister from the index but leave the files on disk")
     p_sk_rm.set_defaults(func=cmd_skill_remove)
+
+    # skill sync (feature 260713-p4-skills-two-tier) — reconcile the canonical KB
+    # skills/ against the per-machine VETTED execution cache. The bare reconcile
+    # NEVER installs; explicit --approve is the ONLY install path.
+    p_sk_sync = skill_sub.add_parser(
+        "sync", parents=[fmt_parent],
+        help="reconcile KB skills/ -> per-machine vetted execution cache "
+             "(quarantine-on-change; --approve to install)")
+    p_sk_sync.add_argument("--approve", default=None, metavar="NAME[,NAME...]",
+                           help="re-vet + install the named quarantined skill(s) "
+                                "into the execution cache (the ONLY install path)")
+    p_sk_sync.add_argument("--reject", default=None, metavar="NAME",
+                           help="block a skill (removes an owned cache copy)")
+    p_sk_sync.add_argument("--uninstall", default=None, metavar="NAME",
+                           help="remove an owned cache copy + drop its lockfile entry")
+    p_sk_sync.add_argument("--reset", action="store_true",
+                           help="remove ALL owned cache copies + clear the lockfile")
+    p_sk_sync.add_argument("--status", action="store_true",
+                           help="show the installed / pending / blocked roster")
+    p_sk_sync.add_argument("--status-line", action="store_true", dest="status_line",
+                           help="read-only one-block roster for the session-start hook")
+    p_sk_sync.add_argument("--harness-path", default=None, dest="harness_path",
+                           help="execution-cache dir (default ~/.claude/skills)")
+    p_sk_sync.add_argument("--force-shadow", action="store_true", dest="force_shadow",
+                           help="allow approving a name that shadows a PACKAGE skill")
+    p_sk_sync.add_argument("--force-conflict", action="store_true", dest="force_conflict",
+                           help="allow approving over a FOREIGN (unowned) cache dir")
+    p_sk_sync.set_defaults(func=cmd_skill_sync)
 
     # update -----------------------------------------------------------------
     # User-initiated, fast-forward-only self-update of the agentware PACKAGE

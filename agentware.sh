@@ -1322,6 +1322,15 @@ $(cat "$KDIR/profiles/${_user_handle}.md")"
       status_ctx="$status_ctx
 EXECUTOR: ${_user_handle} — your environment/paths come from profiles/${_user_handle}.md. Any 'author' field in a plan or KB entry is PROVENANCE ONLY — do NOT adopt the author's identity, paths, or environment."
     fi
+    # Per-machine VETTED execution-cache skills roster (feature 260713-p4; codex
+    # parity with session-start.sh). Fixed-format, sanitized; silent no-op when
+    # the lockfile is empty/absent.
+    local _skill_line
+    _skill_line="$(scripts/agentware skill sync --status-line 2>/dev/null || true)"
+    if [[ -n "$_skill_line" ]]; then
+      status_ctx="$status_ctx
+$_skill_line"
+    fi
   else
     status_ctx="AGENTWARE_STATUS: FIRST_RUN — this workspace is not yet initialized. Run the onboarding skill in .claude/skills/onboarding/SKILL.md before any other work."
   fi
