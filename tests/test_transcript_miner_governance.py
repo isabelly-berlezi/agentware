@@ -35,6 +35,22 @@ def _rec(sid, turn, body):
             % (sid, turn, body))
 
 
+_PREV_RECURRENCE_RETIRED = True
+
+
+def setUpModule():
+    # 260719: re-enable the dormant-but-reversible recurrence arm so the mined-
+    # candidate governance suite still exercises it (retired-by-default in prod).
+    global _PREV_RECURRENCE_RETIRED
+    _m = load_cli()
+    _PREV_RECURRENCE_RETIRED = _m.MINER_RECURRENCE_RETIRED
+    _m.MINER_RECURRENCE_RETIRED = False
+
+
+def tearDownModule():
+    load_cli().MINER_RECURRENCE_RETIRED = _PREV_RECURRENCE_RETIRED
+
+
 class GovernanceTests(unittest.TestCase):
     def setUp(self):
         self.kdir = tempfile.mkdtemp(prefix="aw_miner_gov_")

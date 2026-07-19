@@ -6318,11 +6318,66 @@ _PREF_NEG_LOOSEN_RE = re.compile(
     % _PREF_NEG_LOOSE, re.I)
 
 
+# Operator-turn provenance gate (260719-prefer-precision-and-reject). This session's
+# marquee false positives were preference CUES that appeared only inside text the
+# operator QUOTED BACK from the agent as markdown blockquotes (lines led by `>`) —
+# not their own instruction.
+#
+# A confusion/interrogative that HAPPENS to carry a cue token (e.g. "i dont
+# understand …" matches the `dont` cue) is not a durable preference. This guard is
+# DELIBERATELY NARROW — only explicit confusion phrases and `aux + pronoun` question
+# openers — so it never drops a genuine preference that merely OPENS with a temporal/
+# relative/wh clause ("When merging, always …", "Which manager — always pin …") or a
+# negated imperative ("do not …", "should always …"). It anchors at ^ and runs on the
+# FULL text (not the residual), so it stays strictly tighten-only.
+_PREF_STATEMENT_QUESTION_RE = re.compile(
+    r"^\s*(?:"
+    r"i\s+(?:dont|don'?t|do\s+not)\s+understand|"
+    r"i'?m\s+(?:confused|not\s+sure|unclear|lost)|"
+    r"(?:can|could|would|should|will|do|does|did|are|is)\s+"
+    r"(?:you|we|it|this|these|i)\b"
+    r")", re.I)
+# The statement-question guard PREFIX-matches, so it must NOT fire when the turn
+# ALSO carries a STRONG directive cue (a genuine preference stated after a leading
+# question/confusion clause, e.g. "Can we always use spaces" / "i'm not sure, but
+# from now on always lint"). Only a confusion/question with NO strong cue — e.g.
+# "i dont understand what this is" (which merely trips the weak `dont` cue) — is
+# dropped. Strong cues are the unambiguous directives, NOT the weak `dont/do not`.
+_PREF_STRONG_CUE_RE = re.compile(
+    r"\b(always|never|prefer(?:s|red|ence)?|by default|default to|from now on)\b",
+    re.I)
+
+
+def _pref_operator_text(text):
+    """Return the genuinely OPERATOR-AUTHORED residual of a human turn: DROP every
+    markdown-blockquote line (first non-space char `>` — content the operator quoted
+    BACK from the agent/elsewhere, not their own instruction), then strip. Pure,
+    deterministic, offline (INV-1). Returns "" for non-str/empty input.
+
+    `>` is ambiguous (quote-back vs the operator's OWN emphasis); this session's
+    entire false-positive class was quote-backs, so it is treated as such. A genuine
+    preference stated ONLY inside a `>` line is therefore a (safe) FALSE NEGATIVE: it
+    is not captured, and the operator can simply restate it without the `>`. Precision
+    over recall — never a false positive from this gate."""
+    if not isinstance(text, str):
+        return ""
+    kept = [ln for ln in text.splitlines() if not ln.lstrip().startswith(">")]
+    return "\n".join(kept).strip()
+
+
 def _pref_is_capturable(text):
-    """(a) noise bar — True iff `text` is a durable, future-affecting preference."""
+    """(a) noise bar — True iff `text` is a durable, future-affecting preference.
+
+    Precision gate (260719): STRICTLY tighten-only over the pre-gate behavior — a
+    text is capturable IFF it was capturable ON ITS OWN (the noise bar below runs on
+    the FULL text, unchanged) AND its preference cue ALSO survives in the operator-
+    authored residual (`_pref_operator_text` strips `>`-blockquote quote-backs). The
+    residual check is purely ADDITIVE, so it can only REJECT more, never capture more
+    — a cue that lives only in quoted-back agent text is dropped without ever
+    reclassifying a previously-rejected turn (e.g. a trailing `?`) as capturable."""
     if not isinstance(text, str):        # tolerate a non-str queue record text
         return False
-    t = text.strip()
+    t = text.strip()                     # noise bar runs on the FULL text (tighten-only)
     if not t:
         return False
     low = t.lower()
@@ -6330,9 +6385,17 @@ def _pref_is_capturable(text):
         return False
     if low.endswith("?"):                        # pure interrogative
         return False
+    if (_PREF_STATEMENT_QUESTION_RE.match(low)   # confusion/question opener AND
+            and not _PREF_STRONG_CUE_RE.search(low)):  # no strong directive later
+        return False
     if len(low.split()) < _PREF_MIN_TOKENS:
         return False
-    return bool(_PREF_CUE_RE.search(low))
+    if not _PREF_CUE_RE.search(low):
+        return False
+    # ADDITIONAL operator-turn gate: the cue must ALSO be in the authored residual
+    # (blockquote quote-backs stripped) — a cue only in quoted-back text is dropped.
+    residual = _pref_operator_text(text)
+    return bool(residual) and bool(_PREF_CUE_RE.search(residual.lower()))
 
 
 def _pref_hits_kernel(text):
@@ -6961,6 +7024,13 @@ def _prefer_queue_scan(kdir, sid, cwd, prompts_path=None):
             m = _PREFER_QUEUE_RE.search(body)
             if not m:
                 continue
+            # Operator-turn gate (260719): the cue must ALSO survive in the operator-
+            # authored residual (blockquote quote-backs stripped), so a keyword only
+            # inside quoted-back agent text never enqueues. STRICTLY tighten-only (the
+            # original match above is unchanged); the full `body` is stored verbatim.
+            authored = _pref_operator_text(body)
+            if not authored or not _PREFER_QUEUE_RE.search(authored):
+                continue
             turn_id = hdr.get("turn") or ""
             fp = _prefer_cand_fp(sid, turn_id, body)
             if fp in seen:
@@ -7123,6 +7193,13 @@ def _prefer_seed_cursor_cli(args):
 MINER_STATE_REL = "logs/steering/.transcript-miner.state.json"  # miner's OWN state
 PREFER_QUEUE_MINER_PRODUCER = "transcript-miner"          # never the stop-hook value
 MINER_RECURRENCE_N = 2        # distinct-session near-dup asks that flag a recurrence
+# RETIRED (260719-prefer-precision-and-reject; operator-decided 2026-07-17,
+# decide-miner-recurrence-arm-retired-keep-error-recovery): the recurrence arm
+# emits NOTHING to the prefer-queue. Measured 0 true positives across 1142 prompts —
+# the exact-match `_transcript_norm_key` structurally cannot detect paraphrased
+# preferences (humans reword). Error-recovery mining is a SEPARATE arm and is
+# untouched. Reversible: set False to re-enable recurrence emission.
+MINER_RECURRENCE_RETIRED = True
 MINER_SESSION_CAP = 50        # sessions walked per run (incremental + --backfill)
 MINER_TALLY_CAP = 2000        # persistent recurrence-tally keys (LRU-pruned)
 MINER_EMITTED_CAP = 4000      # persistent emitted-key ledger (emit-once, F-A)
@@ -7740,6 +7817,15 @@ def _transcript_mine_recurrence(prompts, tally, kdir, emitted_keys=None,
         if key not in touched:
             touched.append(key)
     out = []
+    # RETIRED (260719): the recurrence arm emits NOTHING. The tally FOLD above is
+    # preserved (harmless cumulative counting; zero behavior change to persisted
+    # state) — only EMISSION is disabled. On a future re-enable, emission resumes for
+    # keys folded in SUBSEQUENT windows; a key that first reached N during retirement
+    # (and never `emitted`) will emit the next time it is re-folded (i.e. when it next
+    # recurs), NOT retroactively for windows already scanned. The SEPARATE error-
+    # recovery arm is untouched.
+    if MINER_RECURRENCE_RETIRED:
+        return out
     for key in touched:
         entry = tally[key]
         count = len(entry.get("sessions") or [])
@@ -8143,7 +8229,22 @@ def _prefer_emit_workorder(kdir, text, fp):
     # Detect the existing workorder and return it as SUCCESS so the re-drain marks
     # the record proposed (no double emit, no wedge). The slug embeds the candidate
     # fingerprint, so this is the SAME candidate, not a collision.
-    if os.path.isfile(os.path.join(kdir, "work", "auto", slug, "plan.md")):
+    existing_plan = os.path.join(kdir, "work", "auto", slug, "plan.md")
+    if os.path.isfile(existing_plan):
+        # State-aware sentinel (260719 audit): a TERMINAL existing workorder —
+        # cancelled via `prefer reject`, or superseded/done — means this candidate
+        # was ALREADY RESOLVED. Returning it as success would re-mark a re-queued
+        # rejected candidate `proposed` (resurrecting it into an approve-but-
+        # unrunnable dead end). Signal the drain to mark it resolved instead. A LIVE
+        # (draft/ready/running) workorder is the crash-recovery case: return it as
+        # success so the re-drain re-marks the record proposed (no double emit).
+        try:
+            with open(existing_plan, encoding="utf-8") as _pf:
+                _state, _ = _read_plan_status(_pf.read())
+        except OSError:
+            _state = None
+        if _state in _PLAN_TERMINAL_STATES:
+            return None, "resolved:%s" % _state
         return "auto/" + slug, None
     feature = "auto/" + slug
     activate_cmd = "scripts/agentware prefer capture --from-workorder %s" % feature
@@ -8333,6 +8434,18 @@ def _prefer_classify_drain(kdir):
                 fp = _prefer_cand_fp(rec.get("sid"), rec.get("turn_id"), text)
                 feature, err = _prefer_emit_workorder(kdir, text, fp)
                 if err is not None:
+                    if err.startswith("resolved:"):
+                        # The workorder for this candidate is TERMINAL (rejected via
+                        # `prefer reject`, or superseded/done) — mark the re-queued
+                        # record rejected, do NOT re-propose it (audit: no
+                        # resurrection of a rejected candidate).
+                        rec["status"] = "rejected"
+                        rec["tier"] = 2
+                        rec["rejected_reason"] = ("workorder already %s"
+                                                  % err.split(":", 1)[1])
+                        rejected_n += 1
+                        changed = True
+                        continue
                     deferred_n += 1               # emitter refused -> stay queued
                     continue
                 rec["status"] = "proposed"
@@ -8451,6 +8564,133 @@ def cmd_prefer_approve(args):
     feat = target[len("auto/"):] if target.startswith("auto/") else target
     print("approved: %s — run it via the loop (e.g. ./agentware.sh %s) or claim "
           "the workorder." % (target, feat))
+    return 0
+
+
+def _prefer_cancel_workorder(kdir, workorder, reason):
+    """Cancel an emitted `work/auto/pref-*` workorder for `prefer reject`, called
+    BEFORE the queue flip so a cancel FAILURE never orphans a draft workorder (it
+    refuses the reject instead of leaving a rejected record pointing at a still-draft
+    plan that inflates the g3 cap). Returns (cancelled, disposition):
+      'cancelled' -> a live draft/ready workorder was cancelled;
+      'absent'    -> no plan.md (nothing to cancel) -> proceed with the flip;
+      'terminal'  -> already cancelled/superseded/done -> proceed with the flip;
+      'refuse'    -> a LIVE/unreadable workorder that would NOT cancel -> the caller
+                     must REFUSE (do not flip the queue) so the reject stays re-driveable."""
+    plan_path = _plan_path(kdir, workorder)
+    if not os.path.isfile(plan_path):
+        return False, "absent"
+    try:
+        with open(plan_path, encoding="utf-8") as f:
+            state, _cnt = _read_plan_status(f.read())
+    except OSError:
+        return False, "refuse"
+    if state in _PLAN_TERMINAL_STATES:
+        return False, "terminal"
+    ns = argparse.Namespace(feature=workorder, state="cancelled", actor="operator",
+                            reason="prefer reject: %s" % reason, format="json")
+    rc, _out = _dream_capture(cmd_plan_set_state, ns)
+    return (True, "cancelled") if rc == 0 else (False, "refuse")
+
+
+def cmd_prefer_reject(args):
+    """`prefer reject <workorder> [--reason …]` — reject a dream-proposed steering
+    candidate as NOISE: the governed counterpart to `prefer approve`. Under the queue
+    lock it CANCELS the emitted `work/auto/pref-*` workorder FIRST (via the shipped
+    `plan set-state … cancelled`), then flips the record proposed -> rejected — so a
+    cancel failure never orphans a draft workorder, and only the target record's queue
+    line is rewritten (every other line is byte-preserved). The plan.md is KEPT on
+    disk; the classify drain's state-aware sentinel treats a cancelled workorder as
+    RESOLVED, so a re-queued rejected candidate is re-marked rejected, never
+    resurrected. Closes the proposed-noise dead end that previously forced an
+    ungoverned hand-edit of the prefer-queue. A dispatched STATE-MUTATING writer,
+    registered in `_kb_writer_funcs()` (the predispatch gate keys on args.func)."""
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    target = (getattr(args, "id", None) or "").strip()
+    if not target:
+        sys.stderr.write("agentware: prefer reject requires a workorder id\n")
+        return 1
+    # Namespace guard: only ever act on a bare `auto/pref-<slug>` workorder — the
+    # target feeds cmd_plan_set_state's feature path, so refuse a traversal or any
+    # other namespace (defense-in-depth).
+    wo = target if target.startswith("auto/") else "auto/" + target
+    if not wo.startswith("auto/pref-") or "/" in wo[len("auto/"):]:
+        sys.stderr.write("agentware: prefer reject only targets an auto/pref-* "
+                         "workorder (got %r)\n" % target)
+        return 1
+    qpath = os.path.join(kdir, PREFER_QUEUE_REL)
+    if not os.path.isfile(qpath):
+        sys.stderr.write("agentware: no prefer-queue to reject from\n")
+        return 1
+    reason = (getattr(args, "reason", None) or "").strip() \
+        or "operator-rejected as noise via `prefer reject`"
+    import fcntl
+    lockp = qpath + ".lock"
+    try:
+        lf = open(lockp, "a+")
+    except OSError:
+        sys.stderr.write("agentware: cannot lock the prefer-queue\n")
+        return 1
+    try:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        # Read RAW lines and PRESERVE every one byte-for-byte; only the matched
+        # target record's line is rewritten (never silently drop a malformed line).
+        # Split on '\n' ONLY (NOT str.splitlines(), which also splits on U+2028/
+        # U+2029/U+0085 that the producer + drain leave verbatim inside a record —
+        # splitting there would shred an unrelated record and could make a candidate
+        # unrejectable). `"\n".join(raw)` is then a byte-exact round-trip.
+        with open(qpath, encoding="utf-8") as f:
+            raw = f.read().split("\n")
+        hit_idx, hit = None, None
+        for i, line in enumerate(raw):
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                rec = json.loads(s)
+            except ValueError:
+                continue
+            if (isinstance(rec, dict) and rec.get("status") == "proposed"
+                    and rec.get("workorder") == wo):
+                hit_idx, hit = i, rec
+                break
+        if hit is None:
+            sys.stderr.write(
+                "agentware: no proposed candidate with workorder '%s' — see "
+                "`prefer review` or the classify report\n" % wo)
+            return 1
+        # Cancel FIRST: a live workorder that will not cancel -> refuse without
+        # touching the queue (stays re-driveable); absent/terminal -> proceed.
+        cancelled, disp = _prefer_cancel_workorder(kdir, wo, reason)
+        if disp == "refuse":
+            sys.stderr.write(
+                "agentware: could not cancel workorder '%s' (live or unreadable) — "
+                "NOT rejecting; resolve the workorder and retry\n" % wo)
+            return 1
+        hit["status"] = "rejected"
+        hit["rejected_reason"] = reason
+        raw[hit_idx] = json.dumps(hit, ensure_ascii=False)
+        # `split("\n")` captured the file's trailing newline as a trailing "" element,
+        # so join alone reproduces the exact byte structure (no extra newline).
+        _atomic_write(qpath, "\n".join(raw))
+    finally:
+        try:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lf.close()
+    if getattr(args, "format", "text") == "json":
+        json.dump({"ok": True, "workorder": wo, "status": "rejected",
+                   "workorder_cancelled": cancelled, "workorder_state": disp},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        note = {"cancelled": "workorder cancelled", "absent": "no workorder on disk",
+                "terminal": "workorder already terminal"}.get(disp, disp)
+        print("rejected: %s — candidate marked rejected; %s (plan.md kept as the "
+              "re-emit sentinel)." % (wo, note))
     return 0
 
 
@@ -19030,6 +19270,10 @@ def _kb_writer_funcs():
         # mutates prefer-queue state (proposed -> approved); the predispatch gate
         # keys on args.func, so it MUST be registered by its own func name.
         cmd_prefer_approve,
+        # steering-capture reject (260719): the governed counterpart to approve —
+        # a distinct dispatched func that mutates prefer-queue state (proposed ->
+        # rejected) + cancels the workorder. Registered by func name like approve.
+        cmd_prefer_reject,
         # P2c transcript miner (260713): the SECOND prefer-queue producer. A
         # dispatched WRITER (appends candidates + persists its own state); the
         # predispatch schema-guard keys on args.func, so register it by name. NOT
@@ -27387,6 +27631,21 @@ def build_parser():
     p_pref_approve.add_argument(
         "id", help="the emitted workorder feature (auto/pref-…)")
     p_pref_approve.set_defaults(func=cmd_prefer_approve, prefer_command="approve")
+
+    # reject: the governed counterpart to approve — mark a proposed candidate as
+    # noise (proposed -> rejected) AND cancel its emitted workorder, keeping the
+    # plan.md as the re-emit sentinel. Closes the proposed-noise dead end.
+    p_pref_reject = prefer_sub.add_parser(
+        "reject", parents=[fmt_parent],
+        help="reject a dream-proposed steering candidate as noise by its "
+             "workorder id (flips proposed->rejected + cancels the workorder)")
+    p_pref_reject.add_argument(
+        "id", help="the emitted workorder feature (auto/pref-…)")
+    p_pref_reject.add_argument(
+        "--reason", default=None,
+        help="optional rejection reason recorded on the queue record + the "
+             "workorder cancel")
+    p_pref_reject.set_defaults(func=cmd_prefer_reject, prefer_command="reject")
 
     # Layer-3 OPERATOR SURFACE (Task 8, 260714): the read-only "what needs me?"
     # digest over the prefer-queue + archive. Its own dispatched func precisely

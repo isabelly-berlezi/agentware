@@ -33,6 +33,22 @@ def _rec(sid, turn, body):
             % (sid, turn, body))
 
 
+_PREV_RECURRENCE_RETIRED = True
+
+
+def setUpModule():
+    # 260719: re-enable the dormant-but-reversible recurrence arm so the end-to-end
+    # spine still exercises it (retired-by-default in production).
+    global _PREV_RECURRENCE_RETIRED
+    _m = load_cli()
+    _PREV_RECURRENCE_RETIRED = _m.MINER_RECURRENCE_RETIRED
+    _m.MINER_RECURRENCE_RETIRED = False
+
+
+def tearDownModule():
+    load_cli().MINER_RECURRENCE_RETIRED = _PREV_RECURRENCE_RETIRED
+
+
 class E2ESpineTests(unittest.TestCase):
     def setUp(self):
         self.mod = load_cli()

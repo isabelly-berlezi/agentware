@@ -33,6 +33,22 @@ def _rec(ts, sid, cwd, origin, turn, prompt):
             % (ts, sid, cwd, origin, turn, prompt))
 
 
+_PREV_RECURRENCE_RETIRED = True
+
+
+def setUpModule():
+    # 260719: re-enable the dormant-but-reversible recurrence arm so the wiring +
+    # dream-step suites still exercise it (retired-by-default in production).
+    global _PREV_RECURRENCE_RETIRED
+    _m = load_cli()
+    _PREV_RECURRENCE_RETIRED = _m.MINER_RECURRENCE_RETIRED
+    _m.MINER_RECURRENCE_RETIRED = False
+
+
+def tearDownModule():
+    load_cli().MINER_RECURRENCE_RETIRED = _PREV_RECURRENCE_RETIRED
+
+
 class _Base(unittest.TestCase):
     def setUp(self):
         self.kdir = tempfile.mkdtemp(prefix="aw_miner_wire_")

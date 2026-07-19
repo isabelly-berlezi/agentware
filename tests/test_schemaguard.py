@@ -69,6 +69,11 @@ _GROUND_TRUTH_WRITERS = {
     # steering-capture approve (260712, Task 7): a distinct dispatched func that
     # mutates prefer-queue state (proposed -> approved) — registered by func name.
     "cmd_prefer_approve",
+    # steering-capture reject (260719): the governed counterpart to approve — a
+    # dispatched func that flips proposed -> rejected + cancels the workorder.
+    # NOT an index writer (no save_index/rebuild_kb), so like cmd_prefer_approve it
+    # is absent from _EXPECTED_INDEX_WRITER_DEFS and present here + _kb_writer_funcs.
+    "cmd_prefer_reject",
     # P2c transcript miner (260713): the SECOND prefer-queue producer — a
     # dispatched WRITER (appends candidates + persists its own state), registered
     # by func name so the predispatch schema-guard covers it. Not an index writer

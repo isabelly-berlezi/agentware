@@ -46,6 +46,24 @@ def _rec(ts, sid, cwd, origin, turn, prompt):
             % (ts, sid, cwd, origin, turn, prompt))
 
 
+_PREV_RECURRENCE_RETIRED = True
+
+
+def setUpModule():
+    # 260719: recurrence EMISSION is RETIRED by default (MINER_RECURRENCE_RETIRED).
+    # These suites validate the dormant-but-REVERSIBLE mechanism (fold / emit-once /
+    # LRU ledger / precision gate / wiring / governance), so re-enable it for the
+    # module; the shipped default-off behavior is asserted in TestRecurrenceRetired.
+    global _PREV_RECURRENCE_RETIRED
+    _m = load_cli()
+    _PREV_RECURRENCE_RETIRED = _m.MINER_RECURRENCE_RETIRED
+    _m.MINER_RECURRENCE_RETIRED = False
+
+
+def tearDownModule():
+    load_cli().MINER_RECURRENCE_RETIRED = _PREV_RECURRENCE_RETIRED
+
+
 class _MinerBase(unittest.TestCase):
     def setUp(self):
         self.kdir = tempfile.mkdtemp(prefix="aw_miner_")
@@ -1115,6 +1133,38 @@ class TestSnapshotBackfillHarness(unittest.TestCase):
         loaded, fresh = self.mod._transcript_load_state(self.dst)
         self.assertFalse(fresh, "the pre-seed must be read as an EXISTING state")
         self.assertEqual(loaded["offsets"]["prompts"], 0)
+
+
+class TestRecurrenceRetired(_MinerBase):
+    """The SHIPPED default (260719): with MINER_RECURRENCE_RETIRED True, the
+    recurrence arm emits NOTHING to the prefer-queue even for a verbatim-repeating
+    key across N sessions, while the SEPARATE error-recovery arm is untouched.
+    (setUpModule flips the flag OFF for the mechanism suites; here we set it back to
+    the shipped default to assert retirement.)"""
+
+    def setUp(self):
+        super().setUp()
+        self._pr = self.mod.MINER_RECURRENCE_RETIRED
+        self.mod.MINER_RECURRENCE_RETIRED = True   # the shipped default (retired)
+        self.addCleanup(setattr, self.mod, "MINER_RECURRENCE_RETIRED", self._pr)
+
+    def test_verbatim_recurrence_across_n_sessions_emits_nothing(self):
+        self._seed_zero()
+        body = "From now on, prefer tabs over spaces."   # would emit 1 pre-retire
+        self._write_prompts([_rec("t", s, "/x", "human", "1", body)
+                             for s in ("A", "B", "C")])
+        self.assertEqual(self._mine(), 0, "recurrence emission is retired")
+        self.assertEqual(self._queue(), [], "no recurrence candidate reaches the queue")
+
+    def test_error_recovery_arm_is_untouched_by_retirement(self):
+        self._seed_zero()
+        self._write_session("A", [
+            self._call("Read", "ERR", "/tmp/missing.md",
+                       "No such file or directory"),
+            self._call("Read", "ok", "/tmp/missing.md", "contents"),
+        ])
+        self.assertEqual(self._mine(), 1, "error-recovery still emits")
+        self.assertEqual(self._queue()[0]["signal"], "error-recovery")
 
 
 if __name__ == "__main__":
