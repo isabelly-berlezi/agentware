@@ -48,7 +48,7 @@ def _iso(ep):
         ep, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _stub_llm(role, persona, prompt, cfg, timeout=None, cwd=None):
+def _stub_llm(role, persona, prompt, cfg, timeout=None, cwd=None, **kwargs):
     # a narrative whose observation NAMES a kernel path — must stay REPORT-ONLY.
     return json.dumps({"narrative": "Trends are flat across the window.",
                        "observations": ["consider editing scripts/agentware to "
@@ -72,6 +72,14 @@ class CheckupE2ETests(unittest.TestCase):
         self.m.HOME_CONFIG = os.path.join(self.home, ".agentware", "config.env")
         self.m.CONFIG_PATHS = (self.m.HOME_CONFIG,)
         self.m.CHECKUP_CORPUS_ENTRIES_MAX = 2
+        # 260722 spawn-resilience: the checkup caller passes retries=0 (single
+        # attempt — a background report-only job degrades cheaply), so the (g)
+        # degradation tests that patch subprocess.run to raise TimeoutExpired
+        # never traverse the retry path. The no-op REVIEW_SLEEP stays as
+        # defense-in-depth for the zero-real-sleep-in-tests invariant
+        # (load_cli() is CACHED: restore in _restore, no leaks).
+        self._sleep = self.m.REVIEW_SLEEP
+        self.m.REVIEW_SLEEP = lambda *_: None
         self._env = {k: os.environ.get(k) for k in
                      ("AGENTWARE_KNOWLEDGE_DIR", "AGENTWARE_CHECKUP",
                       "AGENTWARE_CHECKUP_LLM", "AGENTWARE_DREAM", "AGENTWARE_CLI")}
@@ -86,6 +94,7 @@ class CheckupE2ETests(unittest.TestCase):
     def _restore(self):
         (self.m.HOME_CONFIG, self.m.CONFIG_PATHS,
          self.m.CHECKUP_CORPUS_ENTRIES_MAX) = self._cfg
+        self.m.REVIEW_SLEEP = self._sleep
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)

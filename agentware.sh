@@ -1091,19 +1091,56 @@ run_selfheal_review() {
   [[ "$max_rounds" =~ ^[0-9]+$ ]] && (( max_rounds >= 1 )) || max_rounds=3
   local diff_range="${AGENTWARE_REVIEW_DIFF_RANGE:-HEAD}"
 
+  # Remediation round 9 (novel-input): capture the NON-EMPTY expectation the
+  # gate is about to audit under. The rounds below re-resolve `git diff
+  # $diff_range` FRESH each time, so a working tree that becomes clean MID-RUN
+  # (operator commit/stash during a long remediation loop) would make a later
+  # round resolve an EMPTY diff, audit NOTHING, and stamp the self-extension
+  # CLEAN — shipping earlier rounds' confirmed findings with zero reviewers
+  # having seen the final diff. Resolve the range ONCE here; a clean round may
+  # only PROCEED if a non-empty entry diff is STILL non-empty (cross-checked
+  # in the _rrc==0 branch). An entry range that resolves empty (or fails to
+  # resolve — cmd_review fails closed on that itself) arms no expectation.
+  local _entry_diff_files=""
+  _entry_diff_files="$(git diff --name-only "$diff_range" -- 2>/dev/null || true)"
+
   log "[review] self-extension diff — running the adversarial-review gate (max_rounds=$max_rounds, diff-range=$diff_range)"
   local round=1
   while (( round <= max_rounds )); do
     local review_json="$STATE_DIR/adversarial-review-round-$round.json"
     log "[review] round $round/$max_rounds — scripts/agentware review --adversarial (Opus/max fan-out)"
     # review exit: 0 = CLEAN, 1 = confirmed blocking finding(s), >=3 = the audit
-    # itself could NOT run (agent runtime unreachable / a dimension produced no
-    # output). Capture the code without tripping `set -e`.
+    # itself could NOT run. Exit >=3 covers TWO distinct failure classes the
+    # console diagnosis below must not conflate: (a) the DIFF SOURCE failed
+    # (unreadable --diff-file / unresolvable --diff-range — gc'd base ref,
+    # shallow clone, git unavailable; cmd_review fails CLOSED before any
+    # reviewer spawns), and (b) the agent runtime is unreachable / a dimension
+    # produced no output. Per-round stderr is captured into its OWN file so the
+    # class can be read back deterministically (then appended to the main log).
+    # Capture the code without tripping `set -e`.
     local _rrc=0
+    local review_errlog="$STATE_DIR/adversarial-review-round-$round.err"
     scripts/agentware review --adversarial --diff-range "$diff_range" \
          --acceptance-file "$plan" --worklog "$worklog" --format json \
-         > "$review_json" 2>>"$STATE_DIR/adversarial-review.log" || _rrc=$?
+         > "$review_json" 2>"$review_errlog" || _rrc=$?
+    cat "$review_errlog" >> "$STATE_DIR/adversarial-review.log" 2>/dev/null || true
     if (( _rrc == 0 )); then
+      # Remediation round 9 (novel-input): a CLEAN verdict only covers the
+      # diff the reviewers actually SAW. If the gate fired on a NON-empty
+      # entry diff but this round's range now resolves EMPTY (the working
+      # tree was committed/stashed while the gate ran), the reviewers audited
+      # NOTHING — proceeding would stamp the (now-invisible) self-extension
+      # GREEN, including earlier rounds' confirmed findings whose remediation
+      # was never re-audited. Fail CLOSED instead.
+      if [[ -n "$_entry_diff_files" ]]; then
+        local _live_diff_files=""
+        _live_diff_files="$(git diff --name-only "$diff_range" -- 2>/dev/null || true)"
+        if [[ -z "$_live_diff_files" ]]; then
+          log "✖ [review] round $round: the SELF-EXTENSION DIFF VANISHED mid-run — the gate fired on a NON-empty '$diff_range' diff, but this round resolved an EMPTY one (working tree committed/stashed while the gate ran?), so this round's clean verdict covers NOTHING and does NOT clear the original diff. BLOCKING (fail-closed, nothing-skipped). Restore or re-point the diff (e.g. AGENTWARE_REVIEW_DIFF_RANGE=<base>..HEAD over the new commit) so the reviewers can actually see it, then re-run."
+          emit_review_report "blocked-diff-vanished"
+          return 1
+        fi
+      fi
       log "[review] round $round CLEAN — no confirmed high/medium findings; PROCEEDING to done-stamp"
       # CALL OUT (task 6): consolidate the report, surface material findings in the
       # worklog (self-closing markers), and file workorders for low findings.
@@ -1113,9 +1150,39 @@ run_selfheal_review() {
     if (( _rrc >= 3 )); then
       # FAIL-CLOSED: the adversarial audit could not actually RUN — do NOT waste
       # remediation rounds (there are no findings to fix) and NEVER silently
-      # proceed. Block + escalate so the operator fixes agent access or sets the
-      # recorded skip hatch. This is the exact fail-open the gate must not have.
-      log "✖ [review] round $round: the adversarial audit COULD NOT RUN (agent runtime unreachable / a dimension produced no output). BLOCKING (fail-closed, nothing-skipped). Fix agent access or set AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1 to bypass with a recorded DECISION."
+      # proceed. Diagnose the REAL class from this round's captured stderr
+      # (remediation round 8): a failed INPUT SOURCE (diff or acceptance
+      # criteria) means NO reviewer ever ran over the intended input, so the
+      # console must direct the operator to FIX the source and must NEVER
+      # suggest the skip bypass — recording a skip there would ship the
+      # self-extension with ZERO reviewers having seen the diff, the exact
+      # fail-open this gate exists to block.
+      #
+      # ANCHORED classifier (remediation round 9): the errlog ALSO carries
+      # RELAYED agent stdout/stderr snippets (the ⚠️-prefixed WARN diagnostics)
+      # whose untrusted-data fence keeps words intact — so an UN-anchored grep
+      # would let a soft-failing reviewer that merely QUOTES the gate's own
+      # error strings (highly likely when the diff under audit touches
+      # cmd_review, or when a hostile diff steers reviewer prose) misclassify
+      # a runtime-class failure as a source failure, misdirecting the operator
+      # to "fix" a healthy diff source and suppressing the sanctioned
+      # recorded-skip recovery for class (b). Only cmd_review's OWN
+      # operational lines start a physical line with 'review: ' — relayed
+      # payloads are whitespace-collapsed + control-char-neutralized inside
+      # one WARN line and can never start a new line — so the class predicate
+      # MUST be line-anchored. NEVER consume the fenced payload as a predicate
+      # (R-SEC-02).
+      if grep -qE '^review: cannot (resolve --diff-range|read --diff-file)' "$review_errlog" 2>/dev/null; then
+        log "✖ [review] round $round: the adversarial audit COULD NOT RUN — the DIFF SOURCE failed: --diff-range '$diff_range' is unresolvable (gc'd/absent base ref, shallow clone, or git unavailable) or the --diff-file is unreadable, so NO reviewer ever saw the diff. BLOCKING (fail-closed, nothing-skipped). Fix the diff source (fetch/unshallow the base ref or correct AGENTWARE_REVIEW_DIFF_RANGE) and re-run — do NOT bypass: the diff has NOT been audited. Details: $review_errlog"
+      elif grep -qE '^review: cannot read --acceptance-file' "$review_errlog" 2>/dev/null; then
+        # Remediation round 9: same fail-closed source class as the diff —
+        # the plan's acceptance criteria are the SPEC half of the review
+        # contract, and cmd_review now exits 3 (before any reviewer spawns)
+        # when the requested criteria source cannot be read.
+        log "✖ [review] round $round: the adversarial audit COULD NOT RUN — the ACCEPTANCE-CRITERIA SOURCE failed: --acceptance-file '$plan' is unreadable (deleted/renamed by a concurrent run?), so the diff could not be checked against the plan's criteria and NO reviewer ran. BLOCKING (fail-closed, nothing-skipped). Restore the plan file and re-run — do NOT bypass: the diff has NOT been audited. Details: $review_errlog"
+      else
+        log "✖ [review] round $round: the adversarial audit COULD NOT RUN (agent runtime unreachable / a dimension produced no output — per-agent reasons in $review_errlog). BLOCKING (fail-closed, nothing-skipped). Fix agent access or set AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1 to bypass with a recorded DECISION."
+      fi
       emit_review_report "blocked-audit-incomplete"
       return 1
     fi

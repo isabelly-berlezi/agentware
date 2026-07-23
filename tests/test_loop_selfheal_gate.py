@@ -83,6 +83,12 @@ if printf '%s' "$head" | grep -q "REMEDIATION fixer"; then
     # A verifiable fix: names a real, fast, passing regression test + signals the
     # RE-AUDIT that the defect is closed by dropping the fix marker.
     touch "$FAKE_FIXMARK"
+    if [[ "${FAKE_FIXER_BREAKS_PLAN:-0}" == "1" ]]; then
+      # Simulate a concurrent run deleting/replacing plan.md BETWEEN rounds:
+      # the NEXT round's --acceptance-file open must fail. A directory (not
+      # chmod 000) so the OSError fires even when the suite runs as root.
+      rm -f "$FAKE_PLAN" && mkdir -p "$FAKE_PLAN"
+    fi
     echo '{"fixes":[{"index":0,"status":"fixed","regression_test":"tests/test_frontmatter.py","notes":"planted defect fixed"}]}'
   else
     # An UNVERIFIED fix: claims fixed but names NO regression test -> REFUSED
@@ -102,6 +108,22 @@ fi
 if printf '%s' "$head" | grep -q "dimension reviewer"; then
   if [[ "${FAKE_REVIEW_DIES:-0}" == "1" ]]; then
     exit 1   # simulate the agent runtime unreachable: no output, nonzero exit
+  fi
+  if [[ "${FAKE_REVIEW_SOFTFAIL_QUOTES:-0}" == "1" ]]; then
+    # Exit-0 prose that QUOTES the gate's own fail-closed error strings — the
+    # errlog-contamination shape: the soft-fail diagnostic relays this snippet
+    # (fenced, words intact) into the round errlog, where an UN-anchored
+    # classifier would misread a runtime-class exit-3 as a DIFF SOURCE failure.
+    echo "sorry, I could not audit this diff; earlier harness output said review: cannot read --diff-file: x and also review: cannot resolve --diff-range 'HEAD' (git failed)"
+    exit 0
+  fi
+  if [[ "${FAKE_REVIEWER_COMMITS_TREE:-0}" == "1" && -n "${FAKE_GIT_WT:-}" ]]; then
+    # Simulate the operator committing the working tree WHILE the round runs:
+    # the synthetic target repo becomes clean before the bash layer re-resolves
+    # the diff. EXPLICIT --git-dir/--work-tree so this can NEVER touch the real
+    # checkout, even if the env were dropped (git just errors, swallowed).
+    git --git-dir "$FAKE_GIT_WT/.git" --work-tree "$FAKE_GIT_WT" add -A >/dev/null 2>&1 || true
+    git --git-dir "$FAKE_GIT_WT/.git" --work-tree "$FAKE_GIT_WT" -c user.email=t@example.com -c user.name=t commit -m mid-run-commit --no-gpg-sign >/dev/null 2>&1 || true
   fi
   if [[ "${FAKE_CLEAN:-0}" == "1" ]] || [[ -f "${FAKE_FIXMARK:-/nonexistent}" ]]; then
     echo '{"findings":[]}'
@@ -194,11 +216,48 @@ class SelfHealGateLoopTest(unittest.TestCase):
         env.update({k: str(v) for k, v in extra.items()})
         return env
 
-    def _run(self, env):
+    def _run(self, env, cwd=None):
         return subprocess.run(
-            ["bash", AGENTWARE_SH, FEATURE], cwd=REPO_ROOT, env=env,
+            ["bash", AGENTWARE_SH, FEATURE], cwd=cwd or REPO_ROOT, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             timeout=300)
+
+    def _make_git_workdir(self):
+        """A synthetic git checkout MIRRORING the real repo via top-level
+        symlinks (so agentware.sh's relative references — scripts/, .claude/ —
+        still resolve) whose GIT state the test fully controls. The loop runs
+        with THIS as cwd, so every bare `git` the gate's bash layer executes
+        reads the synthetic repo — NEVER the operator's real checkout, whose
+        dirty/clean state is non-deterministic across dev machines and CI.
+        Returns (workdir, git) where git(*args) runs `git -C workdir ...`."""
+        workdir = os.path.join(self.tmp, "workdir")
+        os.makedirs(workdir)
+        for entry in os.listdir(REPO_ROOT):
+            if entry == ".git":
+                continue
+            os.symlink(os.path.join(REPO_ROOT, entry),
+                       os.path.join(workdir, entry))
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", workdir] + list(args),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+        self.assertEqual(git("init").returncode, 0, "git init failed")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "t")
+        with open(os.path.join(workdir, "pkgfile.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write("seed\n")
+        self.assertEqual(git("add", "-A").returncode, 0)
+        self.assertEqual(
+            git("commit", "-m", "seed", "--no-gpg-sign").returncode, 0)
+        # Dirty the tree: `git diff HEAD` now resolves NON-empty — the shape
+        # the gate fires on in production (default diff_range=HEAD).
+        with open(os.path.join(workdir, "pkgfile.txt"), "w",
+                  encoding="utf-8") as f:
+            f.write("changed self-extension content\n")
+        return workdir, git
 
     def test_planted_defect_is_fixed_reaudited_clean_then_proceeds(self):
         # Round 1 finds a CONFIRMED high; remediation applies a verified fix +
@@ -265,8 +324,164 @@ class SelfHealGateLoopTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0,
                             "an un-runnable audit must BLOCK, not proceed:\n%s" % out)
         self.assertIn("COULD NOT RUN", out, out)
+        # Remediation round 9 (test-quality): 'COULD NOT RUN' is shared by BOTH
+        # exit>=3 diagnosis branches, so it alone cannot lock branch selection —
+        # a classifier mutation that matches unconditionally (misreporting a
+        # genuine runtime outage as a DIFF SOURCE failure, and suppressing the
+        # sanctioned recorded-skip recovery) would ship 100% green. Lock the
+        # runtime-unreachable branch's CONTENT: it must name the real class,
+        # must still offer the sanctioned skip hatch, and must NOT print the
+        # diff-source diagnosis.
+        self.assertIn("agent runtime unreachable", out,
+                      "the runtime-class failure must be NAMED as such:\n%s"
+                      % out)
+        self.assertIn("AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1", out,
+                      "the runtime-unreachable class legitimately offers the "
+                      "recorded-DECISION skip hatch — it must stay named:\n%s"
+                      % out)
+        self.assertNotIn("DIFF SOURCE", out,
+                         "a runtime-class failure must never be misdiagnosed "
+                         "as a diff-source failure:\n%s" % out)
         self.assertNotIn("fully complete", out,
                          "a fail-closed block must NOT reach done-stamp/kb-sync:\n%s"
+                         % out)
+
+    def test_unresolvable_diff_range_names_diff_source_not_bypass(self):
+        # Remediation round 8 (reuse-in-new-context): cmd_review's exit 3
+        # gained a NEW meaning — an unresolvable/unreadable DIFF SOURCE (gc'd
+        # base ref, shallow clone, mistyped --diff-file). The bash consumer
+        # used to reuse its stale predicate and diagnose every exit>=3 as
+        # 'agent runtime unreachable', printing 'set
+        # AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1 to bypass' — actively steering
+        # the operator toward the bypass for exactly the un-audited-diff shape
+        # the fail-closed hardening exists to block. The console must now name
+        # the DIFF SOURCE failure and must NOT suggest the bypass.
+        proc = self._run(self._env(
+            AGENTWARE_REVIEW_DIFF_RANGE="deadbeef123456..HEAD",
+            AGENTWARE_REVIEW_MAX_ROUNDS="2",
+            AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
+        out = proc.stdout
+        self.assertNotEqual(proc.returncode, 0,
+                            "an unresolvable diff range must BLOCK:\n%s" % out)
+        self.assertIn("COULD NOT RUN", out, out)
+        self.assertIn("DIFF SOURCE", out,
+                      "the console must name the REAL failure class (diff "
+                      "source), not the stale unreachable guess:\n%s" % out)
+        self.assertNotIn("agent runtime unreachable", out,
+                         "the stale unreachable predicate must not fire for a "
+                         "diff-source failure:\n%s" % out)
+        self.assertNotIn("AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1", out,
+                         "the console must NOT steer the operator toward the "
+                         "bypass over an UN-audited diff:\n%s" % out)
+        self.assertNotIn("fully complete", out,
+                         "a diff-source failure must NOT reach done-stamp:\n%s"
+                         % out)
+
+    def test_softfail_quoting_gate_errors_is_not_misread_as_diff_source(self):
+        # Remediation round 9 (correctness + reuse-in-new-context): the round
+        # errlog carries BOTH cmd_review's own operational lines AND relayed,
+        # attacker/model-influenceable agent stdout/stderr snippets (fenced,
+        # words intact). A reviewer that soft-fails with exit-0 prose QUOTING
+        # the gate's own error strings — highly likely whenever the diff under
+        # audit touches cmd_review's fail-closed messages, and steerable by a
+        # hostile diff — used to make the UN-anchored exit>=3 classifier
+        # misdiagnose the runtime-class failure as a DIFF SOURCE failure:
+        # the operator was told to fix a healthy diff source, told 'do NOT
+        # bypass', and the sanctioned recorded-skip recovery for the
+        # runtime class was suppressed. The classifier must consume ONLY
+        # line-anchored operational lines, never the fenced payload (R-SEC-02).
+        proc = self._run(self._env(
+            FAKE_REVIEW_SOFTFAIL_QUOTES="1", AGENTWARE_REVIEW_MAX_ROUNDS="2",
+            AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
+        out = proc.stdout
+        self.assertNotEqual(proc.returncode, 0,
+                            "a soft-failed fan-out must BLOCK:\n%s" % out)
+        self.assertIn("COULD NOT RUN", out, out)
+        # Vacuity guard: the classifier strings really DID contaminate the
+        # round errlog (inside the fenced WARN relay) — the misclassification
+        # input is present, and classification still resists it.
+        errlog = os.path.join(self.docs, ".loop",
+                              "adversarial-review-round-1.err")
+        with open(errlog, encoding="utf-8") as f:
+            errtxt = f.read()
+        self.assertIn("cannot read --diff-file", errtxt,
+                      "the relayed snippet must really reach the errlog — "
+                      "else this test exercises nothing:\n%s" % errtxt)
+        self.assertIn("untrusted agent stdout", errtxt,
+                      "the relay must be fenced as untrusted DATA:\n%s"
+                      % errtxt)
+        # The REAL class wins: runtime/soft-fail diagnosis, with its
+        # sanctioned skip hatch — never the forged diff-source diagnosis.
+        self.assertIn("agent runtime unreachable", out, out)
+        self.assertIn("AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1", out, out)
+        self.assertNotIn("DIFF SOURCE", out,
+                         "a relayed snippet quoting the gate's own error "
+                         "strings must NOT flip the diagnosis to DIFF "
+                         "SOURCE:\n%s" % out)
+        self.assertNotIn("fully complete", out, out)
+
+    def test_unreadable_acceptance_file_names_criteria_source_not_bypass(self):
+        # Remediation round 9 (reuse-in-new-context + novel-input): the gate
+        # always passes --acceptance-file "$plan"; a plan deleted/replaced by
+        # a concurrent run BETWEEN rounds used to degrade SILENTLY to empty
+        # criteria — round 2 audited the diff with NO acceptance criteria and
+        # stamped it GREEN. cmd_review now fails CLOSED (exit 3) and the bash
+        # console must name the ACCEPTANCE-CRITERIA SOURCE class — not the
+        # diff source, not the stale unreachable guess, and never the bypass.
+        proc = self._run(self._env(
+            FAKE_FIXABLE="1", FAKE_FIXER_BREAKS_PLAN="1",
+            AGENTWARE_REVIEW_MAX_ROUNDS="3",
+            AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
+        out = proc.stdout
+        self.assertNotEqual(proc.returncode, 0,
+                            "an unreadable acceptance file must BLOCK — the "
+                            "spec half of the audit cannot run:\n%s" % out)
+        self.assertIn("auto-remediating", out,
+                      "round 1 must really have run + remediated (the plan "
+                      "breaks BETWEEN rounds):\n%s" % out)
+        self.assertIn("COULD NOT RUN", out, out)
+        self.assertIn("ACCEPTANCE-CRITERIA SOURCE", out,
+                      "the console must name the criteria-source class:\n%s"
+                      % out)
+        self.assertNotIn("DIFF SOURCE", out, out)
+        self.assertNotIn("agent runtime unreachable", out, out)
+        self.assertNotIn("AGENTWARE_SKIP_ADVERSARIAL_REVIEW=1", out,
+                         "the console must NOT steer the operator toward the "
+                         "bypass over an un-audited diff:\n%s" % out)
+        self.assertNotIn("fully complete", out, out)
+
+    def test_mid_run_commit_vanishing_diff_blocks_clean_stamp(self):
+        # Remediation round 9 (novel-input-edge-cases): the gate re-resolves
+        # `git diff $diff_range` FRESH each round with no non-empty
+        # expectation — a working tree committed/stashed MID-RUN made a later
+        # round resolve an EMPTY diff, audit NOTHING, and stamp the
+        # self-extension CLEAN (shipping any unremediated survivors GREEN
+        # with zero reviewers having seen the final diff). The bash layer
+        # already proved the entry diff non-empty; it must cross-check that
+        # expectation before letting a clean round PROCEED.
+        workdir, git = self._make_git_workdir()
+        proc = self._run(self._env(
+            FAKE_CLEAN="1", FAKE_REVIEWER_COMMITS_TREE="1",
+            FAKE_GIT_WT=workdir,
+            AGENTWARE_REVIEW_DIFF_RANGE="HEAD",
+            AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"),
+            cwd=workdir)
+        out = proc.stdout
+        # Vacuity guard: the mid-run commit really happened — the synthetic
+        # tree is clean, so the round genuinely resolved an EMPTY diff.
+        status = git("status", "--porcelain").stdout.strip()
+        self.assertEqual(status, "",
+                         "the fake reviewer must have committed the tree "
+                         "mid-run (else this test exercises nothing)")
+        self.assertNotEqual(proc.returncode, 0,
+                            "a clean round over a VANISHED diff must BLOCK, "
+                            "never stamp the un-audited diff green:\n%s" % out)
+        self.assertIn("running the adversarial-review gate", out, out)
+        self.assertIn("VANISHED", out,
+                      "the console must name the vanished-diff class:\n%s"
+                      % out)
+        self.assertNotIn("fully complete", out,
+                         "a vanished-diff round must NOT reach done-stamp:\n%s"
                          % out)
 
     def test_skip_false_does_NOT_bypass_gate(self):

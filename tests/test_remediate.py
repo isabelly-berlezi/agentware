@@ -14,9 +14,11 @@ monkeypatched with stubs. Asserts:
 Stdlib unittest only.
 """
 
+import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import types
 import unittest
@@ -49,7 +51,7 @@ class RemediateTests(unittest.TestCase):
         'fixer' role. Any other role returns ''."""
         calls = []
 
-        def fake(role, persona, prompt, cfg, timeout=None, cwd=None):
+        def fake(role, persona, prompt, cfg, timeout=None, cwd=None, **kwargs):
             calls.append({"role": role, "persona": persona, "prompt": prompt})
             if role == "fixer":
                 return json.dumps(fixes_payload)
@@ -173,7 +175,7 @@ class RemediateTests(unittest.TestCase):
 
     # --- robustness (novel-input hardening) ---------------------------------
     def test_malformed_fixer_payload_is_not_crashed(self):
-        def fake(role, persona, prompt, cfg, timeout=None, cwd=None):
+        def fake(role, persona, prompt, cfg, timeout=None, cwd=None, **kwargs):
             return "sorry, no JSON here" if role == "fixer" else ""
         self.mod._review_invoke_agent = fake
         gate_calls = self._install_gate(ok=True)
@@ -295,6 +297,117 @@ class RemediateTests(unittest.TestCase):
             findings = self.mod._review_load_findings(args)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["verdict"], "confirmed")
+
+    # --- latin-1 / non-UTF-8 input tolerance (remediation round 7) ----------
+    # test-quality: the tolerant errors='replace' decode was regression-locked
+    # only at cmd_review --diff-file and the _git seam; the PARALLEL sites on
+    # the remediation pass — cmd_remediate --diff-file / --acceptance-file and
+    # _review_load_findings --findings-file — had no test, so reverting any of
+    # them to strict UTF-8 shipped green and then CRASHED the self-heal loop's
+    # remediation pass (UnicodeDecodeError, exit 1 with a traceback the bash
+    # gate misreads) over the SAME latin-1-carrying diff the audit survived.
+
+    def test_remediate_latin1_diff_and_acceptance_files_never_crash(self):
+        self._install_fixer({"fixes": [
+            {"index": 0, "status": "fixed",
+             "regression_test": "tests/test_remediate.py::test_x",
+             "notes": "closed"}]})
+        self._install_gate(ok=True)
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, "findings.json")
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump({"findings": [self._confirmed_high()]}, f)
+            dpath = os.path.join(d, "diff.patch")
+            with open(dpath, "wb") as f:
+                # The exact byte shape the audit tolerates (latin-1 0xE9/0xFF,
+                # no NUL): the remediation pass over the SAME diff must not
+                # crash with a strict decode.
+                f.write(b"diff --git a/x b/x\n+caf\xe9 after \xff\n")
+            apath = os.path.join(d, "criteria.md")
+            with open(apath, "wb") as f:
+                f.write(b"# Crit\xe8res\n- caf\xe9 must survive \xff\n")
+            args = types.SimpleNamespace(
+                findings_file=fpath, diff_range=None, diff_file=dpath,
+                acceptance_file=apath, no_gate_chain=False, format="json")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = self.mod.cmd_remediate(args)
+        self.assertEqual(code, 0,
+                         "latin-1 bytes in --diff-file/--acceptance-file must "
+                         "decode tolerantly, never crash the remediation pass")
+        payload = json.loads(buf.getvalue())
+        self.assertTrue(payload["all_fixed"])
+
+    def test_load_findings_tolerates_latin1_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            fpath = os.path.join(d, "findings.json")
+            with open(fpath, "wb") as f:
+                # A findings file that picked up a raw latin-1 byte inside a
+                # string value (e.g. a summary quoting the diff under audit):
+                # errors='replace' degrades it to U+FFFD and the JSON still
+                # parses; a strict decode raises UnicodeDecodeError instead.
+                f.write(b'{"findings": [{"dimension": "correctness", '
+                        b'"severity": "high", "verdict": "confirmed", '
+                        b'"file": "x", "line": 1, "summary": "caf\xe9", '
+                        b'"failure_scenario": "y"}]}')
+            args = types.SimpleNamespace(findings_file=fpath)
+            findings = self.mod._review_load_findings(args)
+        self.assertEqual(len(findings), 1,
+                         "a latin-1 byte must not crash --findings-file "
+                         "loading")
+        self.assertEqual(findings[0]["summary"], "caf�")
+
+    # --- unresolvable --diff-range degrade branch (remediation round 8) -----
+    # test-quality: the None -> '' coercion + the 'proceeding with an empty
+    # diff context' LOUD warning in cmd_remediate had zero regression lock —
+    # deleting the guard (e.g. a refactor consolidating the two
+    # _review_resolve_diff call sites with cmd_review's fail-closed one) left
+    # the suite 100% green while the fixer silently remediated with a None
+    # diff and NO stderr trace — the exact silent-degradation shape the
+    # round-7 hardening forbids.
+
+    def test_unresolvable_diff_range_degrades_loudly_with_empty_diff(self):
+        calls = self._install_fixer({"fixes": [
+            {"index": 0, "status": "fixed",
+             "regression_test": "tests/test_remediate.py::test_x",
+             "notes": "closed"}]})
+        self._install_gate(ok=True)
+        tmp = tempfile.mkdtemp(prefix="aw-remdr-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        # Pin REPO_ROOT to a NON-git dir so `git -C <root> diff <range>` FAILS
+        # (rc != 0 -> _review_resolve_diff returns None) — the gc'd-base-ref /
+        # shallow-clone shape, hermetic (never the operator's checkout).
+        orig_root = self.mod.REPO_ROOT
+        self.mod.REPO_ROOT = tmp
+        try:
+            fpath = os.path.join(tmp, "findings.json")
+            with open(fpath, "w", encoding="utf-8") as f:
+                json.dump({"findings": [self._confirmed_high()]}, f)
+            args = types.SimpleNamespace(
+                findings_file=fpath, diff_range="deadbeef123456..HEAD",
+                diff_file=None, acceptance_file=None, no_gate_chain=False,
+                format="json")
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf_out), \
+                    contextlib.redirect_stderr(buf_err):
+                code = self.mod.cmd_remediate(args)
+        finally:
+            self.mod.REPO_ROOT = orig_root
+        # Remediate is NOT the gate: it DEGRADES (rc by fix outcome, not 3)...
+        self.assertEqual(code, 0, buf_err.getvalue())
+        payload = json.loads(buf_out.getvalue())
+        self.assertTrue(payload["all_fixed"])
+        # ...but LOUDLY, never silently: the degradation names the range.
+        err = buf_err.getvalue()
+        self.assertIn("cannot resolve --diff-range", err)
+        self.assertIn("deadbeef123456..HEAD", err)
+        self.assertIn("proceeding with an empty diff context", err)
+        # The fixer prompt got the explicit EMPTY diff fence — None never
+        # leaked into _review_fence / the prompt builder.
+        fixer_prompts = [c["prompt"] for c in calls if c["role"] == "fixer"]
+        self.assertEqual(len(fixer_prompts), 1)
+        self.assertIn("<<<DIFF", fixer_prompts[0])
+        self.assertIn("(empty)", fixer_prompts[0])
 
 
 if __name__ == "__main__":

@@ -55,6 +55,12 @@ class EmitTests(unittest.TestCase):
         self.m.HOME_CONFIG = os.path.join(self.base, "home", ".agentware",
                                           "config.env")
         self.m.CONFIG_PATHS = (self.m.HOME_CONFIG,)
+        # 260722 spawn-resilience: the checkup caller passes retries=0 (single
+        # attempt), so TimeoutExpired never traverses the retry path here; the
+        # no-op REVIEW_SLEEP stays as defense-in-depth for the zero-real-sleep
+        # invariant (module is cached across suites: restore in _restore).
+        self._sleep = self.m.REVIEW_SLEEP
+        self.m.REVIEW_SLEEP = lambda *_: None
         self._env = {k: os.environ.get(k) for k in
                      ("AGENTWARE_KNOWLEDGE_DIR", "AGENTWARE_CHECKUP",
                       "AGENTWARE_CHECKUP_LLM", "AGENTWARE_DREAM", "AGENTWARE_CLI")}
@@ -66,6 +72,7 @@ class EmitTests(unittest.TestCase):
 
     def _restore(self):
         self.m.HOME_CONFIG, self.m.CONFIG_PATHS = self._cfg
+        self.m.REVIEW_SLEEP = self._sleep
         for k, v in self._env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -152,7 +159,7 @@ class EmitTests(unittest.TestCase):
         self._stalled_plan("260713-widget", "Add a widget")
         os.environ["AGENTWARE_CHECKUP_LLM"] = "1"
 
-        def stub(role, persona, prompt, cfg, timeout=None, cwd=None):
+        def stub(role, persona, prompt, cfg, timeout=None, cwd=None, **kwargs):
             return json.dumps({"narrative": "flat",
                                "observations": ["edit scripts/agentware to raise "
                                                 "the tier-2 workorder cap"]})
