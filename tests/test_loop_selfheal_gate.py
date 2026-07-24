@@ -274,6 +274,44 @@ class SelfHealGateLoopTest(unittest.TestCase):
         self.assertIn("fully complete", out, out)  # reached done-stamp + kb-sync
         self.assertTrue(os.path.isfile(self.fixmark), "the fixer must have run")
 
+    def test_single_pass_default_ships_after_one_audit_and_fix(self):
+        # NEW single-pass default (max_rounds=1, operator-directed 2026-07-24):
+        # ONE audit finds a confirmed high, remediation applies a SELF-VERIFIED
+        # fix (regression test + gate chain green -> exit 0), and the run SHIPS
+        # WITHOUT a confirming re-audit. No AGENTWARE_REVIEW_MAX_ROUNDS is set, so
+        # the default (1) is exercised — this locks the audit->fix->re-audit LOOP
+        # from silently coming back (the run-1 marathon / max-rounds cliff).
+        proc = self._run(self._env(FAKE_FIXABLE="1",
+                                   AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
+        out = proc.stdout
+        self.assertEqual(proc.returncode, 0,
+                         "a single-pass self-healed run must complete:\n%s" % out)
+        self.assertIn("max_rounds=1", out,
+                      "the default must be exactly ONE audit:\n%s" % out)
+        self.assertIn("auto-remediating", out, out)
+        self.assertIn("no confirming re-audit", out,
+                      "single-pass must SHIP the self-verified fix, not re-audit:\n%s" % out)
+        self.assertNotIn("round 2", out,
+                         "single-pass must NOT run a second audit round:\n%s" % out)
+        self.assertIn("fully complete", out,
+                      "the single-pass run must reach done-stamp + kb-sync:\n%s" % out)
+        self.assertTrue(os.path.isfile(self.fixmark), "the fixer must have run")
+
+    def test_single_pass_failed_fix_blocks_immediately(self):
+        # Single-pass (default max_rounds=1) with an UNFIXABLE defect: remediation
+        # exits non-zero (no regression test -> fix refused), so the gate BLOCKS on
+        # the failed fix in round 1 — never shipping a broken fix, never re-auditing.
+        proc = self._run(self._env(FAKE_FIXABLE="0",
+                                   AGENTWARE_REVIEW_DIFF_FILES_OVERRIDE="scripts/agentware"))
+        out = proc.stdout
+        self.assertNotEqual(proc.returncode, 0,
+                            "a failed single-pass fix must block the run:\n%s" % out)
+        self.assertIn("BLOCKED", out, out)
+        self.assertNotIn("fully complete", out,
+                         "a blocked run must NOT reach done-stamp + kb-sync:\n%s" % out)
+        self.assertNotIn("round 2", out,
+                         "single-pass must not re-audit before blocking:\n%s" % out)
+
     def test_unfixable_defect_blocks_done_and_escalates(self):
         # The fixer never provides a regression test -> every fix is REFUSED -> the
         # confirmed high survives every bounded round -> BLOCKED, no done, no commit.

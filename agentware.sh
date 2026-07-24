@@ -1087,8 +1087,13 @@ run_selfheal_review() {
   esac
 
   # Resolve the bounded round count + diff range ONCE.
-  local max_rounds="${AGENTWARE_REVIEW_MAX_ROUNDS:-3}"
-  [[ "$max_rounds" =~ ^[0-9]+$ ]] && (( max_rounds >= 1 )) || max_rounds=3
+  # SINGLE-PASS default (operator-directed 2026-07-24): ONE audit per plan, then
+  # FIX + ship-iff-self-verified — NOT an audit->fix->re-audit LOOP. The loop
+  # failed to converge on large diffs (each remediation grew the diff, each fresh
+  # Opus fan-out found new marginalia) and burned many Opus rounds. Override to
+  # re-audit the fix N times with AGENTWARE_REVIEW_MAX_ROUNDS=<N>.
+  local max_rounds="${AGENTWARE_REVIEW_MAX_ROUNDS:-1}"
+  [[ "$max_rounds" =~ ^[0-9]+$ ]] && (( max_rounds >= 1 )) || max_rounds=1
   local diff_range="${AGENTWARE_REVIEW_DIFF_RANGE:-HEAD}"
 
   # Remediation round 9 (novel-input): capture the NON-EMPTY expectation the
@@ -1186,24 +1191,46 @@ run_selfheal_review() {
       emit_review_report "blocked-audit-incomplete"
       return 1
     fi
-    # _rrc == 1: confirmed blocking finding(s) survive — CALL OUT (task 6 fleshes
-    # the report) and AUTO-REMEDIATE, then loop to RE-AUDIT with a FRESH fan-out.
+    # _rrc == 1: confirmed blocking finding(s) — CALL OUT (task 6 fleshes the
+    # report) and AUTO-REMEDIATE. `remediate` applies EVERY confirmed finding and
+    # runs its OWN regression tests + gate chain, exiting 0 ONLY when all_fixed
+    # AND that chain is green — so a zero exit is a SELF-VERIFIED fix and a
+    # non-zero exit is a real, un-healed regression.
     log "⚠ [review] round $round: confirmed high/medium finding(s) — CALLING OUT + auto-remediating (see $review_json)"
     local remediate_json="$STATE_DIR/adversarial-remediate-round-$round.json"
-    if scripts/agentware remediate --findings-file "$review_json" --diff-range "$diff_range" \
+    local _remediate_rc=0
+    scripts/agentware remediate --findings-file "$review_json" --diff-range "$diff_range" \
          --acceptance-file "$plan" --format json \
-         > "$remediate_json" 2>>"$STATE_DIR/adversarial-review.log"; then
-      log "[review] round $round: remediation applied all confirmed findings (with regression tests + gate chain) — RE-AUDITING"
-    else
-      log "⚠ [review] round $round: remediation could NOT fully fix every finding — RE-AUDITING to confirm survivors"
+         > "$remediate_json" 2>>"$STATE_DIR/adversarial-review.log" || _remediate_rc=$?
+    if (( _remediate_rc != 0 )); then
+      # A real regression the fixer could NOT make green — BLOCK now (never ship a
+      # broken fix; do not spend a re-audit on a diff the fixer already failed).
+      log "✖ [review] round $round: remediation could NOT fully fix every finding (its regression tests / gate chain did not pass) — a real regression survives. BLOCKING (fail-closed)."
+      emit_review_report "blocked"
+      return 1
     fi
+    if (( round >= max_rounds )); then
+      # SINGLE-PASS SHIP: the fix self-verified (all findings fixed + gate chain
+      # green) and no re-audit round remains. PROCEED — the deterministic ship
+      # gates still run after this (post-hooks: features/index/steering-lint/
+      # gate-release/worklog-scan, then the plan done-stamp, then kb-sync), so
+      # "ship iff ALL conditions met" is still enforced; what is intentionally
+      # dropped is only the Opus CONFIRMING re-audit. Set
+      # AGENTWARE_REVIEW_MAX_ROUNDS=<N> to re-audit the fix instead of shipping it.
+      log "✓ [review] round $round: remediation applied ALL confirmed findings and its regression tests + gate chain PASSED — single-pass policy: PROCEEDING to ship (no confirming re-audit). Override with AGENTWARE_REVIEW_MAX_ROUNDS=<N>."
+      emit_review_report "remediated-shipped-round-$round"
+      return 0
+    fi
+    # More rounds allowed (operator raised max_rounds): RE-AUDIT the fix with a
+    # fresh fan-out to CONFIRM it resolved the findings without introducing new ones.
+    log "[review] round $round: remediation applied all confirmed findings — RE-AUDITING to confirm (round $((round + 1))/$max_rounds)"
     round=$((round + 1))
   done
 
-  # Exhausted every bounded round with a confirmed high/medium still surviving.
-  log "✖ [review] adversarial-review gate BLOCKED after $max_rounds round(s): a confirmed high/medium finding survives — the fix could not self-heal."
-  # CALL OUT (task 6): write the report + worklog call-out BEFORE escalating so the
-  # operator has the full survivor list surfaced, not just a log line.
+  # Defensive backstop: with the decide-on-final-round logic above, every path
+  # inside the loop returns explicitly, so this is normally unreachable. Falling
+  # through would mean the loop exited without a decision — fail CLOSED.
+  log "✖ [review] adversarial-review gate BLOCKED: the round loop exited without a ship/block decision (unexpected) — failing closed."
   emit_review_report "blocked"
   return 1
 }
