@@ -713,6 +713,33 @@ def api_kb_tag(request, tag):
     return HTTPStatus.OK, {"tag": tag, "count": len(rows), "entries": rows}
 
 
+# --- /api/graph/<name> (read-only derived graph status) ----------------------
+def api_graph(request, name):
+    """Read-only mirror of `graph status --format json` — the SAME derived payload
+    (`_graph_status_payload`), with NO new collection and NO writer. Bound to
+    127.0.0.1 by the server; delegates to the CLI's pure status builder so the
+    body is the exact object `scripts/agentware graph status <name> --format json`
+    prints. An optional `?now=<iso>` pins the clock for a byte-identical compare."""
+    cli = get_cli()
+    kdir = _kdir(request)
+    name = urllib.parse.unquote(name)
+    # Containment: the route regex matches the RAW percent-encoded segment, so a
+    # `..%2F..%2F..` traversal reaches here as `../../..` after unquote. A graph
+    # name is a strict slug (FANOUT_FEATURE_RE) — anything else (a separator, a
+    # `..`, a `%`) can only be a traversal probe. Refuse it before it touches the
+    # filesystem path in `_graph_manifest_path` (which does no confinement).
+    if not cli.FANOUT_FEATURE_RE.match(name or ""):
+        return HTTPStatus.NOT_FOUND, {"error": "no such graph", "graph": name}
+    if not kdir:
+        return HTTPStatus.OK, dict(_NO_KDIR, graph=name)
+    manifest, err = cli._graph_load_manifest(kdir, name)
+    if err:
+        return HTTPStatus.NOT_FOUND, {"error": err, "graph": name}
+    now = _qp(request, "now") or cli.utc_now_iso()
+    payload = cli._graph_status_payload(kdir, name, manifest, now)
+    return HTTPStatus.OK, payload
+
+
 # --- /api/features -----------------------------------------------------------
 def api_features(request):
     cli = get_cli()
@@ -940,6 +967,7 @@ PARAM_ROUTES = [
     (re.compile(r"^/api/loop-health/(?P<feature>[^/]+)$"), api_loop_health_feature),
     (re.compile(r"^/api/failures/(?P<feature>[^/]+)$"), api_failures),
     (re.compile(r"^/api/assessments/(?P<feature>[^/]+)$"), api_assessments),
+    (re.compile(r"^/api/graph/(?P<name>[^/]+)$"), api_graph),
 ]
 
 

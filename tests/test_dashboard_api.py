@@ -364,6 +364,103 @@ class DashboardApiTestCase(unittest.TestCase):
         self.assertIn("learnings", data["categories"])
         self.assertGreaterEqual(data["entry_count"], 1)
 
+    # -- graph status endpoint (Task 8) ---------------------------------------
+    def _build_fixture_graph(self, name):
+        """Write two non-self-ext plans + a manifest via the CLI single-writer."""
+        cli = SRV.get_cli()
+        for feat in ("gnode-a", "gnode-b"):
+            d = os.path.join(self.kdir, "work", feat)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "plan.md"), "w") as f:
+                f.write("# Plan\n\n> Feature: `%s`\n> Status: draft\n\n"
+                        "## Target packages\n\n- ~/workspace/agentware\n" % feat)
+        manifest = cli._graph_new_manifest(name, concurrency=2)
+        manifest["nodes"] = [
+            {"feature": "gnode-a", "checkpoint": "none",
+             "self_extension": False, "write_set": []},
+            {"feature": "gnode-b", "checkpoint": "none",
+             "self_extension": False, "write_set": []},
+        ]
+        manifest["edges"] = [
+            {"from": "gnode-a", "to": "gnode-b", "kind": "logical"}]
+        cli._graph_save(self.kdir, manifest)
+        return cli, manifest
+
+    def test_graph_status_endpoint_matches_cli(self):
+        cli, manifest = self._build_fixture_graph("api-graph-fixture")
+        now = "2026-07-24T12:00:00Z"
+        api = self._get("/api/graph/api-graph-fixture?now=%s" % now)
+        # The endpoint body is the SAME derived payload as graph status --json.
+        expected = cli._graph_status_payload(
+            self.kdir, "api-graph-fixture", manifest, now)
+        self.assertEqual(api, expected)
+        self.assertEqual(api["node_count"], 2)
+        self.assertEqual({n["feature"] for n in api["nodes"]},
+                         {"gnode-a", "gnode-b"})
+        # No lane provisioned yet → both nodes are vacuously pending.
+        self.assertEqual({n["status"] for n in api["nodes"]}, {"pending"})
+
+    def test_graph_status_endpoint_unknown_404(self):
+        req = urllib.request.Request(self.base + "/api/graph/no-such-graph")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(cm.exception.code, 404)
+
+    def _run_cli_graph_status_json(self, cli, name, now):
+        """Run the REAL `graph status --format json` CLI command bound to the same
+        KB and capture its stdout as parsed JSON."""
+        import contextlib
+        import io
+        import types
+        prev = os.environ.get("AGENTWARE_KNOWLEDGE_DIR")
+        os.environ["AGENTWARE_KNOWLEDGE_DIR"] = self.kdir
+        try:
+            ns = types.SimpleNamespace(name=name, node_timeout=None, now=now,
+                                       format="json")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_graph_status(ns)
+            self.assertEqual(rc, 0)
+            return json.loads(buf.getvalue())
+        finally:
+            if prev is None:
+                os.environ.pop("AGENTWARE_KNOWLEDGE_DIR", None)
+            else:
+                os.environ["AGENTWARE_KNOWLEDGE_DIR"] = prev
+
+    def test_graph_status_endpoint_byte_equals_cli_command(self):
+        # AC #8: the endpoint body must byte-equal `graph status --format json`.
+        # The sibling test only compares the endpoint to the shared payload
+        # builder (near-tautological — `api_graph` literally returns it); this
+        # pins the endpoint against the actual CLI COMMAND output, so a change
+        # that wraps/augments only one side is caught.
+        cli, _manifest = self._build_fixture_graph("api-cli-parity")
+        now = "2026-07-24T12:00:00Z"
+        api = self._get("/api/graph/api-cli-parity?now=%s" % now)
+        cli_json = self._run_cli_graph_status_json(cli, "api-cli-parity", now)
+        self.assertEqual(api, cli_json)
+
+    def test_graph_endpoint_refuses_path_traversal(self):
+        # Security: `..%2F..%2Fsecret-graph` decodes (after unquote) to
+        # `../../secret-graph`, which os.path.join resolves to a graph.json OUTSIDE
+        # `work/graphs`. The endpoint must refuse it (404) before touching the
+        # filesystem — never disclose an out-of-tree manifest (path traversal).
+        cli = SRV.get_cli()
+        secret = os.path.join(self.kdir, "secret-graph")
+        os.makedirs(secret, exist_ok=True)
+        with open(os.path.join(secret, "graph.json"), "w") as f:
+            json.dump({"schema": cli.GRAPH_MANIFEST_SCHEMA, "name": "x",
+                       "concurrency": 3, "nodes": [], "edges": []}, f)
+        # Sanity: the traversal really would resolve onto the planted file.
+        traversed = cli._graph_manifest_path(self.kdir, "../../secret-graph")
+        self.assertEqual(os.path.realpath(traversed),
+                         os.path.realpath(os.path.join(secret, "graph.json")))
+        req = urllib.request.Request(
+            self.base + "/api/graph/..%2F..%2Fsecret-graph")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(cm.exception.code, 404)
+
     # -- kb aggregate + drill-downs -------------------------------------------
     def test_kb_aggregate(self):
         data = self._get("/api/kb")
