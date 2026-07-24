@@ -65,7 +65,8 @@ ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # C-4: bound large tool I/O. Mirrors render-transcript.py's _short(..., 1500)
 # (truncate to MAXLEN chars + the " …[truncated]" marker for parity).
 MAXLEN=1500
-trunc() {  # trunc <string> -> truncated string on stdout
+trunc() {  # HEAD-only truncation — for the INPUT (the miner derives the target
+           # from the command head, and _transcript_hook_trunc keeps byte parity).
   local s="$1"
   if [[ ${#s} -gt $MAXLEN ]]; then
     printf '%s …[truncated]' "${s:0:MAXLEN}"
@@ -73,8 +74,21 @@ trunc() {  # trunc <string> -> truncated string on stdout
     printf '%s' "$s"
   fi
 }
+trunc_tail() {  # tail-PRESERVING truncation — for the RESPONSE. A deep failure's
+  # discriminating error line (a traceback's exception, an `Exit code` detail)
+  # lives at the END; head-only trunc() would destroy it and collapse two
+  # genuinely-distinct deep failures onto ONE miner cross-session F-E key
+  # (adversarial-review). Mirrors scripts/agentware _transcript_resp_trunc
+  # (head + marker + tail around the SAME " …[truncated]" marker).
+  local s="$1" marker=' …[truncated]'
+  if [[ ${#s} -le $MAXLEN ]]; then printf '%s' "$s"; return; fi
+  local room=$(( MAXLEN - ${#marker} ))
+  if (( room <= 1 )); then printf '%s …[truncated]' "${s:0:MAXLEN}"; return; fi
+  local tail=$(( room / 2 )) head=$(( room - room / 2 ))
+  printf '%s%s%s' "${s:0:head}" "$marker" "${s: -tail}"
+}
 input_t="$(trunc "$input_c")"
-resp_t="$(trunc "$resp_c")"
+resp_t="$(trunc_tail "$resp_c")"
 
 # Outcome: ERR only when the response explicitly reports success=false; absence
 # of a success field (most tools) reads as ok.

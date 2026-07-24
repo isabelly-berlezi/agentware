@@ -30,7 +30,7 @@ TRUNC_MARK = " …[truncated]"
 # turn.started, an intro agent_message, TWO command_execution tool calls (the
 # second with an oversized aggregated_output), a MALFORMED line (must be skipped),
 # a final agent_message carrying the <promise> tag, then turn.completed.
-BIG_OUTPUT = "X" * 5000
+BIG_OUTPUT = "HEADSENTINEL" + "X" * 5000 + "TAILSENTINEL"
 
 
 def _sample_stream():
@@ -129,13 +129,24 @@ class CodexStreamLogTest(unittest.TestCase):
         for ln in lines:
             self.assertIn("🔧", ln)
 
-    def test_oversized_tool_io_truncated(self):
+    def test_oversized_tool_response_truncated_tail_preserving(self):
+        # Adversarial-review F-E fix: the RESPONSE is bounded TAIL-preservingly
+        # (head + marker + tail), NOT head-only — a deep failure's discriminating
+        # error line lives at the END, and head-only truncation would drop it and
+        # collapse two genuinely-distinct deep failures onto one miner F-E key.
         recs = [json.loads(l) for l in self._read(self.sess, "live.jsonl").splitlines() if l.strip()]
-        big = [r for r in recs if r["response"].startswith("X")][0]
-        self.assertTrue(big["response"].endswith(TRUNC_MARK))
+        big = [r for r in recs if TRUNC_MARK in r["response"]][0]
         self.assertLessEqual(len(big["response"]), MAXLEN + len(TRUNC_MARK))
-        # The bounded payload is far shorter than the 5000-char original.
+        # The bounded payload is far shorter than the original.
         self.assertLess(len(big["response"]), len(BIG_OUTPUT))
+        self.assertIn(TRUNC_MARK, big["response"])
+        # BOTH ends survive: the head AND the discriminating tail are preserved.
+        self.assertTrue(big["response"].startswith("HEADSENTINEL"),
+                        "head must be preserved")
+        self.assertTrue(big["response"].endswith("TAILSENTINEL"),
+                        "TAIL must be preserved (head-only trunc would drop it)")
+        # ...and it no longer ENDS with the marker (that was the head-only shape).
+        self.assertFalse(big["response"].endswith(TRUNC_MARK))
 
     def test_final_message_echoed_to_stdout(self):
         # Invariant (i): the <promise> must reach stdout for run_phase's grep.

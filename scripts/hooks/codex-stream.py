@@ -66,6 +66,29 @@ def _short(text, n=MAXLEN):
     return text if len(text) <= n else text[:n] + " …[truncated]"
 
 
+def _short_tail(text, n=MAXLEN):
+    """Bound a tool RESPONSE while PRESERVING its TAIL. A deep failure's
+    discriminating error line (a traceback's exception, an `Exit code` detail)
+    lives at the END, where head-only _short() would destroy it and collapse two
+    genuinely-distinct deep failures onto one miner cross-session F-E key
+    (adversarial-review). Mirrors scripts/agentware _transcript_resp_trunc
+    (head + marker + tail around the SAME " …[truncated]" marker)."""
+    if not isinstance(text, str):
+        try:
+            text = json.dumps(text, ensure_ascii=False)
+        except Exception:
+            text = str(text)
+    if len(text) <= n:
+        return text
+    marker = " …[truncated]"
+    room = n - len(marker)
+    if room <= 1:
+        return text[:n] + marker
+    tail = room // 2
+    head = room - tail
+    return text[:head] + marker + text[-tail:]
+
+
 def _append(path, data):
     """Best-effort append (logging is a VIEW, never a gate — never raises)."""
     try:
@@ -148,7 +171,7 @@ def _tool_fields(item):
             resp = json.dumps(resp, ensure_ascii=False)
         except Exception:
             resp = str(resp)
-    return tool, _short(inp), _short(resp), status
+    return tool, _short(inp), _short_tail(resp), status
 
 
 def main(argv):
