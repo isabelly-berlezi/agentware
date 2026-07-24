@@ -57,7 +57,10 @@ their own space and never touches the orchestrator. Only changing the PACKAGE
   are for procedures invoked when a TRIGGER condition is met. "Always do X" →
   steering. "When X happens, do Y, Z" → skill.
 - **Two-strike rule** — if you hit the same gotcha a second time and there's no
-  skill yet, that's the moment to promote.
+  skill yet, that's the moment to promote. In practice you rarely promote by hand:
+  the automated pipeline (dream step `k` + `scripts/agentware skill propose`)
+  detects recurring, cohesive learning clusters and PROPOSES an approval-gated
+  tier-2 skill-candidate workorder for you to approve+run (see 3b).
 
 ## Procedure
 
@@ -113,39 +116,56 @@ human note, but the reference on the marker line is what clears the gate.
 NEVER hand-create the learning file, NEVER hand-edit `index.json` — `learn` is
 the only writer. Do NOT ask the user; learnings belong on the record without ceremony.
 
-#### 3b. Skill (reusable procedure) — auto, write to the EXTERNAL dir
+#### 3b. Skill (reusable procedure) — AUTHORED into canonical KB `skills/`, invocable only on approval
 
-For reusable procedures. New skills live in the operator's external knowledge
-dir, NOT in the package, so the orchestrator stays immutable. Because this is the
-user's own space and is non-destructive, do it AUTONOMOUSLY (no permission gate)
-once the reuse threshold is met — just inform the user afterward.
+A skill is **authored** (never a hand-written `index add` stub, never a download):
+it lands in the canonical KB `skills/<name>/` as the source of truth, and becomes
+**invocable** on this machine only through the explicit approval gate. Two layers:
 
-1. Confirm it clears the bar: ≥2 steps AND reusable across tasks (two-strike rule).
-   If it's a one-off, keep it as a learning (3a) instead.
-2. Resolve `KDIR=$(scripts/agentware config --knowledge-dir-only)`, then:
-   - Use `templates/skill-template.md` as the structural starting point. Fill in:
-     title, **when to invoke** (specific trigger), **why it exists**,
-     prerequisites, procedure, failure handling, gotchas.
-   - Write `$KDIR/skills/<topic>/SKILL.md` with the `write` tool — into the
-     EXTERNAL knowledge dir, never the package.
-   - Register it so it is discoverable deterministically (no token re-scan):
-     ```bash
-     scripts/agentware index add \
-       --id skill-<topic> --title "<Skill title>" --category skills \
-       --path skills/<topic>/SKILL.md --tags "skill,<other-tags>" \
-       --summary "<one-line summary>"
-     ```
-   - Validate + refresh the TOC: `scripts/agentware index validate` (exit 0),
-     then `scripts/agentware features`.
-   - Future agents find it via `scripts/agentware query --category skills` (or
-     `--tag`), then read the exact path it returns — deterministic, not by
-     re-reading everything.
-   - Append to `worklog.md`: `Promoted to skill: <KDIR>/skills/<topic>/SKILL.md`.
+- **Canonical source** — KB `skills/<name>/SKILL.md`, written+registered by
+  `scripts/agentware skill add` (which VETS the skill before it is trusted). This
+  is the shared source of truth; `index add --category skills` is NOT the promotion
+  path — do not hand-register a skill stub.
+- **Per-machine execution cache** — `scripts/agentware skill sync --approve <name>`
+  re-vets and installs the skill into `~/.claude/skills` (the ONLY install path;
+  `sync` NEVER auto-installs — approval is the sole gate). Once installed, retrieval
+  pins it via `SKILL_PIN_FLOOR=0.85` so a matching skill floats to the top of recall.
 
-   External skills are discovered through the index query, not Claude's native
-   `.claude/skills/` auto-trigger. Making a skill a permanent part of the
-   orchestrator itself (package `.claude/skills/`) is a self-extension / package
-   change — see 3c.
+**The automated pipeline (shipped — normally you do NOT hand-author).** Recurring,
+cohesive learnings are auto-detected and surfaced as approval-gated proposals — you
+rarely promote a skill by hand:
+
+1. **Detection** runs BOTH on the offline dream cadence (dream step `k`,
+   `skill-propose`) AND on demand via `scripts/agentware skill propose` (add
+   `--dry-run` to rank candidate clusters without emitting; `--format json` for the
+   structured report). It clusters `learnings` by a density-gated tag-spine (never a
+   naive similarity/duplicate trigger), dedups against existing KB + `.claude/skills/`
+   names (surfacing an "extend `<X>`" note instead of a sibling), and is bounded by a
+   per-run cap + the `WORKORDER_DRAFT_CAP` (g3) gate.
+2. **Proposal** — each qualifying cluster becomes a **tier-2 PROPOSED workorder**
+   (`work/auto/skill-candidate-<fp>/plan.md`, `Status: draft`, NEVER auto-started).
+   The operator approves+running it IS the gate — the toolkit only detects+proposes;
+   it NEVER authors a stub, NEVER runs `index add --category skills`, NEVER installs.
+3. **Authoring** — the approved+run workorder reads each source learning via
+   `scripts/agentware query --id <id>`, authors the SKILL.md via the **skill-creator**
+   skill, then `scripts/agentware skill add` vets+installs it into canonical KB
+   `skills/`, declaring **reversible** relates-edges back to the source learnings
+   (no learning is ever auto-deleted).
+4. **Invocability** — `scripts/agentware skill sync --approve <name>` makes it
+   invocable on this machine (per the two-layer gate above).
+
+**Hand-authoring (only when you are doing it right now, not via a proposal).**
+Confirm it clears the bar first: ≥2 steps AND reusable across tasks (two-strike
+rule); a one-off stays a learning (3a). Then use the **skill-creator** skill (or
+`templates/skill-template.md`) to author `SKILL.md`, run `scripts/agentware skill
+add --source <path> --allow-external` to vet+install it into canonical KB `skills/`,
+validate with `scripts/agentware index validate` (exit 0) + `scripts/agentware
+features`, and `scripts/agentware skill sync --approve <name>` to make it invocable.
+Future agents find it via `scripts/agentware query --category skills` (or `--tag`)
+and the sync-installed cache. Append to `worklog.md`: `Promoted to skill: <name>`.
+
+Making a skill a permanent part of the orchestrator PACKAGE itself (package
+`.claude/skills/`) is a distinct self-extension / package change — see 3c.
 
 #### 3c. Steering / package change (explicit-only, with a !! WARNING !!)
 

@@ -272,7 +272,7 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
         payload = json.loads(out)
         self.assertTrue(payload["dry_run"])
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["1", "2", "a", "b", "c", "d", "e", "s", "m", "g", "f"])
+                         ["1", "2", "a", "b", "c", "d", "e", "s", "k", "m", "g", "f"])
         for s in payload["steps"]:
             self.assertEqual(s["status"], "planned")
 
@@ -1236,7 +1236,7 @@ class DreamObservabilityE2ETests(unittest.TestCase, _GuardedEnv):
         steps = {s["step"]: s for s in payload["steps"]}
         # The full a-f cycle ran (c failed but never aborted the rest).
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["1", "2", "a", "b", "c", "d", "e", "s", "m", "g", "f"])
+                         ["1", "2", "a", "b", "c", "d", "e", "s", "k", "m", "g", "f"])
         self.assertEqual(steps["c"]["status"], "fail")
         self.assertEqual(steps["e"]["status"], "ok")
 
