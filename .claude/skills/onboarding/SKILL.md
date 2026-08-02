@@ -767,8 +767,8 @@ resolve.
    **If `$AW_CLI` == `claude` (default):**
    ```
    # >>> agentware aliases >>>
-   alias PLAN_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && claude --agent agentware-planner --dangerously-skip-permissions)'
-   alias WORK_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && claude --agent agentware-execution --dangerously-skip-permissions)'
+   alias PLAN_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && claude --agent agentware-planner --effort max --dangerously-skip-permissions)'
+   alias WORK_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && claude --agent agentware-execution --effort max --dangerously-skip-permissions)'
    # <<< agentware aliases <<<
    ```
 
@@ -790,6 +790,14 @@ resolve.
    agents, settings, and hooks) from the repo no matter where the user's terminal
    is, and their shell stays in whatever directory they were in. (Only ONE
    `# >>> agentware aliases >>>` block is written — the one matching `$AW_CLI`.)
+
+   The claude form pins `--effort max` (the CLI's top reasoning tier) on both
+   personas: planning and execution are the two steps where a shallow decision
+   costs the most downstream. Leave the MODEL unpinned so each session inherits
+   the account default (currently latest Opus) instead of rotting to a stale
+   hardcoded id. NOTE: `claude` does NOT fail on a bad `--effort` value — it
+   prints `Unknown --effort value … ignoring it` and silently runs at the default
+   tier, so a typo degrades reasoning invisibly. Copy the literal string `max`.
 5. Confirm the append landed: re-run the grep from step 3 (must match now).
 6. **VERIFY the aliases actually work before completing onboarding:**
    - `command -v "$AW_CLI"` must succeed (the chosen runtime is on PATH). If not,
@@ -797,9 +805,14 @@ resolve.
      that the aliases will work once it is.
    - Confirm each alias resolves in a fresh interactive shell of the user's type:
      - zsh: `zsh -ic 'alias PLAN_AW; alias WORK_AW'`
-     - bash: `bash -ic 'type PLAN_AW WORK_AW'`
+     - bash: `bash -lic 'type PLAN_AW WORK_AW'` — use the LOGIN flag `-l`. If the
+       block went into `~/.bash_profile`, a non-login `bash -ic` reads only
+       `~/.bashrc` and prints "not found" even though the install is fine.
      Both must print the alias definition. If they don't (e.g. the rc isn't
      auto-sourced), tell the user to run `source <rc>` or open a new terminal.
+   - IF `$AW_CLI` == `claude`: confirm each printed definition contains the exact
+     literal `--effort max`. Since a misspelled tier is silently ignored by the
+     CLI, this string check is the ONLY signal that the reasoning pin survived.
    - Report the verification result to the user explicitly (✅/❌ per alias).
 7. Tell the user: "`source <rc>` (or open a new terminal), then just run
    `PLAN_AW` to plan and `WORK_AW` to execute."

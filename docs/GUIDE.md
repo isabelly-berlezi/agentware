@@ -54,10 +54,16 @@ After that you never run onboarding again.
 | `PLAN_AW` | planner | Designs a feature plan with you, using `scripts/agentware recall` to surface relevant prior learnings. Writes only `plan.md`. **Never executes.** |
 | `WORK_AW` | execution | Implements the work: `recall` at task start, verifies each step, promotes learnings before the completion promise, runs `audit --stale` before KB writes. The loop's POST phase self-assesses via this agent. |
 
-Each alias is `(cd /your/agentware && claude --agent … --dangerously-skip-permissions)`:
+Each alias is `(cd /your/agentware && claude --agent … --effort max --dangerously-skip-permissions)`:
 - The `cd` subshell means you can run them from **any directory** — they always
   load agentware's agents/steering/hooks from the package, and your terminal's
   current directory is left unchanged.
+- `--effort max` pins the CLI's top reasoning tier for both personas — planning
+  and execution are where a shallow decision costs the most downstream. The
+  **model** is deliberately left unpinned so each session inherits your account
+  default (currently latest Opus) rather than a hardcoded id that goes stale.
+  Beware: a misspelled tier is *ignored with a warning*, not an error, so it
+  degrades to default effort silently — the literal string must be `max`.
 - `--dangerously-skip-permissions` means the session never stops to ask you to
   approve commands. (Plain `claude` in the repo is also low-friction: the project
   `settings.json` pre-allows the toolkit and auto-accepts edits.)
